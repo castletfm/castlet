@@ -6,15 +6,20 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/castletfm/castlet/auth"
+	authoidc "github.com/castletfm/castlet/auth/oidc"
 	"github.com/castletfm/castlet/blob"
 	"github.com/castletfm/castlet/blob/localfs"
+	"github.com/castletfm/castlet/blob/s3"
 	"github.com/castletfm/castlet/config"
 	"github.com/castletfm/castlet/internal/session"
 	"github.com/castletfm/castlet/queue"
@@ -37,6 +42,7 @@ type App struct {
 	queue       queue.JobQueue
 	transcriber transcribe.Transcriber
 	sessions    *session.Manager
+	authn       auth.Authenticator // nil when OIDC is not configured
 	logger      *slog.Logger
 }
 
@@ -52,11 +58,15 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	blobs, err := localfs.New(filepath.Join(cfg.DataDir, "media"))
+	blobs, err := buildBlobStore(cfg)
 	if err != nil {
 		return nil, err
 	}
 	tr, err := buildTranscriber(cfg)
+	if err != nil {
+		return nil, err
+	}
+	authn, err := buildAuthenticator(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -69,6 +79,7 @@ func New(cfg *config.Config) (*App, error) {
 		queue:       dbqueue.New(st),
 		transcriber: tr,
 		sessions:    session.NewManager(cfg.SessionKey, session.WithSecure(secure)),
+		authn:       authn,
 		logger:      logger,
 	}, nil
 }
@@ -94,12 +105,17 @@ func (a *App) Serve(ctx context.Context) error {
 		return fmt.Errorf("app: start worker: %w", err)
 	}
 
-	srv, err := server.New(a.store, a.blobs, a.queue, a.sessions,
+	opts := []server.Option{
 		server.WithAddr(a.cfg.Addr),
 		server.WithBaseURL(a.cfg.BaseURL),
 		server.WithSiteName(a.cfg.SiteName),
+		server.WithAllowSignup(a.cfg.AllowSignup),
 		server.WithLogger(a.logger),
-	)
+	}
+	if a.authn != nil {
+		opts = append(opts, server.WithAuthenticator(a.authn))
+	}
+	srv, err := server.New(a.store, a.blobs, a.queue, a.sessions, opts...)
 	if err != nil {
 		return err
 	}
@@ -118,6 +134,67 @@ func (a *App) Serve(ctx context.Context) error {
 	cancel() // ensure the worker also winds down
 	<-wkCtrl.Done()
 	return errors.Join(srvCtrl.Err(), wkCtrl.Err())
+}
+
+// buildAuthenticator constructs the OIDC authenticator when an issuer is
+// configured, performing discovery with a bounded timeout. It returns nil when
+// OIDC is disabled.
+func buildAuthenticator(cfg *config.Config, logger *slog.Logger) (auth.Authenticator, error) {
+	if cfg.OIDCIssuer == "" {
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	authn, err := authoidc.New(ctx, authoidc.Config{
+		Issuer:       cfg.OIDCIssuer,
+		ClientID:     cfg.OIDCClientID,
+		ClientSecret: cfg.OIDCClientSecret,
+		RedirectURL:  cfg.OIDCRedirectURL,
+		Scopes:       cfg.OIDCScopes,
+	})
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("oidc enabled", "issuer", cfg.OIDCIssuer, "redirect_url", cfg.OIDCRedirectURL)
+	return authn, nil
+}
+
+// buildBlobStore selects the media blob backend. With no config file it is the
+// local filesystem under DataDir/media. Otherwise the JSON file's "type" field
+// picks the backend ("fs" or "s3") and supplies its settings.
+func buildBlobStore(cfg *config.Config) (blob.BlobStore, error) {
+	if cfg.BlobStoreConfig == "" {
+		return localfs.New(filepath.Join(cfg.DataDir, "media"))
+	}
+	data, err := os.ReadFile(cfg.BlobStoreConfig)
+	if err != nil {
+		return nil, fmt.Errorf("app: read blob store config: %w", err)
+	}
+	var head struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &head); err != nil {
+		return nil, fmt.Errorf("app: parse blob store config: %w", err)
+	}
+	switch head.Type {
+	case "", "fs":
+		var c struct {
+			Dir string `json:"dir"`
+		}
+		_ = json.Unmarshal(data, &c)
+		if c.Dir == "" {
+			c.Dir = filepath.Join(cfg.DataDir, "media")
+		}
+		return localfs.New(c.Dir)
+	case "s3":
+		var c s3.Config
+		if err := json.Unmarshal(data, &c); err != nil {
+			return nil, fmt.Errorf("app: parse s3 blob store config: %w", err)
+		}
+		return s3.New(c)
+	default:
+		return nil, fmt.Errorf("app: unknown blob store type %q", head.Type)
+	}
 }
 
 func buildTranscriber(cfg *config.Config) (transcribe.Transcriber, error) {

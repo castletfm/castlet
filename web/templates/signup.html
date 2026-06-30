@@ -1,0 +1,28 @@
+{{define "content"}}
+<section class="auth">
+  <h1>Create your account</h1>
+  {{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
+  <form method="post" action="/signup" class="stack">
+    <label>Display name
+      <input type="text" name="name" value="{{.Data.Name}}" autofocus>
+    </label>
+    <label>Email
+      <input type="email" name="email" value="{{.Data.Email}}" required>
+    </label>
+    <label>Password <span class="muted">(at least 8 characters)</span>
+      <input type="password" name="password" required>
+    </label>
+    <label>Confirm password
+      <input type="password" name="password_confirm" required>
+    </label>
+    <button type="submit">Sign up</button>
+  </form>
+
+  {{if .OIDCEnabled}}
+  <div class="auth-divider"><span>or</span></div>
+  <a class="btn ghost block" href="/auth/oidc/login">Sign up with single sign-on</a>
+  {{end}}
+
+  <p class="muted">Already have an account? <a href="/login">Log in</a>.</p>
+</section>
+{{end}}

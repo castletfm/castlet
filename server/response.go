@@ -10,10 +10,12 @@ import (
 // a successful render.
 func (s *Server) render(w http.ResponseWriter, r *http.Request, status int, page, title string, data any) {
 	vd := &ViewData{
-		Site:  s.siteName,
-		User:  userFrom(r.Context()),
-		Title: title,
-		Data:  data,
+		Site:        s.siteName,
+		User:        userFrom(r.Context()),
+		Title:       title,
+		AllowSignup: s.allowSignup,
+		OIDCEnabled: s.authn != nil,
+		Data:        data,
 	}
 	var buf bytes.Buffer
 	if err := s.renderer.Render(&buf, page, vd); err != nil {

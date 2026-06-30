@@ -11,5 +11,14 @@
     </label>
     <button type="submit">Log in</button>
   </form>
+
+  {{if .OIDCEnabled}}
+  <div class="auth-divider"><span>or</span></div>
+  <a class="btn ghost block" href="/auth/oidc/login">Log in with single sign-on</a>
+  {{end}}
+
+  {{if .AllowSignup}}
+  <p class="muted">No account? <a href="/signup">Sign up</a>.</p>
+  {{end}}
 </section>
 {{end}}

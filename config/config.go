@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"flag"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -18,6 +19,20 @@ type Config struct {
 
 	SessionKey   []byte // HMAC key for session cookies
 	GeneratedKey bool   // true when SessionKey was randomly generated this run
+
+	AllowSignup bool // enable the self-service local sign-up path
+
+	// BlobStoreConfig is the path to a JSON file selecting and configuring the
+	// media blob store (its "type" field picks the backend). Empty means the
+	// local filesystem under DataDir/media.
+	BlobStoreConfig string
+
+	// OIDC single sign-on. When OIDCIssuer is empty, OIDC is disabled.
+	OIDCIssuer       string
+	OIDCClientID     string
+	OIDCClientSecret string
+	OIDCRedirectURL  string   // defaults to BaseURL + /auth/oidc/callback
+	OIDCScopes       []string // defaults to openid, profile, email
 
 	Transcriber       string   // "null" (default) or "command"
 	TranscribeCommand string   // executable for the command transcriber
@@ -39,12 +54,23 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.Transcriber, "transcriber", env("CASTLET_TRANSCRIBER", "null"), "transcriber backend: null|command")
 	fs.StringVar(&cfg.TranscribeCommand, "transcribe-command", env("CASTLET_TRANSCRIBE_COMMAND", ""), "executable for the command transcriber")
 	fs.StringVar(&cfg.LogLevel, "log-level", env("CASTLET_LOG_LEVEL", "info"), "log level: debug|info|warn|error")
+	fs.BoolVar(&cfg.AllowSignup, "allow-signup", envBool("CASTLET_ALLOW_SIGNUP", true), "enable self-service local sign-up")
+	fs.StringVar(&cfg.BlobStoreConfig, "blob-store-config", env("CASTLET_BLOB_STORE_CONFIG", ""), "path to a JSON file configuring the media blob store (default: local filesystem under data-dir)")
+	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", env("CASTLET_OIDC_ISSUER", ""), "OIDC issuer URL (enables SSO when set)")
+	fs.StringVar(&cfg.OIDCClientID, "oidc-client-id", env("CASTLET_OIDC_CLIENT_ID", ""), "OIDC client id")
+	fs.StringVar(&cfg.OIDCClientSecret, "oidc-client-secret", env("CASTLET_OIDC_CLIENT_SECRET", ""), "OIDC client secret")
+	fs.StringVar(&cfg.OIDCRedirectURL, "oidc-redirect-url", env("CASTLET_OIDC_REDIRECT_URL", ""), "OIDC redirect URL (default base-url + /auth/oidc/callback)")
 	args0 := fs.String("transcribe-args", env("CASTLET_TRANSCRIBE_ARGS", "{{audio}}"), "space-separated argument template for the command transcriber")
+	scopes := fs.String("oidc-scopes", env("CASTLET_OIDC_SCOPES", "openid profile email"), "space-separated OIDC scopes")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
 	cfg.TranscribeArgs = strings.Fields(*args0)
+	cfg.OIDCScopes = strings.Fields(*scopes)
+	if cfg.OIDCRedirectURL == "" {
+		cfg.OIDCRedirectURL = strings.TrimRight(cfg.BaseURL, "/") + "/auth/oidc/callback"
+	}
 
 	if key := os.Getenv("CASTLET_SESSION_KEY"); key != "" {
 		cfg.SessionKey = []byte(key)
@@ -60,6 +86,19 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool reads a boolean env var; unset or unparseable falls back to def.
+func envBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 func randomKey() []byte {

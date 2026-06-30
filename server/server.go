@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/castletfm/castlet/auth"
 	"github.com/castletfm/castlet/blob"
 	"github.com/castletfm/castlet/internal/session"
 	"github.com/castletfm/castlet/queue"
@@ -30,15 +31,21 @@ var ErrServerClosed = errors.New("server: closed")
 // Server serves the Castlet web application. The receiver holds only validated
 // configuration and is safe to Run more than once.
 type Server struct {
-	store    store.Store
-	blobs    blob.BlobStore
-	queue    queue.JobQueue
-	sessions *session.Manager
-	renderer Renderer
+	store store.Store
+	blobs blob.BlobStore
+	// directBlobs is set (once, at construction) when the blob store can serve
+	// objects directly via a URL; then the media handler redirects instead of
+	// streaming. nil means always stream.
+	directBlobs blob.DirectURL
+	queue       queue.JobQueue
+	sessions    *session.Manager
+	renderer    Renderer
+	authn       auth.Authenticator // nil when OIDC is disabled
 
 	addr            string
 	baseURL         string
 	siteName        string
+	allowSignup     bool
 	maxUploadBytes  int64
 	shutdownTimeout time.Duration
 	logger          *slog.Logger
@@ -55,6 +62,8 @@ type (
 	identMaxUploadBytes struct{}
 	identLogger         struct{}
 	identRenderer       struct{}
+	identAllowSignup    struct{}
+	identAuthenticator  struct{}
 )
 
 // WithAddr sets the listen address (default ":8080").
@@ -79,12 +88,21 @@ func WithLogger(l *slog.Logger) Option { return option.New(identLogger{}, l) }
 // frontend. The default renders the embedded html/template pages.
 func WithRenderer(r Renderer) Option { return option.New(identRenderer{}, r) }
 
+// WithAllowSignup enables the self-service local sign-up path (default false).
+func WithAllowSignup(allow bool) Option { return option.New(identAllowSignup{}, allow) }
+
+// WithAuthenticator enables OIDC single sign-on using the given authenticator.
+// When unset, OIDC routes are disabled and the SSO button is hidden.
+func WithAuthenticator(a auth.Authenticator) Option { return option.New(identAuthenticator{}, a) }
+
 // New constructs a Server from its dependencies. It returns an error only if
 // the default renderer fails to parse its templates.
 func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *session.Manager, options ...Option) (*Server, error) {
+	direct, _ := blobs.(blob.DirectURL) // nil unless the backend serves directly
 	s := &Server{
 		store:           st,
 		blobs:           blobs,
+		directBlobs:     direct,
 		queue:           q,
 		sessions:        sessions,
 		addr:            ":8080",
@@ -109,6 +127,10 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *sessi
 			s.logger = option.MustGet[*slog.Logger](o)
 		case identRenderer:
 			s.renderer = option.MustGet[Renderer](o)
+		case identAllowSignup:
+			s.allowSignup = option.MustGet[bool](o)
+		case identAuthenticator:
+			s.authn = option.MustGet[auth.Authenticator](o)
 		}
 	}
 	if s.renderer == nil {
@@ -148,7 +170,8 @@ func (c *Controller) Wait() error { <-c.done; return c.Err() }
 // Run binds the listener and starts serving, returning immediately. A bind
 // failure is returned synchronously; runtime errors surface via the Controller.
 func (s *Server) Run(ctx context.Context) (*Controller, error) {
-	ln, err := net.Listen("tcp", s.addr)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", s.addr)
 	if err != nil {
 		return nil, fmt.Errorf("server: listen %q: %w", s.addr, err)
 	}
