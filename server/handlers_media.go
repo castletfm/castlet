@@ -13,11 +13,31 @@ import (
 	"github.com/castletfm/castlet/store"
 )
 
-// handleMedia streams a stored media object with range support so audio/video
-// players can seek. The content type comes from the owning episode; if no
-// episode references the key (e.g. channel art), http.ServeContent sniffs it.
+// handleMedia serves a stored media object. When the blob store can serve bytes
+// directly (object storage), it redirects to a presigned URL so audio never
+// flows through Castlet; otherwise it streams the object with HTTP range support
+// so audio/video players can seek. The content type comes from the owning
+// episode; if no episode references the key, http.ServeContent sniffs it.
 func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+
+	mime := ""
+	if ep, eerr := s.store.EpisodeByMediaKey(r.Context(), key); eerr == nil {
+		mime = ep.MediaMIME
+	}
+
+	// Direct-serving backend: redirect to the object store. Decided once at
+	// startup (s.directBlobs is nil for streaming backends).
+	if s.directBlobs != nil {
+		url, err := s.directBlobs.URL(r.Context(), key, mime)
+		if err != nil {
+			s.serverError(w, r, err)
+			return
+		}
+		http.Redirect(w, r, url, http.StatusFound)
+		return
+	}
+
 	rc, size, err := s.blobs.Get(r.Context(), key)
 	if errors.Is(err, blob.ErrNotFound) {
 		http.NotFound(w, r)
@@ -29,16 +49,16 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 
-	if ep, eerr := s.store.EpisodeByMediaKey(r.Context(), key); eerr == nil && ep.MediaMIME != "" {
-		w.Header().Set("Content-Type", ep.MediaMIME)
+	if mime != "" {
+		w.Header().Set("Content-Type", mime)
 	}
 	_ = size // ServeContent derives length from the seeker; size is informational
 	// Zero modtime omits Last-Modified but still supports range requests.
 	http.ServeContent(w, r, key, time.Time{}, rc)
 }
 
-func (s *Server) handleFeed(w http.ResponseWriter, r *http.Request, channelSlug string) {
-	ch, ok := s.lookupChannel(w, r, channelSlug)
+func (s *Server) handleFeed(w http.ResponseWriter, r *http.Request) {
+	ch, ok := s.lookupChannel(w, r, r.PathValue("id"))
 	if !ok {
 		return
 	}

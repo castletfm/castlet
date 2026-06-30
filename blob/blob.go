@@ -28,3 +28,15 @@ type BlobStore interface {
 	// Delete removes the object. Deleting a missing key is not an error.
 	Delete(ctx context.Context, key string) error
 }
+
+// DirectURL is an optional capability: a BlobStore that can hand a client a
+// URL to fetch an object directly (e.g. a presigned object-store URL), so the
+// server can redirect instead of streaming the bytes itself. The server checks
+// for this once at startup (a type assertion) and serves accordingly for the
+// life of the process; a store that does not implement it is always streamed.
+type DirectURL interface {
+	// URL returns a fetch URL for key. contentType is the Content-Type the
+	// response should carry (the server knows it from the episode); an
+	// implementation may encode it into the URL.
+	URL(ctx context.Context, key, contentType string) (string, error)
+}
