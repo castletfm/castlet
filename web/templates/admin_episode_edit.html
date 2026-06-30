@@ -1,0 +1,48 @@
+{{define "content"}}
+{{$ch := .Data.Channel}}
+{{$ep := .Data.Episode}}
+<section class="admin-head">
+  <h1>Edit episode — {{$ch.Title}}</h1>
+  {{if eq (printf "%s" $ep.Status) "published"}}
+  <a class="btn ghost" href="/e/{{$ep.ID}}/" target="_blank" rel="noopener">View published page</a>
+  {{end}}
+</section>
+
+{{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
+
+<form method="post" action="/admin/episodes/{{$ep.ID}}" class="stack">
+  <label>Title
+    <input type="text" name="title" value="{{.Data.Title}}" required autofocus>
+  </label>
+  <label>Description
+    <textarea name="description" rows="4">{{.Data.Description}}</textarea>
+  </label>
+  <label>Spoken language <span class="muted">(re-transcribe to apply a change)</span>
+    {{$lang := .Data.Language}}
+    <select name="language">
+      <option value=""{{if eq $lang ""}} selected{{end}}>Auto-detect</option>
+      {{range languageOptions}}<option value="{{.Code}}"{{if eq .Code $lang}} selected{{end}}>{{.Name}}</option>{{end}}
+    </select>
+  </label>
+  <div class="form-actions">
+    <button type="submit">Save</button>
+    <a class="btn ghost" href="/admin/channels/{{$ch.ID}}/episodes">Cancel</a>
+  </div>
+  <p class="muted">
+    Media is immutable once uploaded ({{$ep.MediaMIME}}, {{$ep.MediaBytes}} bytes); to replace it, delete and re-upload.
+  </p>
+</form>
+
+{{$ts := printf "%s" $ep.TranscriptStatus}}
+<section class="admin-subsection">
+  <h2>Transcript <span class="badge {{$ts}}">{{$ep.TranscriptStatus}}</span></h2>
+  <p class="muted">Re-runs transcription on the existing media using the saved language above. Save first if you changed it.</p>
+  {{if or (eq $ts "pending") (eq $ts "processing")}}
+  <button class="btn ghost" disabled>Transcribing…</button>
+  {{else}}
+  <form method="post" action="/admin/episodes/{{$ep.ID}}/transcribe" class="inline">
+    <button class="btn ghost" type="submit">Re-transcribe</button>
+  </form>
+  {{end}}
+</section>
+{{end}}

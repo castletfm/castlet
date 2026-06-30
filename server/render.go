@@ -18,13 +18,15 @@ type Renderer interface {
 	Render(w io.Writer, page string, data *ViewData) error
 }
 
-// ViewData is the uniform shape handed to every page. Site and User populate
-// the shared layout; Data carries page-specific values.
+// ViewData is the uniform shape handed to every page. Site, User, and the
+// feature flags populate the shared layout; Data carries page-specific values.
 type ViewData struct {
-	Site  string
-	User  *model.User
-	Title string
-	Data  any
+	Site        string
+	User        *model.User
+	Title       string
+	AllowSignup bool // show local sign-up affordances
+	OIDCEnabled bool // show the single sign-on button
+	Data        any
 }
 
 // pageNames are the templates parsed at startup. Each is rendered as the
@@ -34,10 +36,13 @@ var pageNames = []string{
 	"channel",
 	"episode",
 	"login",
+	"signup",
 	"admin_dashboard",
+	"admin_upload",
 	"admin_channel_form",
 	"admin_episodes",
 	"admin_episode_form",
+	"admin_episode_edit",
 	"error",
 }
 
@@ -51,6 +56,8 @@ func newTemplateRenderer() (*templateRenderer, error) {
 		"formatDuration":    formatDuration,
 		"formatTimecode":    formatTimecode,
 		"transcriptMessage": transcriptMessage,
+		"languageOptions":   func() []langOption { return feedLanguages },
+		"add":               func(a, b int) int { return a + b },
 	}
 	tr := &templateRenderer{pages: make(map[string]*template.Template, len(pageNames))}
 	for _, name := range pageNames {
@@ -101,4 +108,38 @@ func transcriptMessage(status model.TranscriptStatus) string {
 	default:
 		return "No transcript is available for this episode."
 	}
+}
+
+// langOption is one entry in the channel primary-language dropdown.
+type langOption struct {
+	Code string
+	Name string
+}
+
+// feedLanguages are the choices for a channel's primary (feed) language. Codes
+// are ISO 639-1, the form Apple Podcasts accepts and that we emit as the RSS
+// channel <language>. This is the whole feed's primary language, not a per-
+// episode setting (RSS has no per-item language); transcription detects each
+// episode's language separately.
+var feedLanguages = []langOption{
+	{"en", "English"},
+	{"ja", "Japanese (日本語)"},
+	{"zh", "Chinese (中文)"},
+	{"ko", "Korean (한국어)"},
+	{"es", "Spanish (Español)"},
+	{"pt", "Portuguese (Português)"},
+	{"fr", "French (Français)"},
+	{"de", "German (Deutsch)"},
+	{"it", "Italian (Italiano)"},
+	{"nl", "Dutch (Nederlands)"},
+	{"ru", "Russian (Русский)"},
+	{"ar", "Arabic (العربية)"},
+	{"hi", "Hindi (हिन्दी)"},
+	{"id", "Indonesian (Bahasa Indonesia)"},
+	{"tr", "Turkish (Türkçe)"},
+	{"pl", "Polish (Polski)"},
+	{"sv", "Swedish (Svenska)"},
+	{"uk", "Ukrainian (Українська)"},
+	{"vi", "Vietnamese (Tiếng Việt)"},
+	{"th", "Thai (ไทย)"},
 }

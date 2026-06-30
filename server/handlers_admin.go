@@ -1,11 +1,15 @@
 package server
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/castletfm/castlet/internal/idgen"
-	"github.com/castletfm/castlet/internal/slug"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/store"
 )
@@ -48,7 +52,6 @@ func (s *Server) handleChannelCreate(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:   s.now(),
 		UpdatedAt:   s.now(),
 	}
-	ch.Slug = s.channelSlug(r.FormValue("slug"), ch.Title)
 
 	if msg := s.validateChannel(ch); msg != "" {
 		s.render(w, r, http.StatusBadRequest, "admin_channel_form", "New channel",
@@ -56,11 +59,6 @@ func (s *Server) handleChannelCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.CreateChannel(r.Context(), ch); err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			s.render(w, r, http.StatusConflict, "admin_channel_form", "New channel",
-				channelForm{Channel: ch, Action: "/admin/channels", Error: "That slug is already taken."})
-			return
-		}
 		s.serverError(w, r, err)
 		return
 	}
@@ -84,7 +82,6 @@ func (s *Server) handleChannelUpdate(w http.ResponseWriter, r *http.Request) {
 	ch.Title = r.FormValue("title")
 	ch.Description = r.FormValue("description")
 	ch.Language = orDefault(r.FormValue("language"), "en")
-	ch.Slug = s.channelSlug(r.FormValue("slug"), ch.Title)
 	ch.UpdatedAt = s.now()
 
 	action := "/admin/channels/" + ch.ID
@@ -94,11 +91,6 @@ func (s *Server) handleChannelUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.UpdateChannel(r.Context(), ch); err != nil {
-		if errors.Is(err, store.ErrConflict) {
-			s.render(w, r, http.StatusConflict, "admin_channel_form", "Edit channel",
-				channelForm{Channel: ch, Action: action, Error: "That slug is already taken."})
-			return
-		}
 		s.serverError(w, r, err)
 		return
 	}
@@ -109,25 +101,28 @@ func (s *Server) validateChannel(ch *model.Channel) string {
 	if ch.Title == "" {
 		return "Title is required."
 	}
-	if ch.Slug == "" {
-		return "Could not derive a slug; please provide one."
-	}
-	if isReservedSlug(ch.Slug) {
-		return "That slug is reserved; choose another."
-	}
 	return ""
 }
 
-// channelSlug uses the provided slug, falling back to one derived from the
-// title, then to a generated id so a channel is always reachable.
-func (s *Server) channelSlug(provided, title string) string {
-	if sl := slug.Make(provided); sl != "" {
-		return sl
+// handleUpload is the global "Upload" entry point shown in the header for any
+// logged-in user. Episodes belong to a channel, so it routes by how many the
+// user owns: straight to the upload form when there is exactly one, a channel
+// picker when there are several, and a create-a-channel prompt when there are
+// none.
+func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
+	user := userFrom(r.Context())
+	channels, err := s.store.ListChannelsByUser(r.Context(), user.ID)
+	if err != nil {
+		s.serverError(w, r, err)
+		return
 	}
-	if sl := slug.Make(title); sl != "" {
-		return sl
+	if len(channels) == 1 {
+		s.redirect(w, r, "/admin/channels/"+channels[0].ID+"/episodes/new")
+		return
 	}
-	return idgen.New()
+	s.render(w, r, http.StatusOK, "admin_upload", "Upload", struct {
+		Channels []*model.Channel
+	}{Channels: channels})
 }
 
 // --- episodes ---------------------------------------------------------------
@@ -151,8 +146,8 @@ func (s *Server) handleEpisodeList(w http.ResponseWriter, r *http.Request) {
 type episodeForm struct {
 	Channel     *model.Channel
 	Title       string
-	Slug        string
 	Description string
+	Language    string // spoken language for transcription; "" = auto-detect
 	Error       string
 }
 
@@ -161,7 +156,10 @@ func (s *Server) handleEpisodeNew(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.render(w, r, http.StatusOK, "admin_episode_form", "New episode", episodeForm{Channel: ch})
+	// Default the episode's spoken language to the channel's primary language so
+	// the common single-language case needs no extra clicks.
+	s.render(w, r, http.StatusOK, "admin_episode_form", "New episode",
+		episodeForm{Channel: ch, Language: ch.Language})
 }
 
 func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
@@ -170,7 +168,8 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	form := episodeForm{Channel: ch, Title: r.FormValue("title"), Slug: r.FormValue("slug"), Description: r.FormValue("description")}
+	form := episodeForm{Channel: ch, Title: r.FormValue("title"),
+		Description: r.FormValue("description"), Language: r.FormValue("language")}
 	reRender := func(status int, msg string) {
 		form.Error = msg
 		s.render(w, r, status, "admin_episode_form", "New episode", form)
@@ -191,7 +190,20 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	defer file.Close()
 
 	mime := detectUploadMIME(header)
-	mediaKey := idgen.New()
+	// Content-address the media: the blob key is the sha256 of the bytes, so a
+	// media URL is permanently bound to exactly those bytes — they cannot change
+	// without becoming a different URL. (The uploaded file is seekable, so we can
+	// hash it and then rewind to store it.)
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	mediaKey := hex.EncodeToString(hasher.Sum(nil))
 	n, err := s.blobs.Put(r.Context(), mediaKey, file)
 	if err != nil {
 		s.serverError(w, r, err)
@@ -201,25 +213,20 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	ep := &model.Episode{
 		ID:               idgen.New(),
 		ChannelID:        ch.ID,
-		Slug:             s.episodeSlug(form.Slug, form.Title),
 		Title:            form.Title,
 		Description:      form.Description,
 		MediaKey:         mediaKey,
 		MediaMIME:        mime,
 		MediaKind:        model.DetectMediaKind(mime),
 		MediaBytes:       n,
+		Language:         form.Language,
 		Status:           model.EpisodeDraft,
 		TranscriptStatus: model.TranscriptPending,
 		CreatedAt:        s.now(),
 		UpdatedAt:        s.now(),
 	}
 	if err := s.store.CreateEpisode(r.Context(), ep); err != nil {
-		// Roll back the orphaned blob on a metadata failure.
-		_ = s.blobs.Delete(r.Context(), mediaKey)
-		if errors.Is(err, store.ErrConflict) {
-			reRender(http.StatusConflict, "An episode with that slug already exists in this channel.")
-			return
-		}
+		s.deleteOrphanBlob(r.Context(), mediaKey) // only if no other episode shares it
 		s.serverError(w, r, err)
 		return
 	}
@@ -232,12 +239,103 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
 
+// episodeEditForm backs the admin episode edit page. Media is immutable, so it
+// is not part of the form; only metadata is editable.
+type episodeEditForm struct {
+	Episode     *model.Episode
+	Channel     *model.Channel
+	Title       string
+	Description string
+	Language    string
+	Error       string
+}
+
+func (s *Server) handleEpisodeEdit(w http.ResponseWriter, r *http.Request) {
+	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	s.render(w, r, http.StatusOK, "admin_episode_edit", "Edit episode", episodeEditForm{
+		Episode: ep, Channel: ch, Title: ep.Title, Description: ep.Description, Language: ep.Language})
+}
+
+func (s *Server) handleEpisodeUpdate(w http.ResponseWriter, r *http.Request) {
+	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	form := episodeEditForm{Episode: ep, Channel: ch, Title: r.FormValue("title"),
+		Description: r.FormValue("description"), Language: r.FormValue("language")}
+	if form.Title == "" {
+		form.Error = "Title is required."
+		s.render(w, r, http.StatusBadRequest, "admin_episode_edit", "Edit episode", form)
+		return
+	}
+	// Metadata only — MediaKey is left untouched, so the bytes never change.
+	ep.Title = form.Title
+	ep.Description = form.Description
+	ep.Language = form.Language
+	ep.UpdatedAt = s.now()
+	if err := s.store.UpdateEpisode(r.Context(), ep); err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
+}
+
 func (s *Server) handleEpisodePublish(w http.ResponseWriter, r *http.Request) {
 	s.setEpisodePublished(w, r, true)
 }
 
 func (s *Server) handleEpisodeUnpublish(w http.ResponseWriter, r *http.Request) {
 	s.setEpisodePublished(w, r, false)
+}
+
+// handleEpisodeMove reorders an episode within its channel one step up or down
+// (form field "dir" = up|down). It loads the channel's episodes in display
+// order, swaps the target with its neighbour, then renumbers positions densely
+// so the manual order is well-defined from then on.
+func (s *Server) handleEpisodeMove(w http.ResponseWriter, r *http.Request) {
+	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	dest := "/admin/channels/" + ch.ID + "/episodes"
+
+	eps, err := s.store.ListEpisodes(r.Context(), store.EpisodeFilter{ChannelID: ch.ID})
+	if err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	i := -1
+	for idx, e := range eps {
+		if e.ID == ep.ID {
+			i = idx
+			break
+		}
+	}
+	j := i - 1
+	if r.FormValue("dir") == "down" {
+		j = i + 1
+	}
+	if i < 0 || j < 0 || j >= len(eps) {
+		s.redirect(w, r, dest) // already at an edge or not found; nothing to do
+		return
+	}
+	eps[i], eps[j] = eps[j], eps[i]
+
+	for idx, e := range eps {
+		if e.Position == idx {
+			continue
+		}
+		e.Position = idx
+		e.UpdatedAt = s.now()
+		if err := s.store.UpdateEpisode(r.Context(), e); err != nil {
+			s.serverError(w, r, err)
+			return
+		}
+	}
+	s.redirect(w, r, dest)
 }
 
 func (s *Server) setEpisodePublished(w http.ResponseWriter, r *http.Request, publish bool) {
@@ -262,6 +360,47 @@ func (s *Server) setEpisodePublished(w http.ResponseWriter, r *http.Request, pub
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
 
+// handleEpisodeTranscribe re-runs transcription for an existing episode using
+// its saved language (set on the edit page): it resets the status to pending and
+// re-enqueues the job, without re-uploading the media.
+func (s *Server) handleEpisodeTranscribe(w http.ResponseWriter, r *http.Request) {
+	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	// Reject overlapping requests: transcription is already queued or running.
+	if ep.TranscriptStatus == model.TranscriptPending || ep.TranscriptStatus == model.TranscriptProcessing {
+		s.renderError(w, r, http.StatusConflict, "Transcription is already in progress for this episode.")
+		return
+	}
+	ep.TranscriptStatus = model.TranscriptPending
+	ep.UpdatedAt = s.now()
+	if err := s.store.UpdateEpisode(r.Context(), ep); err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	if err := s.queue.Enqueue(r.Context(), model.JobTranscribe, model.TranscribePayload{EpisodeID: ep.ID}); err != nil {
+		s.logger.Error("enqueue re-transcription", "episode", ep.ID, "error", err)
+	}
+	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
+}
+
+// handleEpisodeStatus returns an episode's transcript status as JSON, so the
+// admin episode list can poll and update the badge live while transcription
+// runs (no full-page reload).
+func (s *Server) handleEpisodeStatus(w http.ResponseWriter, r *http.Request) {
+	ep, _, ok := s.ownedEpisode(w, r, r.PathValue("id"))
+	if !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(struct {
+		Transcript string `json:"transcript"`
+	}{Transcript: string(ep.TranscriptStatus)}); err != nil {
+		s.logger.Error("encode episode status", "episode", ep.ID, "error", err)
+	}
+}
+
 func (s *Server) handleEpisodeDelete(w http.ResponseWriter, r *http.Request) {
 	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
 	if !ok {
@@ -271,22 +410,26 @@ func (s *Server) handleEpisodeDelete(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, r, err)
 		return
 	}
-	if ep.MediaKey != "" {
-		if err := s.blobs.Delete(r.Context(), ep.MediaKey); err != nil {
-			s.logger.Error("delete media blob", "key", ep.MediaKey, "error", err)
-		}
-	}
+	s.deleteOrphanBlob(r.Context(), ep.MediaKey)
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
 
-func (s *Server) episodeSlug(provided, title string) string {
-	if sl := slug.Make(provided); sl != "" {
-		return sl
+// deleteOrphanBlob removes a media blob, but only if no (other) episode still
+// references it. Media is content-addressed, so identical uploads share a key;
+// this keeps a delete from yanking a blob another episode depends on.
+func (s *Server) deleteOrphanBlob(ctx context.Context, key string) {
+	if key == "" {
+		return
 	}
-	if sl := slug.Make(title); sl != "" {
-		return sl
+	if _, err := s.store.EpisodeByMediaKey(ctx, key); err == nil {
+		return // still referenced
+	} else if !errors.Is(err, store.ErrNotFound) {
+		s.logger.Error("check media references", "key", key, "error", err)
+		return
 	}
-	return idgen.New()
+	if err := s.blobs.Delete(ctx, key); err != nil {
+		s.logger.Error("delete media blob", "key", key, "error", err)
+	}
 }
 
 // --- ownership helpers ------------------------------------------------------

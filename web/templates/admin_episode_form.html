@@ -10,11 +10,17 @@
   <label>Title
     <input type="text" name="title" value="{{.Data.Title}}" required autofocus>
   </label>
-  <label>Slug <span class="muted">(URL; leave blank to derive from title)</span>
-    <input type="text" name="slug" value="{{.Data.Slug}}">
-  </label>
   <label>Description
     <textarea name="description" rows="4">{{.Data.Description}}</textarea>
+  </label>
+  <label>Spoken language <span class="muted">(for transcription accuracy and punctuation)</span>
+    {{$lang := .Data.Language}}
+    <select name="language">
+      <option value=""{{if eq $lang ""}} selected{{end}}>Auto-detect</option>
+      {{range languageOptions}}
+      <option value="{{.Code}}"{{if eq .Code $lang}} selected{{end}}>{{.Name}}</option>
+      {{end}}
+    </select>
   </label>
   <label>Media file <span class="muted">(audio or video)</span>
     <input type="file" name="media" accept="audio/*,video/*" required>

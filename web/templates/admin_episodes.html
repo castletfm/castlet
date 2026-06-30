@@ -7,15 +7,25 @@
 
 {{if .Data.Episodes}}
 <table class="admin-table">
-  <thead><tr><th>Title</th><th>Status</th><th>Transcript</th><th></th></tr></thead>
+  <thead><tr><th>Order</th><th>Title</th><th>Status</th><th>Transcript</th><th></th></tr></thead>
   <tbody>
-    {{range .Data.Episodes}}
+    {{$n := len .Data.Episodes}}
+    {{range $i, $e := .Data.Episodes}}
     <tr>
-      <td><a href="/{{$ch.Slug}}/{{.Slug}}/">{{.Title}}</a></td>
+      <td class="reorder">
+        {{if $i}}<form method="post" action="/admin/episodes/{{.ID}}/move" class="inline"><input type="hidden" name="dir" value="up"><button class="linklike" type="submit" title="Move up" aria-label="Move up">↑</button></form>{{end}}
+        {{if lt (add $i 1) $n}}<form method="post" action="/admin/episodes/{{.ID}}/move" class="inline"><input type="hidden" name="dir" value="down"><button class="linklike" type="submit" title="Move down" aria-label="Move down">↓</button></form>{{end}}
+      </td>
+      <td><a href="/admin/episodes/{{.ID}}/edit">{{.Title}}</a></td>
       <td><span class="badge {{.Status}}">{{.Status}}</span></td>
-      <td><span class="badge">{{.TranscriptStatus}}</span></td>
+      {{$ts := printf "%s" .TranscriptStatus}}
+      <td class="transcript-cell" data-episode="{{.ID}}">
+        <span class="badge transcript-badge {{$ts}}">{{.TranscriptStatus}}</span>
+        {{if or (eq $ts "pending") (eq $ts "processing")}}<span class="progress" role="progressbar" aria-label="Transcribing"></span>{{end}}
+      </td>
       <td class="actions">
         {{if eq (printf "%s" .Status) "published"}}
+        <a href="/e/{{.ID}}/" target="_blank" rel="noopener">View</a>
         <form method="post" action="/admin/episodes/{{.ID}}/unpublish" class="inline">
           <button class="linklike" type="submit">Unpublish</button>
         </form>
@@ -24,6 +34,7 @@
           <button class="linklike" type="submit">Publish</button>
         </form>
         {{end}}
+        <a href="/admin/episodes/{{.ID}}/edit">Edit</a>
         <form method="post" action="/admin/episodes/{{.ID}}/delete" class="inline"
               onsubmit="return confirm('Delete this episode?')">
           <button class="linklike danger" type="submit">Delete</button>
@@ -37,4 +48,38 @@
 <p class="empty">No episodes yet.</p>
 {{end}}
 <p><a href="/admin/">← Back to channels</a></p>
+
+<script>
+// Poll transcript status for in-progress episodes and update the badge live, so
+// the list reflects pending -> processing -> done without a manual reload.
+(function () {
+  var active = {};
+  document.querySelectorAll('.transcript-cell').forEach(function (cell) {
+    var st = cell.querySelector('.transcript-badge').textContent.trim();
+    if (st === 'pending' || st === 'processing') active[cell.dataset.episode] = cell;
+  });
+  function tick() {
+    var ids = Object.keys(active);
+    if (!ids.length) return;
+    Promise.all(ids.map(function (id) {
+      return fetch('/admin/episodes/' + id + '/status', { headers: { Accept: 'application/json' } })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d) return;
+          var cell = active[id], st = d.transcript;
+          var badge = cell.querySelector('.transcript-badge');
+          badge.textContent = st;
+          badge.className = 'badge transcript-badge ' + st;
+          if (st !== 'pending' && st !== 'processing') {
+            var bar = cell.querySelector('.progress');
+            if (bar) bar.remove();
+            delete active[id];
+          }
+        })
+        .catch(function () {});
+    })).then(function () { if (Object.keys(active).length) setTimeout(tick, 3000); });
+  }
+  if (Object.keys(active).length) setTimeout(tick, 3000);
+})();
+</script>
 {{end}}

@@ -1,0 +1,19 @@
+{{define "content"}}
+<section class="admin-head">
+  <h1>Upload an episode</h1>
+</section>
+
+{{if .Data.Channels}}
+<p>Which channel is this episode for?</p>
+<ul class="channel-picker">
+  {{range .Data.Channels}}
+  <li>
+    <a class="btn ghost block" href="/admin/channels/{{.ID}}/episodes/new">{{.Title}}</a>
+  </li>
+  {{end}}
+</ul>
+{{else}}
+<p class="empty">You need a channel before you can upload an episode.
+  <a href="/admin/channels/new">Create your first channel</a>.</p>
+{{end}}
+{{end}}

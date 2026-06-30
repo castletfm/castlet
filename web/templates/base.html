@@ -12,7 +12,8 @@
     <a class="brand" href="/">{{.Site}}</a>
     <nav>
       {{if .User}}
-        <a href="/admin/">Admin</a>
+        <a class="btn nav-upload" href="/admin/upload">Upload</a>
+        <a href="/admin/">My Page</a>
         <form method="post" action="/logout" class="inline">
           <button type="submit" class="linklike">Log out</button>
         </form>
