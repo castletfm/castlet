@@ -1,0 +1,5 @@
+.data/
+.dex/
+.minio/
+.whisper/
+.blobstore.json

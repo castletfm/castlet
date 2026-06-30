@@ -1,0 +1,36 @@
+# Dex OIDC provider config for the standalone Castlet example. Fully offline —
+# no Google/Cloud account needed. Started by run.sh.
+issuer: http://127.0.0.1:5556/dex
+
+# Persist to a sqlite file under /var/dex, which run.sh bind-mounts to a local
+# .dex/ directory so issued keys/tokens survive restarts. The container runs as
+# the host user (see run.sh) so this path is writable without chowning.
+storage:
+  type: sqlite3
+  config:
+    file: /var/dex/dex.db
+
+web:
+  http: 0.0.0.0:5556
+
+oauth2:
+  # Skip the "grant access?" approval screen so the demo is one fewer click.
+  skipApprovalScreen: true
+
+staticClients:
+  - id: castlet
+    name: Castlet (standalone example)
+    secret: castlet-secret
+    redirectURIs:
+      - http://127.0.0.1:18080/auth/oidc/callback
+
+# A single built-in test user. Log in at the Dex form with:
+#   email:    user@example.com
+#   password: password
+enablePasswordDB: true
+staticPasswords:
+  - email: user@example.com
+    # bcrypt hash of "password".
+    hash: "$2a$10$XU0EwqYhnOuNCsKkHIj9OeagfUI5UAyuDwhZby9RHNq9c/IgCUVay"
+    username: user
+    userID: "08a8684b-db88-4b73-90a9-3cd1661f5466"
