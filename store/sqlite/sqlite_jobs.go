@@ -1,0 +1,127 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/castletfm/castlet/model"
+)
+
+func (s *Store) EnqueueJob(ctx context.Context, j *model.Job) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO jobs (id, kind, payload, status, attempts, last_error, run_after, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		j.ID, string(j.Kind), j.Payload, string(j.Status), j.Attempts, j.LastError,
+		toUnix(j.RunAfter), toUnix(j.CreatedAt), toUnix(j.UpdatedAt))
+	if err != nil {
+		return fmt.Errorf("sqlite: enqueue job: %w", mapErr(err))
+	}
+	return nil
+}
+
+func (s *Store) JobByID(ctx context.Context, id string) (*model.Job, error) {
+	j, err := scanJob(s.db.QueryRowContext(ctx,
+		`SELECT id, kind, payload, status, attempts, last_error, run_after, created_at, updated_at
+		 FROM jobs WHERE id = ?`, id))
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return j, nil
+}
+
+// ClaimJob atomically selects and locks the oldest runnable job. Because the
+// pool is a single writer, the SELECT-then-UPDATE inside one transaction is
+// race-free across worker goroutines and processes sharing the file.
+func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Time, lease time.Duration) (*model.Job, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	query := `SELECT id, kind, payload, status, attempts, last_error, run_after, created_at, updated_at
+		FROM jobs WHERE status = ? AND run_after <= ?`
+	args := []any{string(model.JobPending), toUnix(now)}
+	if len(kinds) > 0 {
+		ph := make([]string, len(kinds))
+		for i, k := range kinds {
+			ph[i] = "?"
+			args = append(args, string(k))
+		}
+		query += " AND kind IN (" + strings.Join(ph, ",") + ")"
+	}
+	query += " ORDER BY run_after ASC, created_at ASC LIMIT 1"
+
+	j, err := scanJob(tx.QueryRowContext(ctx, query, args...))
+	if err != nil {
+		return nil, mapErr(err) // ErrNotFound when nothing is runnable
+	}
+
+	// Lease the job: mark processing, bump attempts, push run_after out by the
+	// lease so a crashed worker's job becomes reclaimable after it expires.
+	j.Status = model.JobProcessing
+	j.Attempts++
+	j.UpdatedAt = now
+	j.RunAfter = now.Add(lease)
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, attempts = ?, run_after = ?, updated_at = ? WHERE id = ?`,
+		string(j.Status), j.Attempts, toUnix(j.RunAfter), toUnix(j.UpdatedAt), j.ID); err != nil {
+		return nil, mapErr(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, mapErr(err)
+	}
+	return j, nil
+}
+
+func (s *Store) CompleteJob(ctx context.Context, id string) error {
+	return s.setJobStatus(ctx, id, model.JobDone, "", nil)
+}
+
+func (s *Store) RescheduleJob(ctx context.Context, id string, runAfter time.Time, cause string) error {
+	return s.setJobStatus(ctx, id, model.JobPending, cause, &runAfter)
+}
+
+func (s *Store) FailJob(ctx context.Context, id string, cause string) error {
+	return s.setJobStatus(ctx, id, model.JobFailed, cause, nil)
+}
+
+func (s *Store) setJobStatus(ctx context.Context, id string, status model.JobStatus, cause string, runAfter *time.Time) error {
+	now := time.Now()
+	var res sql.Result
+	var err error
+	if runAfter != nil {
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE jobs SET status = ?, last_error = ?, run_after = ?, updated_at = ? WHERE id = ?`,
+			string(status), cause, toUnix(*runAfter), toUnix(now), id)
+	} else {
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+			string(status), cause, toUnix(now), id)
+	}
+	if err != nil {
+		return fmt.Errorf("sqlite: update job status: %w", mapErr(err))
+	}
+	return requireAffected(res)
+}
+
+func scanJob(sc interface{ Scan(...any) error }) (*model.Job, error) {
+	var (
+		j                      model.Job
+		kind, status           string
+		runAfter, created, upd int64
+	)
+	if err := sc.Scan(&j.ID, &kind, &j.Payload, &status, &j.Attempts, &j.LastError,
+		&runAfter, &created, &upd); err != nil {
+		return nil, err
+	}
+	j.Kind = model.JobKind(kind)
+	j.Status = model.JobStatus(status)
+	j.RunAfter = fromUnix(runAfter)
+	j.CreatedAt = fromUnix(created)
+	j.UpdatedAt = fromUnix(upd)
+	return &j, nil
+}

@@ -1,0 +1,15 @@
+{{define "content"}}
+<section class="auth">
+  <h1>Log in</h1>
+  {{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
+  <form method="post" action="/login" class="stack">
+    <label>Email
+      <input type="email" name="email" value="{{.Data.Email}}" required autofocus>
+    </label>
+    <label>Password
+      <input type="password" name="password" required>
+    </label>
+    <button type="submit">Log in</button>
+  </form>
+</section>
+{{end}}

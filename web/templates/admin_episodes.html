@@ -1,0 +1,40 @@
+{{define "content"}}
+{{$ch := .Data.Channel}}
+<section class="admin-head">
+  <h1>{{$ch.Title}} — episodes</h1>
+  <a class="btn" href="/admin/channels/{{$ch.ID}}/episodes/new">New episode</a>
+</section>
+
+{{if .Data.Episodes}}
+<table class="admin-table">
+  <thead><tr><th>Title</th><th>Status</th><th>Transcript</th><th></th></tr></thead>
+  <tbody>
+    {{range .Data.Episodes}}
+    <tr>
+      <td><a href="/{{$ch.Slug}}/{{.Slug}}/">{{.Title}}</a></td>
+      <td><span class="badge {{.Status}}">{{.Status}}</span></td>
+      <td><span class="badge">{{.TranscriptStatus}}</span></td>
+      <td class="actions">
+        {{if eq (printf "%s" .Status) "published"}}
+        <form method="post" action="/admin/episodes/{{.ID}}/unpublish" class="inline">
+          <button class="linklike" type="submit">Unpublish</button>
+        </form>
+        {{else}}
+        <form method="post" action="/admin/episodes/{{.ID}}/publish" class="inline">
+          <button class="linklike" type="submit">Publish</button>
+        </form>
+        {{end}}
+        <form method="post" action="/admin/episodes/{{.ID}}/delete" class="inline"
+              onsubmit="return confirm('Delete this episode?')">
+          <button class="linklike danger" type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">No episodes yet.</p>
+{{end}}
+<p><a href="/admin/">← Back to channels</a></p>
+{{end}}

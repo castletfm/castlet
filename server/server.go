@@ -1,0 +1,177 @@
+// Package server is Castlet's HTTP front end: public channel/episode pages, an
+// RSS feed, media delivery, cookie-based login, and the admin area. It follows
+// the house Run/Controller lifecycle: Run binds the listener synchronously and
+// returns a Controller; cancelling the context passed to Run gracefully shuts
+// the server down. There is no recover() middleware — a panicking handler
+// propagates so the operator's restart policy applies.
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"sync/atomic"
+	"time"
+
+	"github.com/castletfm/castlet/blob"
+	"github.com/castletfm/castlet/internal/session"
+	"github.com/castletfm/castlet/queue"
+	"github.com/castletfm/castlet/store"
+	"github.com/lestrrat-go/option/v3"
+)
+
+// ErrServerClosed is recorded on the Controller when the server stops because
+// its context was cancelled, distinguishing a clean shutdown from a crash.
+var ErrServerClosed = errors.New("server: closed")
+
+// Server serves the Castlet web application. The receiver holds only validated
+// configuration and is safe to Run more than once.
+type Server struct {
+	store    store.Store
+	blobs    blob.BlobStore
+	queue    queue.JobQueue
+	sessions *session.Manager
+	renderer Renderer
+
+	addr            string
+	baseURL         string
+	siteName        string
+	maxUploadBytes  int64
+	shutdownTimeout time.Duration
+	logger          *slog.Logger
+	now             func() time.Time
+}
+
+// Option configures New.
+type Option = option.Interface
+
+type (
+	identAddr           struct{}
+	identBaseURL        struct{}
+	identSiteName       struct{}
+	identMaxUploadBytes struct{}
+	identLogger         struct{}
+	identRenderer       struct{}
+)
+
+// WithAddr sets the listen address (default ":8080").
+func WithAddr(addr string) Option { return option.New(identAddr{}, addr) }
+
+// WithBaseURL sets the absolute site root used for feed and enclosure URLs
+// (default "http://localhost:8080").
+func WithBaseURL(u string) Option { return option.New(identBaseURL{}, u) }
+
+// WithSiteName sets the site name shown in the header and titles
+// (default "Castlet").
+func WithSiteName(name string) Option { return option.New(identSiteName{}, name) }
+
+// WithMaxUploadBytes caps the size of an episode audio upload
+// (default 512 MiB).
+func WithMaxUploadBytes(n int64) Option { return option.New(identMaxUploadBytes{}, n) }
+
+// WithLogger sets the structured logger (default slog.Default()).
+func WithLogger(l *slog.Logger) Option { return option.New(identLogger{}, l) }
+
+// WithRenderer overrides the view renderer, the seam for an alternative
+// frontend. The default renders the embedded html/template pages.
+func WithRenderer(r Renderer) Option { return option.New(identRenderer{}, r) }
+
+// New constructs a Server from its dependencies. It returns an error only if
+// the default renderer fails to parse its templates.
+func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *session.Manager, options ...Option) (*Server, error) {
+	s := &Server{
+		store:           st,
+		blobs:           blobs,
+		queue:           q,
+		sessions:        sessions,
+		addr:            ":8080",
+		baseURL:         "http://localhost:8080",
+		siteName:        "Castlet",
+		maxUploadBytes:  512 << 20,
+		shutdownTimeout: 10 * time.Second,
+		logger:          slog.Default(),
+		now:             time.Now,
+	}
+	for _, o := range options {
+		switch o.Ident().(type) {
+		case identAddr:
+			s.addr = option.MustGet[string](o)
+		case identBaseURL:
+			s.baseURL = option.MustGet[string](o)
+		case identSiteName:
+			s.siteName = option.MustGet[string](o)
+		case identMaxUploadBytes:
+			s.maxUploadBytes = option.MustGet[int64](o)
+		case identLogger:
+			s.logger = option.MustGet[*slog.Logger](o)
+		case identRenderer:
+			s.renderer = option.MustGet[Renderer](o)
+		}
+	}
+	if s.renderer == nil {
+		r, err := newTemplateRenderer()
+		if err != nil {
+			return nil, fmt.Errorf("server: %w", err)
+		}
+		s.renderer = r
+	}
+	return s, nil
+}
+
+// Controller is the handle to a running Server.
+type Controller struct {
+	done chan struct{}
+	err  atomic.Pointer[error]
+	addr string
+}
+
+// Done is closed when the server goroutine has fully exited.
+func (c *Controller) Done() <-chan struct{} { return c.done }
+
+// Addr is the actual bound address (useful when the configured port was 0).
+func (c *Controller) Addr() string { return c.addr }
+
+// Err returns the terminal error, or nil for a clean context-driven shutdown.
+func (c *Controller) Err() error {
+	if p := c.err.Load(); p != nil && !errors.Is(*p, ErrServerClosed) && !errors.Is(*p, http.ErrServerClosed) {
+		return *p
+	}
+	return nil
+}
+
+// Wait blocks until the server exits and returns Err.
+func (c *Controller) Wait() error { <-c.done; return c.Err() }
+
+// Run binds the listener and starts serving, returning immediately. A bind
+// failure is returned synchronously; runtime errors surface via the Controller.
+func (s *Server) Run(ctx context.Context) (*Controller, error) {
+	ln, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return nil, fmt.Errorf("server: listen %q: %w", s.addr, err)
+	}
+	httpSrv := &http.Server{
+		Handler:           s.handler(),
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+	ctrl := &Controller{done: make(chan struct{}), addr: ln.Addr().String()}
+	go func() {
+		defer close(ctrl.done)
+		serveErr := make(chan error, 1)
+		go func() { serveErr <- httpSrv.Serve(ln) }()
+		select {
+		case <-ctx.Done():
+			shCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
+			defer cancel()
+			_ = httpSrv.Shutdown(shCtx)
+			<-serveErr // let Serve unwind
+			e := ErrServerClosed
+			ctrl.err.Store(&e)
+		case e := <-serveErr:
+			ctrl.err.Store(&e)
+		}
+	}()
+	return ctrl, nil
+}

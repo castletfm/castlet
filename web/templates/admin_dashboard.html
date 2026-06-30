@@ -1,0 +1,26 @@
+{{define "content"}}
+<section class="admin-head">
+  <h1>Your channels</h1>
+  <a class="btn" href="/admin/channels/new">New channel</a>
+</section>
+
+{{if .Data.Channels}}
+<table class="admin-table">
+  <thead><tr><th>Channel</th><th>Slug</th><th></th></tr></thead>
+  <tbody>
+    {{range .Data.Channels}}
+    <tr>
+      <td><a href="/{{.Slug}}/">{{.Title}}</a></td>
+      <td class="muted">{{.Slug}}</td>
+      <td class="actions">
+        <a href="/admin/channels/{{.ID}}/episodes">Episodes</a>
+        <a href="/admin/channels/{{.ID}}/edit">Edit</a>
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">You have no channels yet. <a href="/admin/channels/new">Create one</a>.</p>
+{{end}}
+{{end}}

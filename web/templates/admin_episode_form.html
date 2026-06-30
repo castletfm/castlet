@@ -1,0 +1,28 @@
+{{define "content"}}
+{{$ch := .Data.Channel}}
+<section class="admin-head">
+  <h1>New episode — {{$ch.Title}}</h1>
+</section>
+
+{{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
+
+<form method="post" action="/admin/channels/{{$ch.ID}}/episodes" enctype="multipart/form-data" class="stack">
+  <label>Title
+    <input type="text" name="title" value="{{.Data.Title}}" required autofocus>
+  </label>
+  <label>Slug <span class="muted">(URL; leave blank to derive from title)</span>
+    <input type="text" name="slug" value="{{.Data.Slug}}">
+  </label>
+  <label>Description
+    <textarea name="description" rows="4">{{.Data.Description}}</textarea>
+  </label>
+  <label>Media file <span class="muted">(audio or video)</span>
+    <input type="file" name="media" accept="audio/*,video/*" required>
+  </label>
+  <div class="form-actions">
+    <button type="submit">Upload episode</button>
+    <a class="btn ghost" href="/admin/channels/{{$ch.ID}}/episodes">Cancel</a>
+  </div>
+  <p class="muted">The episode is created as a draft. Transcription is queued automatically.</p>
+</form>
+{{end}}

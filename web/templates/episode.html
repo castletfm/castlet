@@ -1,0 +1,41 @@
+{{define "content"}}
+{{$ch := .Data.Channel}}
+{{$ep := .Data.Episode}}
+<nav class="breadcrumb muted">
+  <a href="/{{$ch.Slug}}/">{{$ch.Title}}</a> / {{$ep.Title}}
+</nav>
+
+<article class="episode">
+  <h1>{{$ep.Title}}</h1>
+  <div class="episode-meta muted">
+    {{with $ep.PublishedAt}}<time>{{formatDate .}}</time>{{end}}
+    {{if $ep.DurationSecs}}· {{formatDuration $ep.DurationSecs}}{{end}}
+  </div>
+
+  {{if $ep.IsVideo}}
+  <video id="player" class="player" controls preload="metadata" src="{{.Data.MediaURL}}"></video>
+  {{else}}
+  <audio id="player" class="player" controls preload="metadata" src="{{.Data.MediaURL}}"></audio>
+  {{end}}
+
+  {{with $ep.Description}}<p class="episode-desc">{{.}}</p>{{end}}
+
+  <section class="transcript">
+    <h2>Transcript</h2>
+    {{if .Data.Segments}}
+    <ol class="segments" id="segments">
+      {{range .Data.Segments}}
+      <li class="segment" data-start="{{.StartSecs}}">
+        <button type="button" class="seek" data-start="{{.StartSecs}}">{{formatTimecode .StartSecs}}</button>
+        <span class="seg-text">{{.Text}}</span>
+      </li>
+      {{end}}
+    </ol>
+    {{else}}
+    <p class="muted transcript-status">{{transcriptMessage $ep.TranscriptStatus}}</p>
+    {{end}}
+  </section>
+</article>
+{{end}}
+
+{{define "head"}}<script defer src="/static/player.js"></script>{{end}}

@@ -1,0 +1,27 @@
+{{define "content"}}
+{{$ch := .Data.Channel}}
+<section class="admin-head">
+  <h1>{{if $ch.ID}}Edit channel{{else}}New channel{{end}}</h1>
+</section>
+
+{{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
+
+<form method="post" action="{{.Data.Action}}" class="stack">
+  <label>Title
+    <input type="text" name="title" value="{{$ch.Title}}" required autofocus>
+  </label>
+  <label>Slug <span class="muted">(URL; leave blank to derive from title)</span>
+    <input type="text" name="slug" value="{{$ch.Slug}}">
+  </label>
+  <label>Description
+    <textarea name="description" rows="4">{{$ch.Description}}</textarea>
+  </label>
+  <label>Language
+    <input type="text" name="language" value="{{or $ch.Language "en"}}" placeholder="en">
+  </label>
+  <div class="form-actions">
+    <button type="submit">Save</button>
+    <a class="btn ghost" href="/admin/">Cancel</a>
+  </div>
+</form>
+{{end}}

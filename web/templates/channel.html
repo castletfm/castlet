@@ -1,0 +1,28 @@
+{{define "content"}}
+{{$ch := .Data.Channel}}
+<article class="channel-header">
+  {{if $ch.ImageKey}}<img class="channel-art lg" src="/media/{{$ch.ImageKey}}" alt="">{{end}}
+  <div>
+    <h1>{{$ch.Title}}</h1>
+    <p class="muted">{{$ch.Description}}</p>
+    <a class="feed-link" href="/{{$ch.Slug}}/feed.xml">Subscribe (RSS)</a>
+  </div>
+</article>
+
+{{if .Data.Episodes}}
+<ul class="episode-list">
+  {{range .Data.Episodes}}
+  <li class="episode-row">
+    <a class="episode-title" href="/{{$ch.Slug}}/{{.Slug}}/">{{.Title}}</a>
+    <div class="episode-meta muted">
+      {{with .PublishedAt}}<time>{{formatDate .}}</time>{{end}}
+      {{if .DurationSecs}}· {{formatDuration .DurationSecs}}{{end}}
+    </div>
+    <p class="episode-desc">{{.Description}}</p>
+  </li>
+  {{end}}
+</ul>
+{{else}}
+<p class="empty">No published episodes yet.</p>
+{{end}}
+{{end}}

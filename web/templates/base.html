@@ -1,0 +1,31 @@
+{{define "base.html"}}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{with .Title}}{{.}} · {{end}}{{.Site}}</title>
+  {{block "head" .}}{{end}}
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/">{{.Site}}</a>
+    <nav>
+      {{if .User}}
+        <a href="/admin/">Admin</a>
+        <form method="post" action="/logout" class="inline">
+          <button type="submit" class="linklike">Log out</button>
+        </form>
+      {{else}}
+        <a href="/login">Log in</a>
+      {{end}}
+    </nav>
+  </header>
+  <main class="container">
+    {{block "content" .}}{{end}}
+  </main>
+  <footer class="site-footer">
+    <p>Powered by <a href="https://github.com/castletfm/castlet">Castlet</a></p>
+  </footer>
+</body>
+</html>{{end}}

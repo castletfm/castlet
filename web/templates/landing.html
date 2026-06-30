@@ -1,0 +1,21 @@
+{{define "content"}}
+<section class="hero">
+  <h1>{{.Site}}</h1>
+  <p class="muted">Podcasts hosted on Castlet.</p>
+</section>
+
+{{if .Data}}
+<ul class="channel-grid">
+  {{range .Data}}
+  <li class="channel-card">
+    {{if .ImageKey}}<img class="channel-art" src="/media/{{.ImageKey}}" alt="">{{end}}
+    <h2><a href="/{{.Slug}}/">{{.Title}}</a></h2>
+    <p class="muted">{{.Description}}</p>
+    <a class="feed-link" href="/{{.Slug}}/feed.xml">RSS</a>
+  </li>
+  {{end}}
+</ul>
+{{else}}
+<p class="empty">No channels yet.</p>
+{{end}}
+{{end}}

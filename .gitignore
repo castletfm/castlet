@@ -1,0 +1,20 @@
+# Design overview is kept out of version control by request.
+/DESIGN-OVERVIEW.md
+
+# Agent scratch space and command output.
+/.tmp/
+/.worktrees/
+
+# Build artifacts.
+/castlet
+/dist/
+
+# Default runtime data directory (sqlite file + media blobs).
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Editor / OS noise.
+*.swp
+.DS_Store
