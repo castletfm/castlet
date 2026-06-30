@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/castletfm/castlet/store"
@@ -59,7 +60,7 @@ func Open(path string, options ...Option) (*Store, error) {
 		return nil, fmt.Errorf("sqlite: open %q: %w", path, err)
 	}
 	db.SetMaxOpenConns(maxOpen)
-	if err := db.Ping(); err != nil {
+	if err := db.PingContext(context.Background()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: ping %q: %w", path, err)
 	}
@@ -77,12 +78,37 @@ func dsnFor(path string) string {
 	return "file:" + path + "?" + q.Encode()
 }
 
-// Migrate applies the schema. It is idempotent.
+// Migrate applies the schema. It is idempotent and also upgrades databases
+// created by earlier versions in place.
 func (s *Store) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("sqlite: migrate: %w", err)
 	}
+	// Backfill columns added after the original schema for pre-existing
+	// databases. CREATE TABLE IF NOT EXISTS above is a no-op on them, so the
+	// new columns must be added with ALTER; a duplicate-column error means the
+	// column already exists and is ignored.
+	for _, ddl := range []string{
+		`ALTER TABLE users ADD COLUMN oidc_issuer TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN oidc_subject TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE episodes ADD COLUMN language TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE episodes ADD COLUMN position INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil && !isDuplicateColumn(err) {
+			return fmt.Errorf("sqlite: migrate alter: %w", err)
+		}
+	}
+	// Created after the columns exist so an in-place upgrade does not reference
+	// a missing column.
+	if _, err := s.db.ExecContext(ctx,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc ON users(oidc_issuer, oidc_subject) WHERE oidc_subject <> ''`); err != nil {
+		return fmt.Errorf("sqlite: migrate index: %w", err)
+	}
 	return nil
+}
+
+func isDuplicateColumn(err error) bool {
+	return strings.Contains(err.Error(), "duplicate column name")
 }
 
 // Close closes the underlying connection pool.

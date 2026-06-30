@@ -42,11 +42,11 @@ func seedEpisode(t *testing.T, st *sqlite.Store, blobs *localfs.Store, q *dbqueu
 	t.Helper()
 	ctx := t.Context()
 	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "u@x.y", DisplayName: "U", CreatedAt: time.Now()}))
-	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Slug: "s", Title: "S",
+	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
 		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 	_, err := blobs.Put(ctx, "mk1", strings.NewReader("fake audio bytes"))
 	require.NoError(t, err)
-	require.NoError(t, st.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Slug: "e", Title: "E",
+	require.NoError(t, st.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
 		MediaKey: "mk1", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
 		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptPending,
 		CreatedAt: time.Now(), UpdatedAt: time.Now()}))

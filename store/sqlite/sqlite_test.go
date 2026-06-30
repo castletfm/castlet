@@ -47,33 +47,69 @@ func TestUsers(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrConflict)
 }
 
+func TestUserOIDC(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+
+	// no subject linked yet
+	_, err := s.UserByOIDCSubject(ctx, "https://idp", "sub-1")
+	require.ErrorIs(t, err, store.ErrNotFound)
+
+	// password users (empty subject) must not collide on the partial unique index
+	require.NoError(t, s.CreateUser(ctx, &model.User{ID: "p1", Email: "p1@x.y", DisplayName: "P1", PasswordHash: "h"}))
+	require.NoError(t, s.CreateUser(ctx, &model.User{ID: "p2", Email: "p2@x.y", DisplayName: "P2", PasswordHash: "h"}))
+
+	// link an account to an OIDC identity
+	u := &model.User{ID: "o1", Email: "o@x.y", DisplayName: "O", OIDCIssuer: "https://idp", OIDCSubject: "sub-1", CreatedAt: time.Now()}
+	require.NoError(t, s.CreateUser(ctx, u))
+
+	got, err := s.UserByOIDCSubject(ctx, "https://idp", "sub-1")
+	require.NoError(t, err)
+	require.Equal(t, "o1", got.ID)
+
+	// a second account claiming the same subject is rejected
+	require.ErrorIs(t, s.CreateUser(ctx, &model.User{ID: "o2", Email: "o2@x.y", DisplayName: "O2",
+		OIDCIssuer: "https://idp", OIDCSubject: "sub-1"}), store.ErrConflict)
+
+	// UpdateUser can link a previously password-only account
+	p1, err := s.UserByEmail(ctx, "p1@x.y")
+	require.NoError(t, err)
+	p1.OIDCIssuer = "https://idp"
+	p1.OIDCSubject = "sub-2"
+	require.NoError(t, s.UpdateUser(ctx, p1))
+	linked, err := s.UserByOIDCSubject(ctx, "https://idp", "sub-2")
+	require.NoError(t, err)
+	require.Equal(t, "p1", linked.ID)
+}
+
 func TestChannelsAndEpisodes(t *testing.T) {
 	s := newStore(t)
 	seedUser(t, s)
 	ctx := t.Context()
 
-	ch := &model.Channel{ID: "c1", UserID: "u1", Slug: "show", Title: "Show", Language: "en",
+	ch := &model.Channel{ID: "c1", UserID: "u1", Title: "Show", Language: "en",
 		CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	require.NoError(t, s.CreateChannel(ctx, ch))
 
-	bySlug, err := s.ChannelBySlug(ctx, "show")
+	byID, err := s.ChannelByID(ctx, "c1")
 	require.NoError(t, err)
-	require.Equal(t, "c1", bySlug.ID)
+	require.Equal(t, "Show", byID.Title)
 
-	require.ErrorIs(t, s.CreateChannel(ctx, &model.Channel{ID: "c2", UserID: "u1", Slug: "show", Title: "Dup"}), store.ErrConflict)
+	// reusing an id is a conflict
+	require.ErrorIs(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "Dup"}), store.ErrConflict)
 
 	byUser, err := s.ListChannelsByUser(ctx, "u1")
 	require.NoError(t, err)
 	require.Len(t, byUser, 1)
 
 	pub := time.Now()
-	ep := &model.Episode{ID: "e1", ChannelID: "c1", Slug: "ep1", Title: "Ep 1",
+	ep := &model.Episode{ID: "e1", ChannelID: "c1", Title: "Ep 1",
 		MediaKey: "k1", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, MediaBytes: 100,
 		Status:           model.EpisodePublished,
 		TranscriptStatus: model.TranscriptPending, PublishedAt: &pub, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	require.NoError(t, s.CreateEpisode(ctx, ep))
 
-	draft := &model.Episode{ID: "e2", ChannelID: "c1", Slug: "ep2", Title: "Draft",
+	draft := &model.Episode{ID: "e2", ChannelID: "c1", Title: "Draft",
 		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptNone, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	require.NoError(t, s.CreateEpisode(ctx, draft))
 
@@ -92,15 +128,15 @@ func TestChannelsAndEpisodes(t *testing.T) {
 	require.Equal(t, "e1", byMedia.ID)
 
 	// a video episode round-trips its kind
-	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: "ev", ChannelID: "c1", Slug: "vid", Title: "Vid",
+	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: "ev", ChannelID: "c1", Title: "Vid",
 		MediaKey: "kv", MediaMIME: "video/mp4", MediaKind: model.MediaVideo, Status: model.EpisodeDraft,
 		TranscriptStatus: model.TranscriptNone, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 	vid, err := s.EpisodeByID(ctx, "ev")
 	require.NoError(t, err)
 	require.True(t, vid.IsVideo())
 
-	// unique (channel, slug)
-	require.ErrorIs(t, s.CreateEpisode(ctx, &model.Episode{ID: "e3", ChannelID: "c1", Slug: "ep1",
+	// reusing an id is a conflict
+	require.ErrorIs(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1",
 		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptNone}), store.ErrConflict)
 
 	require.NoError(t, s.DeleteEpisode(ctx, "e2"))
@@ -111,8 +147,8 @@ func TestTranscriptRoundTrip(t *testing.T) {
 	s := newStore(t)
 	seedUser(t, s)
 	ctx := t.Context()
-	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Slug: "s", Title: "S", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
-	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Slug: "e", Title: "E",
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
 		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptPending, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 
 	tr := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: time.Now(),

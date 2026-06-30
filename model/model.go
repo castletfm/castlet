@@ -9,21 +9,22 @@ import (
 )
 
 // User is a person who creates podcasts. A user owns channels and
-// authenticates to the admin area.
+// authenticates to the admin area, by password and/or an OIDC identity.
 type User struct {
 	ID           string
 	Email        string
 	DisplayName  string
-	PasswordHash string
+	PasswordHash string // empty for OIDC-only accounts
+	OIDCIssuer   string // identity provider issuer, empty if not linked
+	OIDCSubject  string // stable subject within the issuer, empty if not linked
 	CreatedAt    time.Time
 }
 
-// Channel groups episodes. A user may own multiple channels. Slug is the
-// public, URL-facing identifier and is unique across all channels.
+// Channel groups episodes. A user may own multiple channels. ID is the opaque,
+// URL-facing identifier (channels are addressed as /c/{id}/).
 type Channel struct {
 	ID          string
 	UserID      string
-	Slug        string
 	Title       string
 	Description string
 	Language    string // BCP-47 tag, e.g. "en"; used in the RSS feed
@@ -71,18 +72,19 @@ const (
 )
 
 // Episode is a single podcast item (audio or video) belonging to one channel.
-// Slug is unique within its channel.
+// ID is the opaque, URL-facing identifier (episodes are addressed as /e/{id}/).
 type Episode struct {
 	ID               string
 	ChannelID        string
-	Slug             string
 	Title            string
 	Description      string
-	MediaKey         string    // blob key for the media object
+	MediaKey         string    // content-addressed blob key (sha256 of the media); immutable
 	MediaMIME        string    // e.g. "audio/mpeg" or "video/mp4"
 	MediaKind        MediaKind // audio or video, drives the player choice
 	MediaBytes       int64
 	DurationSecs     int
+	Language         string // spoken-language hint for transcription (ISO-639, e.g. "ja"); "" = auto-detect
+	Position         int    // manual sort order within the channel (ascending); ties fall back to newest-first
 	Status           EpisodeStatus
 	TranscriptStatus TranscriptStatus
 	PublishedAt      *time.Time // set when Status becomes published

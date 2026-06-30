@@ -20,6 +20,7 @@ type Input struct {
 	Audio    io.Reader
 	MIME     string // e.g. "audio/mpeg"
 	Filename string // hint for tools that key off extension
+	Language string // BCP-47/ISO-639 hint (e.g. "ja"); "" means auto-detect
 }
 
 // Segment is one timestamped span of recognized speech. Times are seconds
@@ -39,7 +40,7 @@ type Result struct {
 // Transcriber converts audio into a timestamped transcript. Implementations
 // must be safe for concurrent use.
 type Transcriber interface {
-	// Transcribe consumes the audio in in and returns its transcript, or
+	// Transcribe reads the audio from in and returns its transcript, or
 	// ErrUnsupported if it does not perform transcription.
 	Transcribe(ctx context.Context, in Input) (*Result, error)
 }

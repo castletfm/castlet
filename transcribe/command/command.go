@@ -86,6 +86,11 @@ func (t *Transcriber) Transcribe(ctx context.Context, in transcribe.Input) (*tra
 	cmd := exec.CommandContext(ctx, t.name, args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Expose the episode's language to the command (e.g. to pick whisper's -l
+	// flag and a matching punctuation prompt). Empty means auto-detect.
+	if in.Language != "" {
+		cmd.Env = append(os.Environ(), "CASTLET_LANGUAGE="+in.Language)
+	}
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("command: %s failed: %w: %s", t.name, err, strings.TrimSpace(stderr.String()))
 	}

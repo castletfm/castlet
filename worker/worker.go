@@ -191,7 +191,8 @@ func (w *Worker) transcribe(ctx context.Context, job *model.Job) error {
 	res, err := w.transcriber.Transcribe(ctx, transcribe.Input{
 		Audio:    rc,
 		MIME:     ep.MediaMIME,
-		Filename: ep.Slug,
+		Filename: ep.ID,
+		Language: ep.Language,
 	})
 	if errors.Is(err, transcribe.ErrUnsupported) {
 		// No transcriber configured: settle to "none", not a failure.

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/store"
@@ -12,15 +13,28 @@ import (
 
 // --- users ------------------------------------------------------------------
 
+const userCols = `id, email, display_name, password_hash, oidc_issuer, oidc_subject, created_at`
+
 func (s *Store) CreateUser(ctx context.Context, u *model.User) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO users (id, email, display_name, password_hash, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		u.ID, u.Email, u.DisplayName, u.PasswordHash, toUnix(u.CreatedAt))
+		`INSERT INTO users (id, email, display_name, password_hash, oidc_issuer, oidc_subject, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, toUnix(u.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("sqlite: create user: %w", mapErr(err))
 	}
 	return nil
+}
+
+func (s *Store) UpdateUser(ctx context.Context, u *model.User) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE users SET email = ?, display_name = ?, password_hash = ?, oidc_issuer = ?, oidc_subject = ?
+		 WHERE id = ?`,
+		u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, u.ID)
+	if err != nil {
+		return fmt.Errorf("sqlite: update user: %w", mapErr(err))
+	}
+	return requireAffected(res)
 }
 
 func (s *Store) UserByID(ctx context.Context, id string) (*model.User, error) {
@@ -31,15 +45,24 @@ func (s *Store) UserByEmail(ctx context.Context, email string) (*model.User, err
 	return s.userWhere(ctx, "email = ?", email)
 }
 
+func (s *Store) UserByOIDCSubject(ctx context.Context, issuer, subject string) (*model.User, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+userCols+` FROM users WHERE oidc_issuer = ? AND oidc_subject = ? AND oidc_subject <> ''`,
+		issuer, subject)
+	return scanUser(row)
+}
+
 func (s *Store) userWhere(ctx context.Context, cond string, arg any) (*model.User, error) {
+	return scanUser(s.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE `+cond, arg))
+}
+
+func scanUser(sc interface{ Scan(...any) error }) (*model.User, error) {
 	var (
 		u       model.User
 		created int64
 	)
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, email, display_name, password_hash, created_at FROM users WHERE `+cond,
-		arg).Scan(&u.ID, &u.Email, &u.DisplayName, &u.PasswordHash, &created)
-	if err != nil {
+	if err := sc.Scan(&u.ID, &u.Email, &u.DisplayName, &u.PasswordHash,
+		&u.OIDCIssuer, &u.OIDCSubject, &created); err != nil {
 		return nil, mapErr(err)
 	}
 	u.CreatedAt = fromUnix(created)
@@ -50,9 +73,9 @@ func (s *Store) userWhere(ctx context.Context, cond string, arg any) (*model.Use
 
 func (s *Store) CreateChannel(ctx context.Context, c *model.Channel) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO channels (id, user_id, slug, title, description, language, image_key, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.UserID, c.Slug, c.Title, c.Description, c.Language, c.ImageKey,
+		`INSERT INTO channels (id, user_id, title, description, language, image_key, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.UserID, c.Title, c.Description, c.Language, c.ImageKey,
 		toUnix(c.CreatedAt), toUnix(c.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("sqlite: create channel: %w", mapErr(err))
@@ -62,9 +85,9 @@ func (s *Store) CreateChannel(ctx context.Context, c *model.Channel) error {
 
 func (s *Store) UpdateChannel(ctx context.Context, c *model.Channel) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE channels SET slug = ?, title = ?, description = ?, language = ?, image_key = ?, updated_at = ?
+		`UPDATE channels SET title = ?, description = ?, language = ?, image_key = ?, updated_at = ?
 		 WHERE id = ?`,
-		c.Slug, c.Title, c.Description, c.Language, c.ImageKey, toUnix(c.UpdatedAt), c.ID)
+		c.Title, c.Description, c.Language, c.ImageKey, toUnix(c.UpdatedAt), c.ID)
 	if err != nil {
 		return fmt.Errorf("sqlite: update channel: %w", mapErr(err))
 	}
@@ -75,18 +98,14 @@ func (s *Store) ChannelByID(ctx context.Context, id string) (*model.Channel, err
 	return s.channelWhere(ctx, "id = ?", id)
 }
 
-func (s *Store) ChannelBySlug(ctx context.Context, slug string) (*model.Channel, error) {
-	return s.channelWhere(ctx, "slug = ?", slug)
-}
-
-const channelCols = `id, user_id, slug, title, description, language, image_key, created_at, updated_at`
+const channelCols = `id, user_id, title, description, language, image_key, created_at, updated_at`
 
 func scanChannel(sc interface{ Scan(...any) error }) (*model.Channel, error) {
 	var (
 		c                model.Channel
 		created, updated int64
 	)
-	if err := sc.Scan(&c.ID, &c.UserID, &c.Slug, &c.Title, &c.Description, &c.Language,
+	if err := sc.Scan(&c.ID, &c.UserID, &c.Title, &c.Description, &c.Language,
 		&c.ImageKey, &created, &updated); err != nil {
 		return nil, err
 	}
@@ -132,17 +151,17 @@ func (s *Store) channelList(ctx context.Context, query string, args ...any) ([]*
 
 // --- episodes ---------------------------------------------------------------
 
-const episodeCols = `id, channel_id, slug, title, description, media_key, media_mime, media_kind,
-	media_bytes, duration_secs, status, transcript_status, published_at, created_at, updated_at`
+const episodeCols = `id, channel_id, title, description, media_key, media_mime, media_kind,
+	media_bytes, duration_secs, status, transcript_status, published_at, created_at, updated_at, language, position`
 
 func (s *Store) CreateEpisode(ctx context.Context, e *model.Episode) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO episodes (id, channel_id, slug, title, description, media_key, media_mime, media_kind,
-			media_bytes, duration_secs, status, transcript_status, published_at, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		e.ID, e.ChannelID, e.Slug, e.Title, e.Description, e.MediaKey, e.MediaMIME, string(e.MediaKind),
+		`INSERT INTO episodes (id, channel_id, title, description, media_key, media_mime, media_kind,
+			media_bytes, duration_secs, status, transcript_status, published_at, created_at, updated_at, language, position)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		e.ID, e.ChannelID, e.Title, e.Description, e.MediaKey, e.MediaMIME, string(e.MediaKind),
 		e.MediaBytes, e.DurationSecs, string(e.Status), string(e.TranscriptStatus),
-		toUnixPtr(e.PublishedAt), toUnix(e.CreatedAt), toUnix(e.UpdatedAt))
+		toUnixPtr(e.PublishedAt), toUnix(e.CreatedAt), toUnix(e.UpdatedAt), e.Language, e.Position)
 	if err != nil {
 		return fmt.Errorf("sqlite: create episode: %w", mapErr(err))
 	}
@@ -151,11 +170,12 @@ func (s *Store) CreateEpisode(ctx context.Context, e *model.Episode) error {
 
 func (s *Store) UpdateEpisode(ctx context.Context, e *model.Episode) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE episodes SET slug = ?, title = ?, description = ?, media_key = ?, media_mime = ?, media_kind = ?,
-			media_bytes = ?, duration_secs = ?, status = ?, transcript_status = ?, published_at = ?, updated_at = ?
+		`UPDATE episodes SET title = ?, description = ?, media_key = ?, media_mime = ?, media_kind = ?,
+			media_bytes = ?, duration_secs = ?, status = ?, transcript_status = ?, published_at = ?, updated_at = ?,
+			language = ?, position = ?
 		 WHERE id = ?`,
-		e.Slug, e.Title, e.Description, e.MediaKey, e.MediaMIME, string(e.MediaKind), e.MediaBytes, e.DurationSecs,
-		string(e.Status), string(e.TranscriptStatus), toUnixPtr(e.PublishedAt), toUnix(e.UpdatedAt), e.ID)
+		e.Title, e.Description, e.MediaKey, e.MediaMIME, string(e.MediaKind), e.MediaBytes, e.DurationSecs,
+		string(e.Status), string(e.TranscriptStatus), toUnixPtr(e.PublishedAt), toUnix(e.UpdatedAt), e.Language, e.Position, e.ID)
 	if err != nil {
 		return fmt.Errorf("sqlite: update episode: %w", mapErr(err))
 	}
@@ -172,16 +192,6 @@ func (s *Store) DeleteEpisode(ctx context.Context, id string) error {
 
 func (s *Store) EpisodeByID(ctx context.Context, id string) (*model.Episode, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+episodeCols+` FROM episodes WHERE id = ?`, id)
-	e, err := scanEpisode(row)
-	if err != nil {
-		return nil, mapErr(err)
-	}
-	return e, nil
-}
-
-func (s *Store) EpisodeBySlug(ctx context.Context, channelID, slug string) (*model.Episode, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT `+episodeCols+` FROM episodes WHERE channel_id = ? AND slug = ?`, channelID, slug)
 	e, err := scanEpisode(row)
 	if err != nil {
 		return nil, mapErr(err)
@@ -213,16 +223,12 @@ func (s *Store) ListEpisodes(ctx context.Context, f store.EpisodeFilter) ([]*mod
 		conds = append(conds, "status = ?")
 		args = append(args, string(model.EpisodePublished))
 	}
-	for i, c := range conds {
-		if i == 0 {
-			query += " WHERE "
-		} else {
-			query += " AND "
-		}
-		query += c
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
 	}
-	// Newest published first; drafts (NULL published_at) sort by creation.
-	query += " ORDER BY COALESCE(published_at, created_at) DESC, created_at DESC"
+	// Manual order first (ascending); ties fall back to newest-published-first,
+	// so a channel that has never been reordered keeps the default ordering.
+	query += " ORDER BY position ASC, COALESCE(published_at, created_at) DESC, created_at DESC"
 	if f.Limit > 0 {
 		query += " LIMIT ?"
 		args = append(args, f.Limit)
@@ -251,9 +257,9 @@ func scanEpisode(sc interface{ Scan(...any) error }) (*model.Episode, error) {
 		published              sql.NullInt64
 		created, updated       int64
 	)
-	if err := sc.Scan(&e.ID, &e.ChannelID, &e.Slug, &e.Title, &e.Description, &e.MediaKey,
+	if err := sc.Scan(&e.ID, &e.ChannelID, &e.Title, &e.Description, &e.MediaKey,
 		&e.MediaMIME, &mkind, &e.MediaBytes, &e.DurationSecs, &status, &tstatus, &published,
-		&created, &updated); err != nil {
+		&created, &updated, &e.Language, &e.Position); err != nil {
 		return nil, err
 	}
 	e.MediaKind = model.MediaKind(mkind)

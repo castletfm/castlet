@@ -18,7 +18,7 @@ var (
 	// ErrNotFound is returned when a lookup matches no row.
 	ErrNotFound = errors.New("store: not found")
 	// ErrConflict is returned when a write violates a uniqueness constraint
-	// (duplicate email or slug).
+	// (e.g. a duplicate email or id).
 	ErrConflict = errors.New("store: conflict")
 )
 
@@ -39,13 +39,16 @@ type Store interface {
 	Close() error
 
 	CreateUser(ctx context.Context, u *model.User) error
+	UpdateUser(ctx context.Context, u *model.User) error
 	UserByID(ctx context.Context, id string) (*model.User, error)
 	UserByEmail(ctx context.Context, email string) (*model.User, error)
+	// UserByOIDCSubject finds the user linked to an identity provider subject,
+	// or ErrNotFound.
+	UserByOIDCSubject(ctx context.Context, issuer, subject string) (*model.User, error)
 
 	CreateChannel(ctx context.Context, c *model.Channel) error
 	UpdateChannel(ctx context.Context, c *model.Channel) error
 	ChannelByID(ctx context.Context, id string) (*model.Channel, error)
-	ChannelBySlug(ctx context.Context, slug string) (*model.Channel, error)
 	ListChannels(ctx context.Context) ([]*model.Channel, error)
 	ListChannelsByUser(ctx context.Context, userID string) ([]*model.Channel, error)
 
@@ -53,7 +56,6 @@ type Store interface {
 	UpdateEpisode(ctx context.Context, e *model.Episode) error
 	DeleteEpisode(ctx context.Context, id string) error
 	EpisodeByID(ctx context.Context, id string) (*model.Episode, error)
-	EpisodeBySlug(ctx context.Context, channelID, slug string) (*model.Episode, error)
 	// EpisodeByMediaKey finds the episode whose media is stored under key, so
 	// the media endpoint can serve it with the right content type. Returns
 	// ErrNotFound when no episode references the key.

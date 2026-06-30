@@ -6,13 +6,16 @@ CREATE TABLE IF NOT EXISTS users (
     email         TEXT    NOT NULL UNIQUE,
     display_name  TEXT    NOT NULL,
     password_hash TEXT    NOT NULL,
+    oidc_issuer   TEXT    NOT NULL DEFAULT '',
+    oidc_subject  TEXT    NOT NULL DEFAULT '',
     created_at    INTEGER NOT NULL
 );
+-- The oidc columns and this index are also ensured imperatively in Migrate so
+-- databases created before they existed are upgraded in place.
 
 CREATE TABLE IF NOT EXISTS channels (
     id          TEXT    PRIMARY KEY,
     user_id     TEXT    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    slug        TEXT    NOT NULL UNIQUE,
     title       TEXT    NOT NULL,
     description TEXT    NOT NULL DEFAULT '',
     language    TEXT    NOT NULL DEFAULT 'en',
@@ -25,7 +28,6 @@ CREATE INDEX IF NOT EXISTS idx_channels_user ON channels(user_id);
 CREATE TABLE IF NOT EXISTS episodes (
     id                TEXT    PRIMARY KEY,
     channel_id        TEXT    NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
-    slug              TEXT    NOT NULL,
     title             TEXT    NOT NULL,
     description       TEXT    NOT NULL DEFAULT '',
     media_key         TEXT    NOT NULL DEFAULT '',
@@ -33,12 +35,13 @@ CREATE TABLE IF NOT EXISTS episodes (
     media_kind        TEXT    NOT NULL DEFAULT 'audio',
     media_bytes       INTEGER NOT NULL DEFAULT 0,
     duration_secs     INTEGER NOT NULL DEFAULT 0,
+    language          TEXT    NOT NULL DEFAULT '',
+    position          INTEGER NOT NULL DEFAULT 0,
     status            TEXT    NOT NULL,
     transcript_status TEXT    NOT NULL,
     published_at      INTEGER,
     created_at        INTEGER NOT NULL,
-    updated_at        INTEGER NOT NULL,
-    UNIQUE(channel_id, slug)
+    updated_at        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_episodes_channel ON episodes(channel_id);
 
