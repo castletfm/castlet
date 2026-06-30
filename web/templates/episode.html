@@ -2,7 +2,7 @@
 {{$ch := .Data.Channel}}
 {{$ep := .Data.Episode}}
 <nav class="breadcrumb muted">
-  <a href="/{{$ch.Slug}}/">{{$ch.Title}}</a> / {{$ep.Title}}
+  <a href="/c/{{$ch.ID}}/">{{$ch.Title}}</a> / {{$ep.Title}}
 </nav>
 
 <article class="episode">
@@ -32,7 +32,12 @@
       {{end}}
     </ol>
     {{else}}
+    {{$st := printf "%s" $ep.TranscriptStatus}}
     <p class="muted transcript-status">{{transcriptMessage $ep.TranscriptStatus}}</p>
+    {{if or (eq $st "pending") (eq $st "processing")}}
+    <div class="progress" role="progressbar" aria-label="Transcribing"></div>
+    <script>setTimeout(function () { location.reload(); }, 5000);</script>
+    {{end}}
     {{end}}
   </section>
 </article>

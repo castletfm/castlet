@@ -3,42 +3,10 @@ package server
 import (
 	"errors"
 	"net/http"
-	"strings"
 
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/store"
 )
-
-// handlePublic is the catch-all for the public site. It parses the request
-// path and dispatches to the landing, channel, episode, or feed view. Routing
-// the dynamic top-level slugs here (rather than via ServeMux wildcards) avoids
-// conflicts with the literal /static/ and /admin/ subtrees.
-func (s *Server) handlePublic(w http.ResponseWriter, r *http.Request) {
-	parts := splitPath(r.URL.Path)
-	switch len(parts) {
-	case 0:
-		s.handleLanding(w, r)
-	case 1:
-		s.handleChannel(w, r, parts[0])
-	case 2:
-		if parts[1] == "feed.xml" {
-			s.handleFeed(w, r, parts[0])
-			return
-		}
-		s.handleEpisode(w, r, parts[0], parts[1])
-	default:
-		s.renderError(w, r, http.StatusNotFound, "Page not found.")
-	}
-}
-
-// splitPath returns the non-empty, slash-separated segments of p.
-func splitPath(p string) []string {
-	p = strings.Trim(p, "/")
-	if p == "" {
-		return nil
-	}
-	return strings.Split(p, "/")
-}
 
 func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
 	channels, err := s.store.ListChannels(r.Context())
@@ -55,8 +23,8 @@ type channelPage struct {
 	Episodes []*model.Episode
 }
 
-func (s *Server) handleChannel(w http.ResponseWriter, r *http.Request, channelSlug string) {
-	ch, ok := s.lookupChannel(w, r, channelSlug)
+func (s *Server) handleChannel(w http.ResponseWriter, r *http.Request) {
+	ch, ok := s.lookupChannel(w, r, r.PathValue("id"))
 	if !ok {
 		return
 	}
@@ -76,16 +44,17 @@ type episodePage struct {
 	Segments []model.Segment
 }
 
-func (s *Server) handleEpisode(w http.ResponseWriter, r *http.Request, channelSlug, episodeSlug string) {
-	ch, ok := s.lookupChannel(w, r, channelSlug)
-	if !ok {
-		return
-	}
-	ep, err := s.store.EpisodeBySlug(r.Context(), ch.ID, episodeSlug)
+func (s *Server) handleEpisode(w http.ResponseWriter, r *http.Request) {
+	ep, err := s.store.EpisodeByID(r.Context(), r.PathValue("id"))
 	if errors.Is(err, store.ErrNotFound) || (err == nil && ep.Status != model.EpisodePublished) {
 		s.renderError(w, r, http.StatusNotFound, "Episode not found.")
 		return
 	}
+	if err != nil {
+		s.serverError(w, r, err)
+		return
+	}
+	ch, err := s.store.ChannelByID(r.Context(), ep.ChannelID)
 	if err != nil {
 		s.serverError(w, r, err)
 		return
@@ -100,10 +69,10 @@ func (s *Server) handleEpisode(w http.ResponseWriter, r *http.Request, channelSl
 	s.render(w, r, http.StatusOK, "episode", ep.Title, page)
 }
 
-// lookupChannel resolves a public channel slug, writing a 404 and returning
+// lookupChannel resolves a public channel by id, writing a 404 and returning
 // false when it does not exist.
-func (s *Server) lookupChannel(w http.ResponseWriter, r *http.Request, slug string) (*model.Channel, bool) {
-	ch, err := s.store.ChannelBySlug(r.Context(), slug)
+func (s *Server) lookupChannel(w http.ResponseWriter, r *http.Request, id string) (*model.Channel, bool) {
+	ch, err := s.store.ChannelByID(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
 		s.renderError(w, r, http.StatusNotFound, "Channel not found.")
 		return nil, false

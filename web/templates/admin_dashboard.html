@@ -6,12 +6,11 @@
 
 {{if .Data.Channels}}
 <table class="admin-table">
-  <thead><tr><th>Channel</th><th>Slug</th><th></th></tr></thead>
+  <thead><tr><th>Channel</th><th></th></tr></thead>
   <tbody>
     {{range .Data.Channels}}
     <tr>
-      <td><a href="/{{.Slug}}/">{{.Title}}</a></td>
-      <td class="muted">{{.Slug}}</td>
+      <td><a href="/c/{{.ID}}/">{{.Title}}</a></td>
       <td class="actions">
         <a href="/admin/channels/{{.ID}}/episodes">Episodes</a>
         <a href="/admin/channels/{{.ID}}/edit">Edit</a>

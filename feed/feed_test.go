@@ -13,11 +13,11 @@ import (
 
 func TestBuild(t *testing.T) {
 	pub := time.Date(2026, 1, 2, 15, 4, 5, 0, time.UTC)
-	ch := &model.Channel{Slug: "show", Title: "My Show", Description: "desc", Language: "en"}
+	ch := &model.Channel{ID: "chan1", Title: "My Show", Description: "desc", Language: "en"}
 	eps := []*model.Episode{
-		{Slug: "ep1", Title: "Episode 1", Description: "first", MediaKey: "k1",
+		{ID: "ep1", Title: "Episode 1", Description: "first", MediaKey: "k1",
 			MediaMIME: "audio/mpeg", MediaBytes: 1234, DurationSecs: 95, PublishedAt: &pub},
-		{Slug: "vid", Title: "Video", Description: "vod", MediaKey: "k2",
+		{ID: "vid", Title: "Video", Description: "vod", MediaKey: "k2",
 			MediaMIME: "video/mp4", MediaBytes: 999, PublishedAt: &pub},
 	}
 
@@ -31,7 +31,8 @@ func TestBuild(t *testing.T) {
 
 	s := string(out)
 	require.Contains(t, s, "<title>My Show</title>")
-	require.Contains(t, s, "https://example.com/show/ep1/")
+	require.Contains(t, s, "https://example.com/e/ep1/")
+	require.Contains(t, s, "<guid isPermaLink=\"false\">urn:castlet:episode:ep1</guid>")
 	require.Contains(t, s, `url="https://example.com/media/k1"`)
 	require.Contains(t, s, `type="audio/mpeg"`)
 	require.Contains(t, s, `type="video/mp4"`)

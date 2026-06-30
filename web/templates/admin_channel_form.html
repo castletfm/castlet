@@ -10,14 +10,16 @@
   <label>Title
     <input type="text" name="title" value="{{$ch.Title}}" required autofocus>
   </label>
-  <label>Slug <span class="muted">(URL; leave blank to derive from title)</span>
-    <input type="text" name="slug" value="{{$ch.Slug}}">
-  </label>
   <label>Description
     <textarea name="description" rows="4">{{$ch.Description}}</textarea>
   </label>
-  <label>Language
-    <input type="text" name="language" value="{{or $ch.Language "en"}}" placeholder="en">
+  <label>Primary language <span class="muted">(applies to the whole feed; each episode is transcribed in its own detected language)</span>
+    {{$cur := or $ch.Language "en"}}
+    <select name="language">
+      {{range languageOptions}}
+      <option value="{{.Code}}"{{if eq .Code $cur}} selected{{end}}>{{.Name}}</option>
+      {{end}}
+    </select>
   </label>
   <div class="form-actions">
     <button type="submit">Save</button>

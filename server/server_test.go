@@ -31,7 +31,7 @@ type harness struct {
 	client *http.Client
 }
 
-func newHarness(t *testing.T) *harness {
+func newHarness(t *testing.T, extra ...server.Option) *harness {
 	t.Helper()
 	ctx := t.Context()
 
@@ -44,23 +44,37 @@ func newHarness(t *testing.T) *harness {
 	q := dbqueue.New(st)
 	sess := session.NewManager([]byte("0123456789abcdef0123456789abcdef"))
 
-	srv, err := server.New(st, blobs, q, sess,
+	opts := append([]server.Option{
 		server.WithAddr("127.0.0.1:0"),
-		server.WithBaseURL("http://example.test"))
+		server.WithBaseURL("http://example.test"),
+	}, extra...)
+	srv, err := server.New(st, blobs, q, sess, opts...)
 	require.NoError(t, err)
 
 	ctrl, err := srv.Run(ctx)
 	require.NoError(t, err)
 	t.Cleanup(func() { <-ctrl.Done() }) // ctx cancels on test end; wait for clean exit
 
+	return &harness{base: "http://" + ctrl.Addr(), store: st, client: newClient()}
+}
+
+// newClient returns an HTTP client with its own cookie jar that does not follow
+// redirects, so tests can inspect 3xx responses and Set-Cookie headers.
+func newClient() *http.Client {
 	jar, _ := cookiejar.New(nil)
-	client := &http.Client{
+	return &http.Client{
 		Jar: jar,
 		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse // inspect redirects ourselves
+			return http.ErrUseLastResponse
 		},
 	}
-	return &harness{base: "http://" + ctrl.Addr(), store: st, client: client}
+}
+
+func mustHash(t *testing.T, password string) string {
+	t.Helper()
+	h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
+	require.NoError(t, err)
+	return string(h)
 }
 
 func (h *harness) get(t *testing.T, path string) (*http.Response, string) {
@@ -81,11 +95,11 @@ func (h *harness) seed(t *testing.T) {
 	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
 		DisplayName: "A", PasswordHash: string(hash), CreatedAt: time.Now()}))
 	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
-		Slug: "show", Title: "My Show", Description: "about", Language: "en",
+		Title: "My Show", Description: "about", Language: "en",
 		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 	pub := time.Now()
 	require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1",
-		Slug: "ep1", Title: "First Episode", Description: "hello", MediaKey: "mk1",
+		Title: "First Episode", Description: "hello", MediaKey: "mk1",
 		MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, MediaBytes: 5,
 		Status: model.EpisodePublished, TranscriptStatus: model.TranscriptDone,
 		PublishedAt: &pub, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
@@ -101,21 +115,21 @@ func TestPublicPages(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Contains(t, body, "My Show")
 
-	resp, body = h.get(t, "/show/")
+	resp, body = h.get(t, "/c/c1/")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Contains(t, body, "First Episode")
 
-	resp, body = h.get(t, "/show/ep1/")
+	resp, body = h.get(t, "/e/e1/")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Contains(t, body, "spoken words")
 	require.Contains(t, body, "<audio")
 
-	resp, body = h.get(t, "/show/feed.xml")
+	resp, body = h.get(t, "/c/c1/feed.xml")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Contains(t, resp.Header.Get("Content-Type"), "rss+xml")
-	require.Contains(t, body, "http://example.test/show/ep1/")
+	require.Contains(t, body, "http://example.test/e/e1/")
 
-	resp, _ = h.get(t, "/nope/")
+	resp, _ = h.get(t, "/c/nope/")
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
@@ -123,10 +137,10 @@ func TestDraftEpisodeHidden(t *testing.T) {
 	h := newHarness(t)
 	h.seed(t)
 	require.NoError(t, h.store.CreateEpisode(t.Context(), &model.Episode{ID: "e2", ChannelID: "c1",
-		Slug: "draft", Title: "Draft Ep", Status: model.EpisodeDraft,
+		Title: "Draft Ep", Status: model.EpisodeDraft,
 		TranscriptStatus: model.TranscriptNone, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 
-	resp, _ := h.get(t, "/show/draft/")
+	resp, _ := h.get(t, "/e/e2/")
 	require.Equal(t, http.StatusNotFound, resp.StatusCode, "draft must not be publicly viewable")
 }
 
@@ -178,7 +192,7 @@ func TestAdminUploadFlow(t *testing.T) {
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 
 	// create a channel
-	resp, err = h.client.PostForm(h.base+"/admin/channels", url.Values{"title": {"My Show"}, "slug": {"show"}})
+	resp, err = h.client.PostForm(h.base+"/admin/channels", url.Values{"title": {"My Show"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -189,7 +203,7 @@ func TestAdminUploadFlow(t *testing.T) {
 
 	// upload an episode (multipart)
 	audio := []byte("ID3 fake mp3 payload")
-	body, contentType := multipartUpload(t, map[string]string{"title": "Hello", "slug": "hello"}, "media", "clip.mp3", "audio/mpeg", audio)
+	body, contentType := multipartUpload(t, map[string]string{"title": "Hello"}, "media", "clip.mp3", "audio/mpeg", audio)
 	resp, err = h.client.Post(h.base+"/admin/channels/"+chID+"/episodes", contentType, body)
 	require.NoError(t, err)
 	resp.Body.Close()
@@ -220,7 +234,7 @@ func TestAdminUploadFlow(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 
-	resp, page := h.get(t, "/show/")
+	resp, page := h.get(t, "/c/"+chID+"/")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Contains(t, page, "Hello")
 }

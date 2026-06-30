@@ -6,21 +6,6 @@ import (
 	"github.com/castletfm/castlet/web"
 )
 
-// reservedSlugs are top-level path segments the router owns; a channel slug may
-// not collide with them.
-var reservedSlugs = map[string]struct{}{
-	"admin":  {},
-	"login":  {},
-	"logout": {},
-	"media":  {},
-	"static": {},
-}
-
-func isReservedSlug(s string) bool {
-	_, ok := reservedSlugs[s]
-	return ok
-}
-
 // handler builds the full middleware-wrapped HTTP handler.
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
@@ -38,9 +23,14 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /login", s.handleLoginForm)
 	mux.HandleFunc("POST /login", s.handleLogin)
 	mux.HandleFunc("POST /logout", s.handleLogout)
+	mux.HandleFunc("GET /signup", s.handleSignupForm)
+	mux.HandleFunc("POST /signup", s.handleSignup)
+	mux.HandleFunc("GET /auth/oidc/login", s.handleOIDCLogin)
+	mux.HandleFunc("GET /auth/oidc/callback", s.handleOIDCCallback)
 
 	// Admin (auth required).
 	mux.HandleFunc("GET /admin/{$}", s.requireAuth(s.handleAdminDashboard))
+	mux.HandleFunc("GET /admin/upload", s.requireAuth(s.handleUpload))
 	mux.HandleFunc("GET /admin/channels/new", s.requireAuth(s.handleChannelNew))
 	mux.HandleFunc("POST /admin/channels", s.requireAuth(s.handleChannelCreate))
 	mux.HandleFunc("GET /admin/channels/{id}/edit", s.requireAuth(s.handleChannelEdit))
@@ -48,16 +38,22 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /admin/channels/{id}/episodes", s.requireAuth(s.handleEpisodeList))
 	mux.HandleFunc("GET /admin/channels/{id}/episodes/new", s.requireAuth(s.handleEpisodeNew))
 	mux.HandleFunc("POST /admin/channels/{id}/episodes", s.requireAuth(s.handleEpisodeCreate))
+	mux.HandleFunc("GET /admin/episodes/{id}/edit", s.requireAuth(s.handleEpisodeEdit))
+	mux.HandleFunc("POST /admin/episodes/{id}", s.requireAuth(s.handleEpisodeUpdate))
 	mux.HandleFunc("POST /admin/episodes/{id}/publish", s.requireAuth(s.handleEpisodePublish))
 	mux.HandleFunc("POST /admin/episodes/{id}/unpublish", s.requireAuth(s.handleEpisodeUnpublish))
+	mux.HandleFunc("POST /admin/episodes/{id}/move", s.requireAuth(s.handleEpisodeMove))
+	mux.HandleFunc("POST /admin/episodes/{id}/transcribe", s.requireAuth(s.handleEpisodeTranscribe))
+	mux.HandleFunc("GET /admin/episodes/{id}/status", s.requireAuth(s.handleEpisodeStatus))
 	mux.HandleFunc("POST /admin/episodes/{id}/delete", s.requireAuth(s.handleEpisodeDelete))
 
-	// Public pages live under top-level, user-chosen slugs (/{channel}/,
-	// /{channel}/{episode}/, /{channel}/feed.xml). A single-segment wildcard
-	// would conflict with the literal subtrees above (/static/, /admin/), so
-	// instead this least-specific catch-all dispatches them internally; every
-	// literal route registered above is more specific and still wins.
-	mux.HandleFunc("GET /{path...}", s.handlePublic)
+	// Public pages, addressed by opaque id (no user-chosen slugs): channels
+	// under /c/{id}/ with their feed, episodes under /e/{id}/. The literal /c/
+	// and /e/ prefixes keep them unambiguous against /admin/, /static/, etc.
+	mux.HandleFunc("GET /{$}", s.handleLanding)
+	mux.HandleFunc("GET /c/{id}/{$}", s.handleChannel)
+	mux.HandleFunc("GET /c/{id}/feed.xml", s.handleFeed)
+	mux.HandleFunc("GET /e/{id}/{$}", s.handleEpisode)
 
 	return s.logRequests(s.loadUser(mux))
 }

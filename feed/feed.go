@@ -66,7 +66,7 @@ type enclosure struct {
 // slash required), used to construct episode and media URLs.
 func Build(baseURL string, ch *model.Channel, episodes []*model.Episode) ([]byte, error) {
 	base := strings.TrimRight(baseURL, "/")
-	channelLink := fmt.Sprintf("%s/%s/", base, ch.Slug)
+	channelLink := fmt.Sprintf("%s/c/%s/", base, ch.ID)
 
 	doc := rss{
 		Version:  "2.0",
@@ -85,11 +85,13 @@ func Build(baseURL string, ch *model.Channel, episodes []*model.Episode) ([]byte
 	}
 
 	for _, ep := range episodes {
-		link := fmt.Sprintf("%s/%s/%s/", base, ch.Slug, ep.Slug)
+		link := fmt.Sprintf("%s/e/%s/", base, ep.ID)
 		it := item{
-			Title:       ep.Title,
-			Link:        link,
-			GUID:        guid{Value: link, IsPermaLink: true},
+			Title: ep.Title,
+			Link:  link,
+			// Stable, opaque guid decoupled from the URL so renaming or
+			// re-linking never makes clients treat it as a new episode.
+			GUID:        guid{Value: "urn:castlet:episode:" + ep.ID, IsPermaLink: false},
 			Description: ep.Description,
 			Enclosure: enclosure{
 				URL:    fmt.Sprintf("%s/media/%s", base, ep.MediaKey),

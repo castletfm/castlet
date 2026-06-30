@@ -9,9 +9,9 @@
   {{range .Data}}
   <li class="channel-card">
     {{if .ImageKey}}<img class="channel-art" src="/media/{{.ImageKey}}" alt="">{{end}}
-    <h2><a href="/{{.Slug}}/">{{.Title}}</a></h2>
+    <h2><a href="/c/{{.ID}}/">{{.Title}}</a></h2>
     <p class="muted">{{.Description}}</p>
-    <a class="feed-link" href="/{{.Slug}}/feed.xml">RSS</a>
+    <a class="feed-link" href="/c/{{.ID}}/feed.xml">RSS</a>
   </li>
   {{end}}
 </ul>

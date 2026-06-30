@@ -5,7 +5,7 @@
   <div>
     <h1>{{$ch.Title}}</h1>
     <p class="muted">{{$ch.Description}}</p>
-    <a class="feed-link" href="/{{$ch.Slug}}/feed.xml">Subscribe (RSS)</a>
+    <a class="feed-link" href="/c/{{$ch.ID}}/feed.xml">Subscribe (RSS)</a>
   </div>
 </article>
 
@@ -13,7 +13,7 @@
 <ul class="episode-list">
   {{range .Data.Episodes}}
   <li class="episode-row">
-    <a class="episode-title" href="/{{$ch.Slug}}/{{.Slug}}/">{{.Title}}</a>
+    <a class="episode-title" href="/e/{{.ID}}/">{{.Title}}</a>
     <div class="episode-meta muted">
       {{with .PublishedAt}}<time>{{formatDate .}}</time>{{end}}
       {{if .DurationSecs}}· {{formatDuration .DurationSecs}}{{end}}
