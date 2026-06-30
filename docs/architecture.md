@@ -108,9 +108,36 @@ the code is merely large:
 | `queue.JobQueue` | DB-polling queue  | Redis/SQS       | async fan-out is where you outgrow a single node first |
 | `transcribe.Transcriber` | null/command | cloud API  | transcription is the heaviest compute; many hosting options |
 | `server.Renderer` | html/template    | (htmx / SPA API) | keeps a future frontend swap additive |
+| `auth.Authenticator` | (none / OIDC)  | any OIDC IdP | SSO is provider-specific; keep the server library-agnostic |
 
-Auth/session is also behind `internal/session` so cookie sessions can become
-server-side/SSO later.
+Session cookies live behind `internal/session` so they can become
+server-side/revocable later.
+
+## Authentication & accounts
+
+Two independent, separately toggleable methods; either or both may be enabled:
+
+- **Local password accounts.** bcrypt hashes; cookie sessions via
+  `internal/session` (HMAC-signed, stateless). Bootstrap the first account with
+  `castlet user-create`, or enable self-service **sign-up** (`/signup`,
+  `--allow-signup`). Sign-up validates the email, enforces a minimum password
+  length, and starts a session on success.
+- **OIDC single sign-on** (`auth.Authenticator`, default impl `auth/oidc` over
+  `coreos/go-oidc`). Provider-agnostic via issuer discovery. Flow:
+  `/auth/oidc/login` mints a random **state** (CSRF defense) and **nonce** (ID
+  token binding) into short-lived cookies and redirects to the IdP;
+  `/auth/oidc/callback` checks state, exchanges the code, verifies the ID token
+  + nonce, and resolves the identity to a user.
+
+**Identity → user resolution** (`server.resolveOIDCUser`): match by
+`(issuer, subject)` first; otherwise link a pre-existing local account **only**
+when the provider asserts a *verified* email (guards against takeover via an
+unverified claim); otherwise provision a new account just-in-time. Users carry
+`oidc_issuer`/`oidc_subject` (partial-unique index, ignoring empty/password
+accounts); a JIT account has an empty `password_hash`.
+
+All accounts have the same single role: a user manages only their own channels
+and episodes (ownership is re-checked in every admin handler).
 
 ## Component contracts (lifecycle)
 
@@ -131,9 +158,15 @@ The default `dbqueue` implements this over the metadata `Store`, which is why
 `Store` carries the job methods (`EnqueueJob`, `JobByID`, `ClaimJob`,
 `CompleteJob`, `RescheduleJob`, `FailJob`). `ClaimJob` leases a job (marks it
 processing and pushes `run_after` out) so a crashed worker's job becomes
-reclaimable. `Store` also exposes `EpisodeByAudioKey` so the media endpoint can
+reclaimable. `Store` also exposes `EpisodeByMediaKey` so the media endpoint can
 serve a blob with the correct content type without threading metadata through
-the blob layer.
+the blob layer, and `UpdateUser`/`UserByOIDCSubject` for account linking.
+
+`Migrate` is idempotent and upgrades existing databases in place: it runs the
+`CREATE TABLE IF NOT EXISTS` schema, then issues `ALTER TABLE … ADD COLUMN` for
+columns added in later versions (ignoring duplicate-column errors), then
+creates newer indexes with `IF NOT EXISTS`. So a database created by an earlier
+build gains the OIDC columns/index on the next `castlet migrate` or `serve`.
 
 ## Request & job flows
 
@@ -178,8 +211,11 @@ GET  /{channel}/feed.xml                        RSS feed
 GET  /{channel}/{episode}/                       episode page (player + transcript)
 GET  /media/{key}                               audio/image bytes (range requests)
 
-GET  /login   POST /login                       session login
+GET  /login   POST /login                       local session login
 POST /logout
+GET  /signup  POST /signup                       self-service sign-up (if enabled)
+GET  /auth/oidc/login                            begin OIDC SSO (if configured)
+GET  /auth/oidc/callback                         OIDC redirect callback
 
 GET  /admin/                                     dashboard: your channels (auth)
 GET  /admin/channels/new                         new-channel form
@@ -196,8 +232,9 @@ POST /admin/episodes/{id}/delete                  delete (also deletes the blob)
 
 Routing uses the Go 1.22+ `net/http.ServeMux` method+pattern matcher (no router
 dependency); a literal first segment (`admin`, `login`, `media`, `static`)
-beats the `{channel}` wildcard, and those names are reserved so a channel slug
-can never shadow them. `loadUser` middleware resolves the session cookie into a
+beats the `{channel}` wildcard, and those names (`admin`, `login`, `logout`,
+`signup`, `auth`, `media`, `static`) are reserved so a channel slug can never
+shadow them. `loadUser` middleware resolves the session cookie into a
 context user for every request; `requireAuth` gates the `/admin/...` handlers.
 Admin handlers re-check that the target channel/episode is owned by the current
 user. CSRF is mitigated by `SameSite=Lax` session cookies plus POST-only

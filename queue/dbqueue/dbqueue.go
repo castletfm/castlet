@@ -73,8 +73,8 @@ func New(s store.Store, options ...Option) *Queue {
 
 func defaultBackoff(attempt int) time.Duration {
 	d := time.Minute << attempt // 2^attempt minutes
-	if max := time.Hour; d > max {
-		return max
+	if limit := time.Hour; d > limit {
+		return limit
 	}
 	return d
 }
