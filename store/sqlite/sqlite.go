@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -64,7 +65,27 @@ func Open(path string, options ...Option) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlite: ping %q: %w", path, err)
 	}
+	// The database holds password hashes, emails, and OIDC subjects. Lock the
+	// file and its WAL sidecars to owner-only so a default umask (which yields
+	// world-readable 0o644 files) can't leak them to other local users. This is
+	// best-effort: ping above opens (and in WAL mode creates) the files, but a
+	// sidecar may not exist yet, and some filesystems don't support chmod.
+	restrictDBFiles(path)
 	return &Store{db: db}, nil
+}
+
+// restrictDBFiles best-effort tightens the SQLite database file and its WAL
+// sidecars to 0o600. A missing sidecar and any chmod failure (e.g. on a
+// filesystem without Unix permissions) are ignored; the goal is that a freshly
+// created database is owner-only regardless of umask.
+func restrictDBFiles(path string) {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			// Perms are a hardening best-effort, not a correctness requirement,
+			// and some filesystems don't support chmod, so failures are ignored.
+			_ = err
+		}
+	}
 }
 
 // dsnFor builds a modernc.org/sqlite DSN with pragmas applied per connection:

@@ -100,7 +100,11 @@ func New(cfg *config.Config) (*App, error) {
 // migration never has to build the blob store, transcriber, or OIDC
 // authenticator (whose discovery can block or fail when the IdP is down).
 func OpenStore(cfg *config.Config) (store.Store, error) {
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	// The data dir holds the sqlite database (password hashes, emails, OIDC
+	// subjects) and, by default, media. Create it owner-only so other local
+	// users on a self-hosted box can't read it; a default umask would otherwise
+	// leave the directory (and the DB file within) world-readable.
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, fmt.Errorf("app: create data dir: %w", err)
 	}
 	st, err := sqlite.Open(filepath.Join(cfg.DataDir, "castlet.db"))
