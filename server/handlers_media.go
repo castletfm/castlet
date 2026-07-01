@@ -1,11 +1,14 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/castletfm/castlet/blob"
@@ -16,8 +19,9 @@ import (
 // handleMedia serves a stored media object. When the blob store can serve bytes
 // directly (object storage), it redirects to a presigned URL so audio never
 // flows through Castlet; otherwise it streams the object with HTTP range support
-// so audio/video players can seek. The content type comes from the owning
-// episode; if no episode references the key, http.ServeContent sniffs it.
+// so audio/video players can seek. Either way the Content-Type is sanitized (see
+// effectiveContentType): episode media uses its stored MIME, other blobs (e.g.
+// channel cover art) are sniffed, and only an allowlist of safe types is served.
 func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
@@ -27,9 +31,25 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Direct-serving backend: redirect to the object store. Decided once at
-	// startup (s.directBlobs is nil for streaming backends).
+	// startup (s.directBlobs is nil for streaming backends). The sanitized type
+	// is passed through so the object store signs the same safe Content-Type.
 	if s.directBlobs != nil {
-		url, err := s.directBlobs.URL(r.Context(), key, mime)
+		ct, err := s.effectiveContentType(r.Context(), key, mime)
+		if errors.Is(err, blob.ErrNotFound) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			s.serverError(w, r, err)
+			return
+		}
+		// Match the streamed path's hardening: force an attachment disposition so
+		// a hostile blob cannot render as a top-level page. The content-type is
+		// already coerced to a safe type by effectiveContentType. nosniff cannot
+		// be signed onto an S3 response (see blob/s3 URL), so the octet-stream
+		// coercion for unsafe types plus this attachment disposition are the
+		// mitigation on the direct path.
+		url, err := s.directBlobs.URL(r.Context(), key, ct, "attachment")
 		if err != nil {
 			s.serverError(w, r, err)
 			return
@@ -49,12 +69,82 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rc.Close()
 
-	if mime != "" {
-		w.Header().Set("Content-Type", mime)
+	ct := mime
+	if ct == "" {
+		// No owning episode (e.g. channel cover art): sniff from the bytes.
+		if ct, err = sniffContentType(rc); err != nil {
+			s.serverError(w, r, err)
+			return
+		}
 	}
+	ct = safeContentType(ct)
+
+	// The bytes stream from Castlet's own origin and their MIME is
+	// client-influenced at upload time (see detectUploadMIME), so a hostile
+	// upload labeled text/html could otherwise execute as stored XSS. Refuse
+	// sniffing, force a download on top-level navigation, and only serve the
+	// allowlisted types; anything else is served opaquely as a download.
+	// Inline <img>/<audio>/<video> loads are unaffected: media elements load by
+	// resource regardless of Content-Disposition, and real uploads keep their
+	// safe type.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", "attachment")
+	w.Header().Set("Content-Type", ct)
 	_ = size // ServeContent derives length from the seeker; size is informational
 	// Zero modtime omits Last-Modified but still supports range requests.
 	http.ServeContent(w, r, key, time.Time{}, rc)
+}
+
+// effectiveContentType resolves the sanitized Content-Type for a blob without
+// streaming it: episode media uses its stored MIME, other blobs are sniffed
+// from their leading bytes. The result is always run through safeContentType.
+func (s *Server) effectiveContentType(ctx context.Context, key, mime string) (string, error) {
+	ct := mime
+	if ct == "" {
+		rc, _, err := s.blobs.Get(ctx, key)
+		if err != nil {
+			return "", err
+		}
+		defer rc.Close()
+		if ct, err = sniffContentType(rc); err != nil {
+			return "", err
+		}
+	}
+	return safeContentType(ct), nil
+}
+
+// sniffContentType detects a blob's content type from its leading bytes and
+// rewinds the reader so the caller can still serve it from the start.
+func sniffContentType(rs io.ReadSeeker) (string, error) {
+	buf := make([]byte, 512)
+	n, err := io.ReadFull(rs, buf)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return "", err
+	}
+	if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	return http.DetectContentType(buf[:n]), nil
+}
+
+// safeContentType returns ct when it is safe to serve under the app origin —
+// audio/* and video/* for playback, plus a small allowlist of raster image
+// types for channel cover art — and application/octet-stream otherwise.
+// Client-influenced types such as text/html and image/svg+xml are coerced so a
+// hostile upload cannot execute as stored XSS.
+func safeContentType(ct string) string {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = strings.TrimSpace(ct[:i])
+	}
+	switch {
+	case strings.HasPrefix(ct, "audio/"), strings.HasPrefix(ct, "video/"):
+		return ct
+	}
+	switch ct {
+	case "image/png", "image/jpeg", "image/gif", "image/webp":
+		return ct
+	}
+	return "application/octet-stream"
 }
 
 func (s *Server) handleFeed(w http.ResponseWriter, r *http.Request) {

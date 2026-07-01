@@ -164,8 +164,17 @@ func (s *Store) Delete(ctx context.Context, key string) error {
 }
 
 // URL returns a presigned GET URL valid for 15 minutes, with the response
-// Content-Type overridden so the client receives the episode's media type.
-func (s *Store) URL(ctx context.Context, key, contentType string) (string, error) {
+// Content-Type and Content-Disposition overridden so the client receives the
+// sanitized media type and (for hardening) the requested disposition.
+//
+// S3 presigned GET overrides can only set response-* parameters that map to
+// response headers S3 supports — response-content-type and
+// response-content-disposition among them — but NOT arbitrary headers, so
+// X-Content-Type-Options: nosniff cannot be forced onto the S3 response via the
+// URL. The direct path's XSS mitigation is therefore the caller's content-type
+// coercion (unsafe types become application/octet-stream) plus the attachment
+// disposition signed here.
+func (s *Store) URL(ctx context.Context, key, contentType, contentDisposition string) (string, error) {
 	t := time.Now().UTC()
 	scope := t.Format("20060102") + "/" + s.cfg.Region + "/s3/aws4_request"
 	q := url.Values{}
@@ -174,8 +183,13 @@ func (s *Store) URL(ctx context.Context, key, contentType string) (string, error
 	q.Set("X-Amz-Date", t.Format("20060102T150405Z"))
 	q.Set("X-Amz-Expires", "900")
 	q.Set("X-Amz-SignedHeaders", "host")
+	// These response-* overrides must be part of the signed canonical query
+	// (canonicalQuery below feeds both the signature and the returned URL).
 	if contentType != "" {
 		q.Set("response-content-type", contentType)
+	}
+	if contentDisposition != "" {
+		q.Set("response-content-disposition", contentDisposition)
 	}
 	path := s.objectPath(key)
 	canonical := strings.Join([]string{
