@@ -135,6 +135,17 @@ func TestPublicPages(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
+func TestSecurityHeaders(t *testing.T) {
+	h := newHarness(t)
+	h.seed(t)
+
+	resp, _ := h.get(t, "/")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+	require.Equal(t, "DENY", resp.Header.Get("X-Frame-Options"))
+	require.Equal(t, "no-referrer", resp.Header.Get("Referrer-Policy"))
+}
+
 func TestDraftEpisodeHidden(t *testing.T) {
 	h := newHarness(t)
 	h.seed(t)
