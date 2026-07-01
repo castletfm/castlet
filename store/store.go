@@ -18,7 +18,10 @@ var (
 	// ErrNotFound is returned when a lookup matches no row.
 	ErrNotFound = errors.New("store: not found")
 	// ErrConflict is returned when a write violates a uniqueness constraint
-	// (e.g. a duplicate email or id).
+	// (e.g. a duplicate email or id), and by EnqueueTranscriptionJob when the
+	// target episode is already pending/processing (a transcription is already
+	// queued or running) — in that case no additional job is queued and the
+	// existing job and status are left untouched.
 	ErrConflict = errors.New("store: conflict")
 	// ErrStaleClaim is returned by the job settlement methods (CompleteJob,
 	// RescheduleJob, FailJob, SettleEpisodeTranscript, and the combined
@@ -168,7 +171,11 @@ type Store interface {
 	// (on any error the transaction rolls back, leaving no job and the episode's
 	// prior, non-pending status intact). This closes both windows a two-step
 	// enqueue-then-mark leaves open: an episode stuck pending with no job to run
-	// it, and a queued job whose episode status was never advanced. j.Payload must
+	// it, and a queued job whose episode status was never advanced. The pending
+	// transition is the concurrency guard: if the episode is already
+	// pending/processing the transaction commits nothing and returns ErrConflict
+	// (no second job is queued; the existing job and status are left intact), so
+	// two racing enqueues cannot both queue a job. j.Payload must
 	// already identify episodeID.
 	//
 	// The episode->pending transition is also the concurrency guard: the job is

@@ -28,7 +28,10 @@ type JobQueue interface {
 	// episode's transcript_status = pending as ONE atomic unit: a caller either
 	// gets both (a queued job and an episode that shows pending) or neither (on
 	// failure no job is queued and the episode keeps its prior, non-pending
-	// status). This is the only way callers should start transcription, so a
+	// status). If the episode is already pending or processing, it returns
+	// store.ErrConflict: no additional job is queued and the existing job and
+	// status are left untouched (distinct from a genuine error, which rolls back
+	// any accepted change). This is the only way callers should start transcription, so a
 	// queued job and its episode's pending state never diverge — there is never a
 	// pending episode with no job to run it, nor a queued job whose episode status
 	// was left stale. The store-backed default (dbqueue over sqlite) provides this
