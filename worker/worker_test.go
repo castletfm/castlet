@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/castletfm/castlet/blob/localfs"
+	"github.com/castletfm/castlet/internal/metrics"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/queue/dbqueue"
 	"github.com/castletfm/castlet/store"
@@ -142,6 +143,32 @@ func TestWorkerTranscribes(t *testing.T) {
 
 	cancel()
 	require.NoError(t, ctrl.Wait())
+}
+
+// TestWorkerMetrics asserts a completed transcription bumps the success counter
+// and records a last-success timestamp in the shared registry.
+func TestWorkerMetrics(t *testing.T) {
+	st, blobs, q := setup(t)
+	id := seedEpisode(t, st, blobs, q)
+
+	reg := metrics.New()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ctrl, err := worker.New(st, blobs, q, fakeTranscriber{},
+		worker.WithPollInterval(10*time.Millisecond), worker.WithMetrics(reg)).Run(ctx)
+	require.NoError(t, err)
+
+	waitStatus(t, st, id, model.TranscriptDone)
+	cancel()
+	require.NoError(t, ctrl.Wait())
+
+	var b strings.Builder
+	_, err = reg.WriteTo(&b)
+	require.NoError(t, err)
+	out := b.String()
+	require.Contains(t, out, `transcription_jobs_total{outcome="success"} 1`)
+	require.Contains(t, out, "worker_last_success_timestamp_seconds ")
+	require.NotContains(t, out, `transcription_jobs_total{outcome="failure"}`)
 }
 
 // TestWorkerJobHasTimeout asserts the worker hands the transcriber a context

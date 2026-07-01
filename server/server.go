@@ -20,6 +20,7 @@ import (
 
 	"github.com/castletfm/castlet/auth"
 	"github.com/castletfm/castlet/blob"
+	"github.com/castletfm/castlet/internal/metrics"
 	"github.com/castletfm/castlet/internal/session"
 	"github.com/castletfm/castlet/queue"
 	"github.com/castletfm/castlet/store"
@@ -50,6 +51,7 @@ type Server struct {
 	sessions    *session.Manager
 	renderer    Renderer
 	authn       auth.Authenticator // nil when OIDC is disabled
+	metrics     *metrics.Registry
 
 	addr            string
 	baseURL         string
@@ -75,6 +77,7 @@ type (
 	identAllowSignup    struct{}
 	identAuthenticator  struct{}
 	identAllowedDomains struct{}
+	identMetrics        struct{}
 )
 
 // WithAddr sets the listen address (default ":8080").
@@ -109,6 +112,11 @@ func WithAuthenticator(a auth.Authenticator) Option { return option.New(identAut
 // WithAllowedDomains restricts OIDC sign-in (linking and just-in-time
 // provisioning) to the given email domains. An empty list allows any domain.
 func WithAllowedDomains(domains []string) Option { return option.New(identAllowedDomains{}, domains) }
+
+// WithMetrics sets the metrics registry the server records HTTP metrics into and
+// serves at /metrics. Share one registry with the worker so a single scrape
+// covers both. When unset, the server creates a private registry.
+func WithMetrics(r *metrics.Registry) Option { return option.New(identMetrics{}, r) }
 
 // New constructs a Server from its dependencies. It returns an error only if
 // the default renderer fails to parse its templates.
@@ -148,8 +156,14 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *sessi
 			s.authn = option.MustGet[auth.Authenticator](o)
 		case identAllowedDomains:
 			s.allowedDomains = option.MustGet[[]string](o)
+		case identMetrics:
+			s.metrics = option.MustGet[*metrics.Registry](o)
 		}
 	}
+	if s.metrics == nil {
+		s.metrics = metrics.New()
+	}
+	s.registerMetrics()
 	if s.renderer == nil {
 		r, err := newTemplateRenderer()
 		if err != nil {

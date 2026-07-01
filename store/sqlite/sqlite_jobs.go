@@ -154,6 +154,18 @@ func (s *Store) setJobStatus(ctx context.Context, id string, token int, status m
 	return nil
 }
 
+// CountPendingJobs counts jobs still queued to run. It is a cheap COUNT over the
+// pending status, backing the queue-depth gauge exposed at /metrics.
+func (s *Store) CountPendingJobs(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs WHERE status = ?`, string(model.JobPending)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: count pending jobs: %w", mapErr(err))
+	}
+	return n, nil
+}
+
 func scanJob(sc interface{ Scan(...any) error }) (*model.Job, error) {
 	var (
 		j                      model.Job

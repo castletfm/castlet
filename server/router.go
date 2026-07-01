@@ -57,8 +57,10 @@ func (s *Server) handler() http.Handler {
 
 	// logRequests is outermost so a recovered panic still produces the normal
 	// completion line (with the 500 status); recoverPanic then wraps loadUser and
-	// the handlers so their panics become a logged 500.
-	app := s.logRequests(s.recoverPanic(s.loadUser(mux)))
+	// the handlers so their panics become a logged 500. instrumentHTTP sits just
+	// inside logRequests so it observes the final status (including a recovered
+	// 500) and resolves the matched route pattern from mux for its metric labels.
+	app := s.logRequests(s.instrumentHTTP(mux, s.recoverPanic(s.loadUser(mux))))
 
 	// Health probes are mounted on an outer mux so they bypass request logging
 	// (they are polled constantly by load balancers / supervisors) and the auth
@@ -70,6 +72,10 @@ func (s *Server) handler() http.Handler {
 	root := http.NewServeMux()
 	root.Handle("GET /healthz", probe(s.handleHealthz))
 	root.Handle("GET /readyz", probe(s.handleReadyz))
+	// Metrics, like the health probes, bypass request logging and auth. It is
+	// unauthenticated by design (typical for a homelab scrape target) and exposes
+	// only aggregate counters/gauges — no request contents or secrets.
+	root.Handle("GET /metrics", probe(s.handleMetrics))
 	root.Handle("/", app)
 
 	// securityHeaders wraps the whole root mux (not each branch) so the baseline

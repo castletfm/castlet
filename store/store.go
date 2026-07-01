@@ -190,4 +190,7 @@ type Store interface {
 	// 'processing'. It returns ErrStaleClaim when the job was reclaimed or is
 	// already in a terminal state (already settled).
 	FailJob(ctx context.Context, id string, token int, cause string) error
+	// CountPendingJobs returns the number of jobs still waiting to run (status
+	// 'pending'). It backs the queue-depth metric and should stay cheap.
+	CountPendingJobs(ctx context.Context) (int, error)
 }

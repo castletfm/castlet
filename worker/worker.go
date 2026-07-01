@@ -18,11 +18,18 @@ import (
 	"time"
 
 	"github.com/castletfm/castlet/blob"
+	"github.com/castletfm/castlet/internal/metrics"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/queue"
 	"github.com/castletfm/castlet/store"
 	"github.com/castletfm/castlet/transcribe"
 	"github.com/lestrrat-go/option/v3"
+)
+
+// Metric names the worker records into its registry.
+const (
+	metricJobsTotal   = "transcription_jobs_total"
+	metricLastSuccess = "worker_last_success_timestamp_seconds"
 )
 
 // ErrWorkerClosed is recorded on the Controller when the worker stops because
@@ -100,6 +107,7 @@ type Worker struct {
 	jobTimeout    JobTimeoutPolicy
 	settleTimeout time.Duration
 	logger        *slog.Logger
+	metrics       *metrics.Registry
 }
 
 // Option configures New.
@@ -110,6 +118,7 @@ type (
 	identJobTimeout    struct{}
 	identSettleTimeout struct{}
 	identLogger        struct{}
+	identMetrics       struct{}
 )
 
 // WithPollInterval sets how often the worker polls when the queue is empty
@@ -128,6 +137,11 @@ func WithSettleTimeout(d time.Duration) Option { return option.New(identSettleTi
 
 // WithLogger sets the structured logger (default slog.Default()).
 func WithLogger(l *slog.Logger) Option { return option.New(identLogger{}, l) }
+
+// WithMetrics sets the metrics registry the worker records job outcomes and its
+// last-success timestamp into. Share one registry with the server so /metrics
+// reports both. When unset, the worker records into a private registry.
+func WithMetrics(r *metrics.Registry) Option { return option.New(identMetrics{}, r) }
 
 // New constructs a Worker from its dependencies.
 func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, tr transcribe.Transcriber, options ...Option) *Worker {
@@ -152,9 +166,16 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, tr transcribe.T
 			}
 		case identLogger:
 			w.logger = option.MustGet[*slog.Logger](o)
+		case identMetrics:
+			w.metrics = option.MustGet[*metrics.Registry](o)
 		}
 	}
 	w.jobTimeout = w.jobTimeout.withDefaults()
+	if w.metrics == nil {
+		w.metrics = metrics.New()
+	}
+	w.metrics.Register(metricJobsTotal, metrics.Counter, "Transcription job attempts by outcome (success or failure).")
+	w.metrics.Register(metricLastSuccess, metrics.Gauge, "Unix timestamp of the worker's last successful transcription.")
 	return w
 }
 
@@ -245,6 +266,7 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 		markCtx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
 		defer cancel()
 		w.markTranscript(markCtx, job, model.TranscriptFailed)
+		w.metrics.Inc(metricJobsTotal, "outcome", "failure")
 		return true, nil
 	}
 	s, herr := w.handle(ctx, job)
@@ -277,6 +299,8 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 	if serr != nil {
 		return true, w.fail(job, serr)
 	}
+	w.metrics.Inc(metricJobsTotal, "outcome", "success")
+	w.metrics.Set(metricLastSuccess, float64(time.Now().Unix()))
 	return true, nil
 }
 
@@ -297,6 +321,7 @@ func (w *Worker) ack(job *model.Job) error {
 // settlement context, which may already be exhausted) so the queue state
 // transition always runs live. cause is returned so the loop can log it.
 func (w *Worker) fail(job *model.Job, cause error) error {
+	w.metrics.Inc(metricJobsTotal, "outcome", "failure")
 	ctx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
 	defer cancel()
 	dead, nerr := w.queue.Nack(ctx, job, cause)
