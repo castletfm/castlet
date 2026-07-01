@@ -121,6 +121,24 @@ a TLS-terminating reverse proxy (nginx, Caddy, Traefik, a cloud LB, …) and:
   matches `<base-url>/auth/oidc/callback` (or your explicit
   `--oidc-redirect-url`).
 
+## Health, readiness & metrics
+
+Three unauthenticated operational endpoints are served on an outer mux, so they
+bypass request logging, session auth, and CSRF (they carry no user state and are
+polled constantly):
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /healthz` | **Liveness.** Always `200 ok` as long as the process can serve a request; runs no dependency checks, so a transient backend outage does not fail it. Use it to detect a wedged process. |
+| `GET /readyz` | **Readiness.** `200 ok` only when the metadata store is reachable (`store.Ping`), `503` otherwise. Point a load balancer at this so traffic is steered away from an instance that has lost its database. |
+| `GET /metrics` | **Prometheus** text exposition (`text/plain; version=0.0.4`). Exposes aggregate counters/gauges only — no request contents or secrets — so it is safe to scrape on a homelab network; put it behind your proxy if the network is not trusted. |
+
+`/metrics` currently exports HTTP request counts and durations labeled by matched
+route pattern (`http_requests_total`, `http_request_duration_seconds_sum`/
+`_count`) and the runnable-job backlog gauge (`queue_pending_jobs`). The registry
+is hand-rolled (`internal/metrics`), so scraping needs no `prometheus/client_golang`
+dependency.
+
 ## Backup & restore
 
 Castlet's state is **two things that must be backed up together and

@@ -46,7 +46,10 @@ User 1───* Channel 1───* Episode 1───0..1 Transcript 1──�
 ```
 
 - **User** — a person who creates podcasts. Owns channels. Authenticates to the
-  admin area. `id, email, display_name, password_hash, created_at`.
+  admin area by password and/or an OIDC identity. `id, email, display_name,
+  password_hash, oidc_issuer, oidc_subject, session_epoch, created_at`.
+  `session_epoch` is a revocation counter (see Authentication); a cookie is
+  accepted only while its epoch matches the user's current one.
 - **Channel** — groups episodes; a user may own many.
   `id, user_id, title, description, language, image_key, created_at,
   updated_at`.
@@ -89,9 +92,12 @@ transcribe/             Transcriber interface + Result/Segment types
 worker/                 transcription worker (Run/Controller lifecycle)
 feed/                   RSS 2.0 + iTunes podcast feed generation
 server/                 HTTP server (Run/Controller lifecycle), router,
-                        handlers, Renderer interface, sessions, middleware
+                        handlers, Renderer interface, sessions, middleware,
+                        CSRF, login rate limiting, health probes, /metrics
 internal/idgen/         random id generation
-internal/session/       HMAC-signed cookie sessions (swap target: server-side)
+internal/session/       HMAC-signed, epoch-revocable cookie sessions
+internal/email/         email address canonicalization (identity key)
+internal/metrics/       dependency-free Prometheus-text metrics registry
 
 web/templates/          embedded html/template files
 web/static/             embedded css + js
@@ -111,18 +117,26 @@ the code is merely large:
 | `server.Renderer` | html/template    | (htmx / SPA API) | keeps a future frontend swap additive |
 | `auth.Authenticator` | (none / OIDC)  | any OIDC IdP | SSO is provider-specific; keep the server library-agnostic |
 
-Session cookies live behind `internal/session` so they can become
-server-side/revocable later.
+Session cookies live behind `internal/session` (HMAC-signed, stateless — no
+server-side session table) so a fully server-side store could be swapped in
+later. Revocation does not need one: each cookie carries the user's
+`session_epoch`, and a cookie is honored only while that epoch still matches the
+stored value, so `Store.BumpSessionEpoch` ("log out everywhere", used on logout
+and after a password change) invalidates every outstanding session at once.
 
 ## Authentication & accounts
 
 Two independent, separately toggleable methods; either or both may be enabled:
 
 - **Local password accounts.** bcrypt hashes; cookie sessions via
-  `internal/session` (HMAC-signed, stateless). Bootstrap the first account with
-  `castlet user-create`, or enable self-service **sign-up** (`/signup`,
-  `--allow-signup`). Sign-up validates the email, enforces a minimum password
-  length, and starts a session on success.
+  `internal/session` (HMAC-signed, stateless, epoch-revocable). Bootstrap the
+  first account with `castlet user-create`, or enable self-service **sign-up**
+  (`/signup`, `--allow-signup`). Sign-up validates the email, enforces a minimum
+  password length, and starts a session on success. Email addresses are
+  canonicalized (`internal/email`, lower-cased, display name stripped) so
+  `user-create`, sign-up, and OIDC all key on one mailbox form. Repeated failed
+  logins from one client IP are throttled by an in-memory fixed-window limiter
+  (`server/ratelimit.go`).
 - **OIDC single sign-on** (`auth.Authenticator`, default impl `auth/oidc` over
   `coreos/go-oidc`). Provider-agnostic via issuer discovery. Flow:
   `/auth/oidc/login` mints a random **state** (CSRF defense) and **nonce** (ID
@@ -210,9 +224,14 @@ dead-letters it (marks it permanently failed) and returns it with
 `deadLettered=true` so the caller only settles its side effects to failed,
 mirroring the `Nack`-exhaustion path.
 
-`Store` also exposes `EpisodeByMediaKey` so the media endpoint can serve a blob
-with the correct content type without threading metadata through the blob layer,
-and `UpdateUser`/`UserByOIDCSubject` for account linking.
+`Store` also exposes `PublishedEpisodeByMediaKey` and `ChannelImageKeyExists` so
+the media endpoint can both *authorize* and serve a blob with the correct
+content type without threading metadata through the blob layer: `/media/{key}`
+serves bytes only when a **published** episode references the key (a draft's
+media stays private) or the key is a channel's cover art, and it uses the owning
+episode's MIME (sniffing an allowlist of safe types for cover art). It also
+exposes `UpdateUser`/`UserByOIDCSubject`/`LinkOIDCIdentity` for account linking
+and `BumpSessionEpoch` for session revocation.
 
 `Migrate` is idempotent and upgrades existing databases in place: it runs the
 `CREATE TABLE IF NOT EXISTS` schema, then issues `ALTER TABLE … ADD COLUMN` for
@@ -288,7 +307,8 @@ GET  /                                          landing: list channels
 GET  /c/{id}/                                   channel page: published episodes
 GET  /c/{id}/feed.xml                           RSS feed
 GET  /e/{id}/                                   episode page (player + transcript)
-GET  /media/{key}                               audio/image bytes (range requests)
+GET  /media/{key}                               media/image bytes (range requests; published only)
+GET  /static/{path...}                          embedded css/js
 
 GET  /login   POST /login                       local session login
 POST /logout
@@ -297,6 +317,7 @@ GET  /auth/oidc/login                            begin OIDC SSO (if configured)
 GET  /auth/oidc/callback                         OIDC redirect callback
 
 GET  /admin/                                     dashboard: your channels (auth)
+GET  /admin/upload                               upload landing (pick a channel)
 GET  /admin/channels/new                         new-channel form
 POST /admin/channels                             create channel
 GET  /admin/channels/{id}/edit                   edit-channel form
@@ -304,10 +325,23 @@ POST /admin/channels/{id}                         update channel
 GET  /admin/channels/{id}/episodes               list a channel's episodes
 GET  /admin/channels/{id}/episodes/new           new-episode (upload) form
 POST /admin/channels/{id}/episodes               create episode (multipart)
+GET  /admin/episodes/{id}/edit                    edit-episode form
+POST /admin/episodes/{id}                         update episode metadata
 POST /admin/episodes/{id}/publish                 publish
 POST /admin/episodes/{id}/unpublish               unpublish
+POST /admin/episodes/{id}/move                    reorder within the channel
+POST /admin/episodes/{id}/transcribe              (re-)enqueue transcription
+GET  /admin/episodes/{id}/status                  transcript-status poll (for the UI)
 POST /admin/episodes/{id}/delete                  delete (also deletes the blob)
+
+GET  /healthz                                    liveness probe (always 200)
+GET  /readyz                                     readiness probe (200 iff store reachable)
+GET  /metrics                                    Prometheus text exposition
 ```
+
+Health probes and `/metrics` are mounted on an outer mux so they bypass the
+request-logging, auth, and CSRF middleware (they are polled constantly and carry
+no user state); everything else falls through the full application chain.
 
 Routing uses the Go 1.22+ `net/http.ServeMux` method+pattern matcher (no router
 dependency). Public channel and episode pages live under the literal `/c/` and
@@ -316,16 +350,29 @@ dependency). Public channel and episode pages live under the literal `/c/` and
 user-chosen slugs to reserve against. `loadUser` middleware resolves the session
 cookie into a context user for every request; `requireAuth` gates the `/admin/...` handlers.
 Admin handlers re-check that the target channel/episode is owned by the current
-user. CSRF is mitigated by `SameSite=Lax` session cookies plus POST-only
-mutations; a token scheme is a noted follow-up.
+user. CSRF is defended by a **double-submit-cookie** token (`server/csrf.go`):
+the `csrf` middleware mints a per-browser token cookie on every request, stashes
+it in the request context so every rendered form embeds it, and rejects any
+unsafe-method request (POST/PUT/…) whose echoed token — from the `X-Csrf-Token`
+header, the query string, or a urlencoded form field — does not constant-time
+match the cookie (403). It is session-independent so it also covers the
+pre-auth login POST; multipart uploads carry the token in the query string so
+the middleware never has to parse the body. `SameSite=Lax` cookies remain a
+second layer.
 
 ## Configuration
 
 `config.Config` is populated from flags then environment (`CASTLET_*`). Key
 fields: `Addr`, `DataDir` (sqlite file + blob root live under it by default),
-`BaseURL` (for absolute feed/enclosure URLs), `SessionKey`, `StoreDSN`,
-`BlobBackend`, `Transcriber` (+ `TranscribeCommand`). Unset secrets in dev are
-generated and a warning logged; production must set `CASTLET_SESSION_KEY`.
+`BaseURL` (absolute feed/enclosure URLs; its scheme also sets the cookie
+`Secure` flag), `SiteName`, `SessionKey`, `AllowSignup`, `BlobStoreConfig` (path
+to the one JSON file selecting the media backend), the `OIDC*` fields,
+`Transcriber` (+ `TranscribeCommand`/`TranscribeArgs`/timeout knobs), and the
+operational tuning knobs (`ShutdownTimeout`, `WorkerPollInterval`, `JobLease`,
+`JobMaxAttempts`, `MaxUploadBytes`, `LogLevel`). The metadata store DSN is
+derived from `DataDir`, not a separate field. Unset secrets in dev are generated
+and a warning logged; production must set `CASTLET_SESSION_KEY`. See
+[operations.md](operations.md) for the full flag/env reference.
 
 For running Castlet in production — secrets, TLS/reverse proxy, backup &
 restore, upgrades, scaling limits, and process supervision — see
