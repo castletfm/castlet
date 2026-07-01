@@ -360,10 +360,18 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Queue transcription; failure to enqueue is logged but does not fail the
-	// upload (the episode still exists and can be re-queued).
+	// Queue transcription. The episode is already persisted as pending (it owns
+	// the media key), so an enqueue failure must not leave it stuck pending with
+	// no job in the queue — the UI only offers a re-transcribe on a non-pending
+	// episode. Roll the status back to failed and surface the error to the user.
 	if err := s.queue.Enqueue(r.Context(), model.JobTranscribe, model.TranscribePayload{EpisodeID: ep.ID}); err != nil {
-		s.logger.Error("enqueue transcription", "episode", ep.ID, "error", err)
+		ep.TranscriptStatus = model.TranscriptFailed
+		ep.UpdatedAt = s.now()
+		if uerr := s.store.UpdateEpisode(r.Context(), ep); uerr != nil {
+			s.logger.Error("mark transcription failed after enqueue error", "episode", ep.ID, "error", uerr)
+		}
+		s.serverError(w, r, err)
+		return
 	}
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
@@ -507,14 +515,18 @@ func (s *Server) handleEpisodeTranscribe(w http.ResponseWriter, r *http.Request)
 		s.renderError(w, r, http.StatusConflict, "Transcription is already in progress for this episode.")
 		return
 	}
+	// Enqueue before persisting the pending status: if the enqueue fails, the
+	// episode keeps its current (non-pending) status so the UI still offers a
+	// re-transcribe, rather than being stuck pending with no job in the queue.
+	if err := s.queue.Enqueue(r.Context(), model.JobTranscribe, model.TranscribePayload{EpisodeID: ep.ID}); err != nil {
+		s.serverError(w, r, err)
+		return
+	}
 	ep.TranscriptStatus = model.TranscriptPending
 	ep.UpdatedAt = s.now()
 	if err := s.store.UpdateEpisode(r.Context(), ep); err != nil {
 		s.serverError(w, r, err)
 		return
-	}
-	if err := s.queue.Enqueue(r.Context(), model.JobTranscribe, model.TranscribePayload{EpisodeID: ep.ID}); err != nil {
-		s.logger.Error("enqueue re-transcription", "episode", ep.ID, "error", err)
 	}
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
