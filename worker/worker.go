@@ -201,12 +201,20 @@ func (w *Worker) loop(ctx context.Context) error {
 // processOne claims and handles a single job. It reports whether a job was
 // processed (so the caller can keep draining) and any handling error.
 func (w *Worker) processOne(ctx context.Context) (bool, error) {
-	job, err := w.queue.Dequeue(ctx, model.JobTranscribe)
+	job, deadLettered, err := w.queue.Dequeue(ctx, model.JobTranscribe)
 	if err != nil {
 		return false, err
 	}
 	if job == nil {
 		return false, nil
+	}
+	if deadLettered {
+		// The queue reclaimed a job past its attempt limit and permanently
+		// failed it instead of handing it back to run. Settle the episode
+		// transcript to failed too, matching the Nack-exhaustion path, so it is
+		// not left stuck "processing" forever. Do not run it.
+		w.markTranscript(ctx, job, model.TranscriptFailed)
+		return true, nil
 	}
 	if herr := w.handle(ctx, job); herr != nil {
 		dead, nerr := w.queue.Nack(ctx, job.ID, herr)

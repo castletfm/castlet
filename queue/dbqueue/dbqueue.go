@@ -96,15 +96,28 @@ func (q *Queue) Enqueue(ctx context.Context, kind model.JobKind, payload any) er
 	})
 }
 
-func (q *Queue) Dequeue(ctx context.Context, kinds ...model.JobKind) (*model.Job, error) {
+func (q *Queue) Dequeue(ctx context.Context, kinds ...model.JobKind) (*model.Job, bool, error) {
 	j, err := q.store.ClaimJob(ctx, kinds, time.Now(), q.lease)
 	if errors.Is(err, store.ErrNotFound) {
-		return nil, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("dbqueue: dequeue: %w", err)
+		return nil, false, fmt.Errorf("dbqueue: dequeue: %w", err)
 	}
-	return j, nil
+	// A job reclaimed from a crashed worker has its attempts bumped by the
+	// claim but is never Nack'd, so enforce max-attempts here too: a poison job
+	// that keeps crashing must be dead-lettered rather than reclaimed and re-run
+	// forever. attempts <= maxAttempts still runs (matching Nack's >= maxAttempts
+	// dead-letter accounting). The dead-lettered job is surfaced
+	// (deadLettered=true) so the caller can settle its side effects to failed,
+	// exactly as it does when Nack reports the job dead.
+	if j.Attempts > q.maxAttempts {
+		if err := q.store.FailJob(ctx, j.ID, "dbqueue: exceeded max attempts"); err != nil {
+			return nil, false, fmt.Errorf("dbqueue: dead-letter poison job: %w", err)
+		}
+		return j, true, nil
+	}
+	return j, false, nil
 }
 
 func (q *Queue) Ack(ctx context.Context, jobID string) error {

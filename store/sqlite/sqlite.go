@@ -118,6 +118,19 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func toUnix(t time.Time) int64 { return t.UTC().Unix() }
 
+// toUnixCeil rounds t up to the next whole second before encoding. Lease
+// deadlines are computed with sub-second precision but persisted as Unix
+// seconds; truncating would let a lease be reclaimed just before its true
+// deadline, so round up to guarantee the durable deadline never precedes the
+// in-memory one.
+func toUnixCeil(t time.Time) int64 {
+	u := t.UTC()
+	if u.Nanosecond() == 0 {
+		return u.Unix()
+	}
+	return u.Unix() + 1
+}
+
 func fromUnix(sec int64) time.Time { return time.Unix(sec, 0).UTC() }
 
 func toUnixPtr(t *time.Time) sql.NullInt64 {

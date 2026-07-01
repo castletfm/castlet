@@ -32,9 +32,12 @@ func (s *Store) JobByID(ctx context.Context, id string) (*model.Job, error) {
 	return j, nil
 }
 
-// ClaimJob atomically selects and locks the oldest runnable job. Because the
-// pool is a single writer, the SELECT-then-UPDATE inside one transaction is
-// race-free across worker goroutines and processes sharing the file.
+// ClaimJob atomically selects and locks the oldest runnable job. A job is
+// runnable when its RunAfter is due and it is either pending or processing with
+// an expired lease (its worker crashed before finishing); the latter is how a
+// stuck job is reclaimed. Because the pool is a single writer, the
+// SELECT-then-UPDATE inside one transaction is race-free across worker
+// goroutines and processes sharing the file.
 func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Time, lease time.Duration) (*model.Job, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -42,9 +45,11 @@ func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Ti
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
+	// A freshly leased processing job has run_after in the future, so the
+	// run_after <= now gate only reclaims processing jobs whose lease expired.
 	query := `SELECT id, kind, payload, status, attempts, last_error, run_after, created_at, updated_at
-		FROM jobs WHERE status = ? AND run_after <= ?`
-	args := []any{string(model.JobPending), toUnix(now)}
+		FROM jobs WHERE status IN (?, ?) AND run_after <= ?`
+	args := []any{string(model.JobPending), string(model.JobProcessing), toUnix(now)}
 	if len(kinds) > 0 {
 		ph := make([]string, len(kinds))
 		for i, k := range kinds {
@@ -65,7 +70,10 @@ func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Ti
 	j.Status = model.JobProcessing
 	j.Attempts++
 	j.UpdatedAt = now
-	j.RunAfter = now.Add(lease)
+	// Round the lease deadline up to whole seconds so the persisted run_after
+	// never falls before the true sub-second deadline; RunAfter is normalized to
+	// the stored precision so callers compare against the durable value.
+	j.RunAfter = fromUnix(toUnixCeil(now.Add(lease)))
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE jobs SET status = ?, attempts = ?, run_after = ?, updated_at = ? WHERE id = ?`,
 		string(j.Status), j.Attempts, toUnix(j.RunAfter), toUnix(j.UpdatedAt), j.ID); err != nil {

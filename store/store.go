@@ -78,8 +78,9 @@ type Store interface {
 	JobByID(ctx context.Context, id string) (*model.Job, error)
 	// ClaimJob atomically selects the oldest runnable job whose Kind is in
 	// kinds and whose RunAfter <= now, marks it processing with the given
-	// lease, increments Attempts, and returns it. It returns ErrNotFound when
-	// no job is runnable.
+	// lease, increments Attempts, and returns it. A runnable job is either
+	// pending or a processing job whose lease expired (reclaimed from a crashed
+	// worker). It returns ErrNotFound when no job is runnable.
 	ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Time, lease time.Duration) (*model.Job, error)
 	// CompleteJob marks a job done.
 	CompleteJob(ctx context.Context, id string) error

@@ -170,6 +170,52 @@ func TestWorkerDoesNotClobberConcurrentEdit(t *testing.T) {
 	require.Equal(t, model.TranscriptDone, ep.TranscriptStatus)
 }
 
+// TestWorkerReclaimDeadLetterFailsEpisode proves that a job reclaimed after it
+// has already exhausted its attempts (a worker that kept crashing before it
+// could Nack) settles BOTH the queue job and the episode transcript to failed.
+// The queue dead-letters the job at dequeue time; the worker must still mark the
+// episode failed rather than leaving it stuck "processing" forever, matching the
+// normal Nack-exhaustion path.
+func TestWorkerReclaimDeadLetterFailsEpisode(t *testing.T) {
+	st, blobs, _ := setup(t)
+	ctx := t.Context()
+
+	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "u@x.y", DisplayName: "U", CreatedAt: time.Now()}))
+	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	_, err := blobs.Put(ctx, "mk1", strings.NewReader("fake audio bytes"))
+	require.NoError(t, err)
+	require.NoError(t, st.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
+		MediaKey: "mk1", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptProcessing,
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	// A job left "processing" by a crashed worker that already used up its
+	// attempts, with an expired lease so it is reclaimable. The reclaim bumps
+	// attempts past maxAttempts, so the queue dead-letters it.
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, st.EnqueueJob(ctx, &model.Job{ID: "poison", Kind: model.JobTranscribe,
+		Payload: `{"episode_id":"e1"}`, Status: model.JobProcessing, Attempts: 2,
+		RunAfter: past, CreatedAt: past, UpdatedAt: past}))
+
+	q := dbqueue.New(st, dbqueue.WithMaxAttempts(2))
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// fakeTranscriber would drive the episode to Done if the job were (wrongly)
+	// run, so a Failed status also proves the job was not re-run.
+	_, err = worker.New(st, blobs, q, fakeTranscriber{}, worker.WithPollInterval(10*time.Millisecond)).Run(wctx)
+	require.NoError(t, err)
+
+	waitStatus(t, st, "e1", model.TranscriptFailed)
+
+	got, err := st.JobByID(t.Context(), "poison")
+	require.NoError(t, err)
+	require.Equal(t, model.JobFailed, got.Status, "dead-lettered job must be permanently failed")
+
+	_, err = st.TranscriptByEpisode(t.Context(), "e1")
+	require.Error(t, err, "no transcript should be saved for a dead-lettered job")
+}
+
 func TestWorkerNullSettlesToNone(t *testing.T) {
 	st, blobs, q := setup(t)
 	id := seedEpisode(t, st, blobs, q)

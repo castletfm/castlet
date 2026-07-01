@@ -192,3 +192,58 @@ func TestJobClaimLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, model.JobDone, done.Status)
 }
+
+func TestJobClaimReclaimsExpiredLease(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	// A job left processing by a crashed worker: its lease (run_after) already
+	// expired, so it must be reclaimable rather than stuck forever.
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: "{}",
+		Status: model.JobProcessing, Attempts: 1, RunAfter: now.Add(-time.Minute),
+		CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour)}))
+
+	claimed, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, "j1", claimed.ID)
+	require.Equal(t, model.JobProcessing, claimed.Status)
+	require.Equal(t, 2, claimed.Attempts) // the reclaim consumes a fresh attempt
+	require.True(t, claimed.RunAfter.After(now))
+
+	// The fresh lease pushes run_after into the future, so it is not reclaimed again.
+	_, err = s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.ErrorIs(t, err, store.ErrNotFound)
+}
+
+func TestJobClaimLeaseNotReclaimedBeforeDeadline(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+
+	// Claim at a sub-second offset. The true deadline is claimAt+lease with
+	// millisecond precision; a lease truncated to whole seconds would expire
+	// ~0.9s early, so the deadline must be rounded up when persisted.
+	base := time.Unix(1_000_000, 0).UTC()
+	claimAt := base.Add(900 * time.Millisecond)
+	lease := 10 * time.Minute
+
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: "{}",
+		Status: model.JobPending, RunAfter: claimAt, CreatedAt: claimAt, UpdatedAt: claimAt}))
+
+	claimed, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, claimAt, lease)
+	require.NoError(t, err)
+	require.Equal(t, "j1", claimed.ID)
+
+	// Past the naively-truncated deadline (base+lease) but before the true
+	// deadline (claimAt+lease): the lease must not be reclaimable yet.
+	justBefore := base.Add(lease).Add(100 * time.Millisecond)
+	require.True(t, justBefore.Before(claimAt.Add(lease)))
+	_, err = s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, justBefore, lease)
+	require.ErrorIs(t, err, store.ErrNotFound)
+
+	// After the true deadline: reclaimable again.
+	after := claimAt.Add(lease).Add(time.Second)
+	reclaimed, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, after, lease)
+	require.NoError(t, err)
+	require.Equal(t, "j1", reclaimed.ID)
+}
