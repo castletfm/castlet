@@ -30,6 +30,13 @@ import (
 // its context was cancelled, distinguishing a clean shutdown from a crash.
 var ErrServerClosed = errors.New("server: closed")
 
+// readTimeout bounds the whole request read (headers + body) for normal routes
+// so a client cannot send headers and then drip the body indefinitely
+// (slowloris-on-body). It is generous for small/bodyless requests; the upload
+// handler extends its own read deadline (Server.uploadReadTimeout) so large
+// media uploads over slow links are not cut off by this global cap.
+const readTimeout = 30 * time.Second
+
 // Server serves the Castlet web application. The receiver holds only validated
 // configuration and is safe to Run more than once.
 type Server struct {
@@ -188,6 +195,11 @@ func (s *Server) Run(ctx context.Context) (*Controller, error) {
 	httpSrv := &http.Server{
 		Handler:           s.handler(),
 		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+		// WriteTimeout is deliberately left unset: /media streams large media
+		// files, and a global write deadline would truncate long downloads.
 	}
 	ctrl := &Controller{done: make(chan struct{}), addr: ln.Addr().String()}
 	go func() {
