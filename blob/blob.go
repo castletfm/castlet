@@ -35,8 +35,12 @@ type BlobStore interface {
 // for this once at startup (a type assertion) and serves accordingly for the
 // life of the process; a store that does not implement it is always streamed.
 type DirectURL interface {
-	// URL returns a fetch URL for key. contentType is the Content-Type the
-	// response should carry (the server knows it from the episode); an
-	// implementation may encode it into the URL.
-	URL(ctx context.Context, key, contentType string) (string, error)
+	// URL returns a fetch URL for key. contentType is the (already sanitized)
+	// Content-Type the response should carry and contentDisposition is the
+	// Content-Disposition (e.g. "attachment") the response should carry; the
+	// server knows both from the request. An empty string means the header is
+	// left unset. An implementation should make the served response carry these
+	// values (e.g. by signing response-* overrides into a presigned URL) so the
+	// direct path keeps the same hardening as the streamed path.
+	URL(ctx context.Context, key, contentType, contentDisposition string) (string, error)
 }

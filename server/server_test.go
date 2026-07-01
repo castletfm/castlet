@@ -15,6 +15,7 @@ import (
 
 	"github.com/castletfm/castlet/store"
 
+	"github.com/castletfm/castlet/blob"
 	"github.com/castletfm/castlet/blob/localfs"
 	"github.com/castletfm/castlet/internal/session"
 	"github.com/castletfm/castlet/model"
@@ -28,6 +29,7 @@ import (
 type harness struct {
 	base   string
 	store  *sqlite.Store
+	blobs  *localfs.Store
 	client *http.Client
 }
 
@@ -55,7 +57,7 @@ func newHarness(t *testing.T, extra ...server.Option) *harness {
 	require.NoError(t, err)
 	t.Cleanup(func() { <-ctrl.Done() }) // ctx cancels on test end; wait for clean exit
 
-	return &harness{base: "http://" + ctrl.Addr(), store: st, client: newClient()}
+	return &harness{base: "http://" + ctrl.Addr(), store: st, blobs: blobs, client: newClient()}
 }
 
 // newClient returns an HTTP client with its own cookie jar that does not follow
@@ -148,6 +150,121 @@ func TestMediaMissingKey(t *testing.T) {
 	h := newHarness(t)
 	resp, _ := h.get(t, "/media/does-not-exist")
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// TestMediaServingHardening verifies the streamed media path defends against a
+// stored-XSS upload: a blob whose episode declares text/html must be served
+// with nosniff, as an attachment, and with a coerced non-HTML Content-Type,
+// while a genuine audio/* blob keeps its type so inline playback still works.
+func TestMediaServingHardening(t *testing.T) {
+	h := newHarness(t)
+	ctx := t.Context()
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: "x", CreatedAt: time.Now()}))
+
+	put := func(key, mime string, body []byte) {
+		t.Helper()
+		_, err := h.blobs.Put(ctx, key, bytes.NewReader(body))
+		require.NoError(t, err)
+		require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "ch-" + key, UserID: "u1",
+			Title: "T", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+		require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "ep-" + key, ChannelID: "ch-" + key,
+			Title: "T", MediaKey: key, MediaMIME: mime, MediaKind: model.MediaAudio, MediaBytes: int64(len(body)),
+			Status: model.EpisodeDraft, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	}
+
+	put("evil", "text/html", []byte("<script>alert(1)</script>"))
+	put("clip", "audio/mpeg", []byte("ID3 fake mp3 payload"))
+
+	// A channel cover image has no owning episode; the type is sniffed. Store
+	// the bytes only (no episode) under a fresh key.
+	pngBytes := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+	_, err := h.blobs.Put(ctx, "cover", bytes.NewReader(pngBytes))
+	require.NoError(t, err)
+
+	// Attacker-labeled text/html is never rendered as HTML.
+	resp, _ := h.get(t, "/media/evil")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+	require.Equal(t, "attachment", resp.Header.Get("Content-Disposition"))
+	require.Equal(t, "application/octet-stream", resp.Header.Get("Content-Type"))
+
+	// Real audio keeps its type (still nosniff) so <audio> playback works.
+	resp, _ = h.get(t, "/media/clip")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+	require.Equal(t, "audio/mpeg", resp.Header.Get("Content-Type"))
+
+	// A non-episode PNG (channel cover art) keeps image/png so <img> renders.
+	resp, _ = h.get(t, "/media/cover")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+	require.Equal(t, "image/png", resp.Header.Get("Content-Type"))
+}
+
+// directBlobStore is a fake blob.BlobStore that also implements blob.DirectURL,
+// recording the arguments the media handler passes to URL so tests can assert
+// the direct-serve path applies the same hardening as the streamed path.
+type directBlobStore struct {
+	*localfs.Store
+	gotContentType        string
+	gotContentDisposition string
+}
+
+func (d *directBlobStore) URL(_ context.Context, key, contentType, contentDisposition string) (string, error) {
+	d.gotContentType = contentType
+	d.gotContentDisposition = contentDisposition
+	return "https://cdn.example.test/o/" + key, nil
+}
+
+var _ blob.DirectURL = (*directBlobStore)(nil)
+
+// TestMediaDirectServingHardening verifies the direct-serve path (blob.DirectURL,
+// e.g. the S3 backend) redirects to a presigned URL that carries an attachment
+// disposition and a coerced non-HTML content-type for a hostile text/html blob,
+// matching the streamed path's stored-XSS defenses.
+func TestMediaDirectServingHardening(t *testing.T) {
+	ctx := t.Context()
+
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	require.NoError(t, st.Migrate(ctx))
+
+	fs, err := localfs.New(t.TempDir())
+	require.NoError(t, err)
+	direct := &directBlobStore{Store: fs}
+	q := dbqueue.New(st)
+	sess := session.NewManager([]byte("0123456789abcdef0123456789abcdef"))
+
+	srv, err := server.New(st, direct, q, sess,
+		server.WithAddr("127.0.0.1:0"),
+		server.WithBaseURL("http://example.test"))
+	require.NoError(t, err)
+	ctrl, err := srv.Run(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { <-ctrl.Done() })
+
+	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: "x", CreatedAt: time.Now()}))
+	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "T", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	_, err = fs.Put(ctx, "evil", bytes.NewReader([]byte("<script>alert(1)</script>")))
+	require.NoError(t, err)
+	require.NoError(t, st.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1",
+		Title: "T", MediaKey: "evil", MediaMIME: "text/html", MediaKind: model.MediaAudio,
+		MediaBytes: 1, Status: model.EpisodeDraft, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	client := newClient()
+	resp, err := client.Get("http://" + ctrl.Addr() + "/media/evil")
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+	require.Equal(t, "https://cdn.example.test/o/evil", resp.Header.Get("Location"))
+	require.Equal(t, "application/octet-stream", direct.gotContentType,
+		"hostile text/html must be coerced before signing the presigned URL")
+	require.Equal(t, "attachment", direct.gotContentDisposition,
+		"direct path must force an attachment disposition")
 }
 
 func TestAuthAndAdmin(t *testing.T) {

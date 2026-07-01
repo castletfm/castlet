@@ -3,6 +3,7 @@ package s3
 import (
 	"context"
 	"encoding/hex"
+	"net/http"
 	"net/url"
 	"strings"
 	"testing"
@@ -289,7 +290,7 @@ func TestPresignedURL(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	raw, err := s.URL(context.Background(), "obj.mp3", "audio/mpeg")
+	raw, err := s.URL(context.Background(), "obj.mp3", "audio/mpeg", "")
 	require.NoError(t, err)
 
 	u, err := url.Parse(raw)
@@ -335,4 +336,53 @@ func TestPresignedURL(t *testing.T) {
 		"UNSIGNED-PAYLOAD",
 	}, "\n")
 	assert.Equal(t, s.sign(ts, canonical), sig, "presigned signature must be self-consistent")
+}
+
+// TestURLSignsResponseOverrides verifies the presigned GET URL carries both the
+// response-content-type and response-content-disposition overrides, and that
+// they are part of the signed canonical query (recomputing the SigV4 signature
+// over the returned query reproduces X-Amz-Signature) so S3/MinIO honors the
+// hardening the direct-serve path needs.
+func TestURLSignsResponseOverrides(t *testing.T) {
+	st, err := New(Config{
+		Endpoint:  "http://127.0.0.1:9000",
+		Bucket:    "media",
+		AccessKey: "AK",
+		SecretKey: "SK",
+	})
+	require.NoError(t, err)
+
+	raw, err := st.URL(context.Background(), "obj", "application/octet-stream", "attachment")
+	require.NoError(t, err)
+
+	u, err := url.Parse(raw)
+	require.NoError(t, err)
+	q := u.Query()
+	require.Equal(t, "application/octet-stream", q.Get("response-content-type"))
+	require.Equal(t, "attachment", q.Get("response-content-disposition"))
+
+	// Recompute the signature over the returned query (minus the signature
+	// itself). If either response-* override were appended but not signed, this
+	// would not match, so this proves both are part of the signed canonical query.
+	sig := q.Get("X-Amz-Signature")
+	require.NotEmpty(t, sig)
+	q.Del("X-Amz-Signature")
+	ts, err := time.Parse("20060102T150405Z", q.Get("X-Amz-Date"))
+	require.NoError(t, err)
+	canonical := strings.Join([]string{
+		http.MethodGet,
+		uriEncodePath(u.Path),
+		canonicalQuery(q),
+		"host:" + st.host + "\n",
+		"host",
+		"UNSIGNED-PAYLOAD",
+	}, "\n")
+	require.Equal(t, st.sign(ts, canonical), sig)
+
+	// An empty disposition omits the override entirely.
+	raw2, err := st.URL(context.Background(), "obj", "application/octet-stream", "")
+	require.NoError(t, err)
+	u2, err := url.Parse(raw2)
+	require.NoError(t, err)
+	require.False(t, u2.Query().Has("response-content-disposition"))
 }
