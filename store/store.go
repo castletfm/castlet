@@ -102,18 +102,38 @@ type Store interface {
 	// DeleteEpisode removes the episode identified by id and, in the SAME
 	// transaction, reports whether its media blob is now orphaned: after the row
 	// is gone, orphaned is true only when no remaining episode references the
-	// media key AND no channel cover art references it. Media is content-addressed
-	// and immutable, so a key may be shared; coupling the delete and the
-	// reference re-check in one transaction closes the TOCTOU where a separate
-	// "check references, then delete blob" lets a concurrent same-content upload
-	// insert a new referencing episode between the check and the delete. On the
-	// single-writer store any such insert serializes either fully before this
-	// transaction (and is seen by the re-check, which reports orphaned=false) or
-	// fully after it (and keeps its own reference), so the caller may delete the
-	// blob whenever orphaned is true without ever removing bytes an episode still
-	// references. Returns the episode's media key (empty when it had none) and
+	// media key, no channel cover art references it, AND no active (non-stale)
+	// blob reservation covers it. Media is content-addressed and immutable, so a
+	// key may be shared; coupling the delete and the reference re-check in one
+	// transaction closes the TOCTOU where a separate "check references, then
+	// delete blob" lets a concurrent same-content upload insert a new referencing
+	// episode between the check and the delete. Counting reservations closes the
+	// sibling window in which a concurrent upload has already written the blob
+	// (blobs.Put) but has not yet committed its episode row: on the single-writer
+	// store that upload's reservation serializes either fully before this
+	// transaction (and is counted, so orphaned=false) or fully after it (and the
+	// upload re-writes the immutable blob after any delete). now anchors the
+	// reservation staleness cutoff so a reservation abandoned by a crashed upload
+	// stops protecting its key. The caller deletes the blob only when orphaned is
+	// true. Returns the episode's media key (empty when it had none) and
 	// ErrNotFound (with orphaned=false) when no episode has the id.
-	DeleteEpisode(ctx context.Context, id string) (mediaKey string, orphaned bool, err error)
+	DeleteEpisode(ctx context.Context, id string, now time.Time) (mediaKey string, orphaned bool, err error)
+	// ReserveBlob records an in-flight media upload for key so a concurrent
+	// episode delete's orphan check counts it and cannot delete the blob before
+	// the upload's episode row is committed (media is written before its row
+	// exists). Identical content-addressed concurrent uploads each add a
+	// reservation, so reservations act as a refcount; ReleaseBlob removes one.
+	// now stamps the reservation for staleness expiry (see DeleteEpisode).
+	ReserveBlob(ctx context.Context, key string, now time.Time) error
+	// ReleaseBlob drops one reservation previously taken by ReserveBlob for key (a
+	// refcount decrement). A missing reservation is not an error: a stale row may
+	// already have been swept, and release is best-effort cleanup.
+	ReleaseBlob(ctx context.Context, key string) error
+	// BlobOrphaned reports whether nothing references the media key: no episode, no
+	// channel cover art, and no active (non-stale, per now) blob reservation. It
+	// backs the failed-create rollback cleanup, which has no episode row to delete
+	// and so cannot rely on DeleteEpisode's in-transaction recount.
+	BlobOrphaned(ctx context.Context, key string, now time.Time) (bool, error)
 	EpisodeByID(ctx context.Context, id string) (*model.Episode, error)
 	// EpisodeByMediaKey finds an episode whose media is stored under key. Media
 	// is content-addressed, so a key may be shared by several episodes; this

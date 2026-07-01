@@ -53,6 +53,22 @@ CREATE TABLE IF NOT EXISTS transcripts (
     created_at INTEGER NOT NULL
 );
 
+-- blob_reservations records an in-flight media upload. A row is written before
+-- the blob is stored (blobs.Put) and removed once the episode row that will
+-- reference it is committed. Because the blob is written before its episode
+-- exists, an episode delete's orphan check would otherwise not see a concurrent
+-- upload; counting active reservations closes that window. Identical
+-- (content-addressed) concurrent uploads each add a row, so the table acts as a
+-- refcount per key. A row left behind by a crashed upload is ignored once older
+-- than the reservation TTL (see blobReservationTTL in sqlite_crud.go), so a leak
+-- only delays orphan cleanup rather than pinning a blob forever. This table is
+-- created by Migrate (which executes this schema) on new and existing databases.
+CREATE TABLE IF NOT EXISTS blob_reservations (
+    media_key  TEXT    NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_blob_reservations_key ON blob_reservations(media_key);
+
 CREATE TABLE IF NOT EXISTS jobs (
     id         TEXT    PRIMARY KEY,
     kind       TEXT    NOT NULL,

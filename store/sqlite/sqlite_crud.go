@@ -310,12 +310,13 @@ func (s *Store) ReorderEpisodes(ctx context.Context, channelID string, orderedID
 // DeleteEpisode deletes the episode row and, in the SAME transaction, re-checks
 // whether its media blob is now orphaned. See store.Store for the contract and
 // the TOCTOU it closes. Reading the media key, deleting the row, and counting the
-// remaining references all run inside one transaction on the single-writer pool,
-// so the "is the blob still referenced" answer is taken against the exact state
-// left after the row is gone — a concurrent same-content upload's insert either
-// committed before (and is counted) or serializes after (and keeps its own
-// reference). The caller deletes the blob only when orphaned is true.
-func (s *Store) DeleteEpisode(ctx context.Context, id string) (mediaKey string, orphaned bool, err error) {
+// remaining references (episodes, channel cover art, and active reservations) all
+// run inside one transaction on the single-writer pool, so the "is the blob still
+// referenced" answer is taken against the exact state left after the row is gone —
+// a concurrent same-content upload's insert or reservation either committed before
+// (and is counted) or serializes after (and keeps its own reference / re-writes
+// the immutable blob). The caller deletes the blob only when orphaned is true.
+func (s *Store) DeleteEpisode(ctx context.Context, id string, now time.Time) (mediaKey string, orphaned bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
@@ -337,14 +338,12 @@ func (s *Store) DeleteEpisode(ctx context.Context, id string) (mediaKey string, 
 
 	// Re-check references AFTER the row is gone, in the same transaction: the blob
 	// is orphaned only when nothing else references the (content-addressed, so
-	// possibly shared) key — neither another episode nor a channel's cover art. An
-	// empty key is never orphaned; there is no blob to delete.
+	// possibly shared) key — no other episode, no channel cover art, and no active
+	// reservation from an in-flight upload. An empty key is never orphaned; there
+	// is no blob to delete.
 	if key != "" {
-		var refs int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT (SELECT COUNT(1) FROM episodes WHERE media_key = ?)
-			      + (SELECT COUNT(1) FROM channels WHERE image_key = ? AND image_key <> '')`,
-			key, key).Scan(&refs); err != nil {
+		refs, err := countBlobRefs(ctx, tx, key, reservationCutoff(now))
+		if err != nil {
 			return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
 		}
 		orphaned = refs == 0
@@ -354,6 +353,83 @@ func (s *Store) DeleteEpisode(ctx context.Context, id string) (mediaKey string, 
 		return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
 	}
 	return key, orphaned, nil
+}
+
+// blobReservationTTL bounds how long an in-flight upload's reservation protects
+// its media key from orphan deletion. It must comfortably exceed the time a live
+// upload spends between reserving a key and committing its episode row (the blob
+// Put plus the insert), so a slow-but-legitimate upload's still-needed blob is
+// never treated as unreferenced and deleted — hence a generous upper bound rather
+// than a tight one. A reservation left behind by a crashed upload simply stops
+// protecting its key after this TTL, so a leak delays orphan cleanup by at most
+// blobReservationTTL and never blocks it permanently. One hour matches the scale
+// of the server's largest allowed upload window.
+const blobReservationTTL = time.Hour
+
+// reservationCutoff is the created_at boundary below which a reservation is
+// considered stale (abandoned by a crashed upload) and ignored by the orphan
+// count. Reservations with created_at strictly greater than the cutoff are active.
+func reservationCutoff(now time.Time) int64 {
+	return toUnix(now.Add(-blobReservationTTL))
+}
+
+// rowQuerier is satisfied by both *sql.DB and *sql.Tx, letting a count run either
+// on the pool or inside an open transaction (so DeleteEpisode can count within
+// its delete transaction while BlobOrphaned counts on the pool).
+type rowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// countBlobRefs counts everything that keeps a media blob alive: referencing
+// episodes, channel cover art using the key, and active (created_at > cutoff)
+// reservations.
+func countBlobRefs(ctx context.Context, q rowQuerier, key string, cutoff int64) (int, error) {
+	var n int
+	err := q.QueryRowContext(ctx,
+		`SELECT (SELECT COUNT(1) FROM episodes WHERE media_key = ?)
+		      + (SELECT COUNT(1) FROM channels WHERE image_key = ? AND image_key <> '')
+		      + (SELECT COUNT(1) FROM blob_reservations WHERE media_key = ? AND created_at > ?)`,
+		key, key, key, cutoff).Scan(&n)
+	return n, err
+}
+
+// ReserveBlob records an in-flight upload of key so a concurrent episode delete's
+// orphan check counts it and does not delete the blob before the upload's episode
+// row exists. See store.Store for the contract.
+func (s *Store) ReserveBlob(ctx context.Context, key string, now time.Time) error {
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO blob_reservations (media_key, created_at) VALUES (?, ?)`,
+		key, toUnix(now)); err != nil {
+		return fmt.Errorf("sqlite: reserve blob: %w", mapErr(err))
+	}
+	return nil
+}
+
+// ReleaseBlob drops ONE reservation for the key (a refcount decrement), so
+// concurrent uploads of identical bytes each release only their own row. A
+// missing reservation is not an error.
+func (s *Store) ReleaseBlob(ctx context.Context, key string) error {
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM blob_reservations
+		 WHERE rowid = (SELECT rowid FROM blob_reservations WHERE media_key = ? LIMIT 1)`,
+		key); err != nil {
+		return fmt.Errorf("sqlite: release blob: %w", mapErr(err))
+	}
+	return nil
+}
+
+// BlobOrphaned reports whether nothing references the media key: no episode, no
+// channel cover art, and no active (non-stale, per now) reservation. See
+// store.Store for the contract.
+func (s *Store) BlobOrphaned(ctx context.Context, key string, now time.Time) (bool, error) {
+	if key == "" {
+		return false, nil
+	}
+	n, err := countBlobRefs(ctx, s.db, key, reservationCutoff(now))
+	if err != nil {
+		return false, fmt.Errorf("sqlite: blob orphaned: %w", mapErr(err))
+	}
+	return n == 0, nil
 }
 
 func (s *Store) EpisodeByID(ctx context.Context, id string) (*model.Episode, error) {

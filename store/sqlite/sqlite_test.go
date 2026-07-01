@@ -211,9 +211,9 @@ func TestChannelsAndEpisodes(t *testing.T) {
 	require.ErrorIs(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1",
 		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptNone}), store.ErrConflict)
 
-	_, _, err = s.DeleteEpisode(ctx, "e2")
+	_, _, err = s.DeleteEpisode(ctx, "e2", time.Now())
 	require.NoError(t, err)
-	_, _, err = s.DeleteEpisode(ctx, "e2")
+	_, _, err = s.DeleteEpisode(ctx, "e2", time.Now())
 	require.ErrorIs(t, err, store.ErrNotFound)
 }
 
@@ -237,14 +237,16 @@ func TestDeleteEpisodeOrphan(t *testing.T) {
 	require.NoError(t, s.CreateEpisode(ctx, mkEp("e1", "shared")))
 	require.NoError(t, s.CreateEpisode(ctx, mkEp("e2", "shared")))
 
+	now := time.Now()
+
 	// Deleting the first must NOT orphan the blob: e2 still references it.
-	key, orphaned, err := s.DeleteEpisode(ctx, "e1")
+	key, orphaned, err := s.DeleteEpisode(ctx, "e1", now)
 	require.NoError(t, err)
 	require.Equal(t, "shared", key)
 	require.False(t, orphaned, "blob is still referenced by e2")
 
 	// Deleting the last referencing episode orphans the blob.
-	key, orphaned, err = s.DeleteEpisode(ctx, "e2")
+	key, orphaned, err = s.DeleteEpisode(ctx, "e2", now)
 	require.NoError(t, err)
 	require.Equal(t, "shared", key)
 	require.True(t, orphaned, "no episode references the blob anymore")
@@ -254,17 +256,75 @@ func TestDeleteEpisodeOrphan(t *testing.T) {
 	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c2", UserID: "u1", Title: "Cover",
 		ImageKey: "img", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 	require.NoError(t, s.CreateEpisode(ctx, mkEp("e3", "img")))
-	key, orphaned, err = s.DeleteEpisode(ctx, "e3")
+	key, orphaned, err = s.DeleteEpisode(ctx, "e3", now)
 	require.NoError(t, err)
 	require.Equal(t, "img", key)
 	require.False(t, orphaned, "channel cover art still references the key")
 
 	// An episode with no media key is never orphaned (there is no blob to delete).
 	require.NoError(t, s.CreateEpisode(ctx, mkEp("e4", "")))
-	key, orphaned, err = s.DeleteEpisode(ctx, "e4")
+	key, orphaned, err = s.DeleteEpisode(ctx, "e4", now)
 	require.NoError(t, err)
 	require.Empty(t, key)
 	require.False(t, orphaned)
+}
+
+// TestBlobReservationOrphan proves the reservation table closes the sibling race
+// (an in-flight upload writes the blob before its episode row exists): an active
+// reservation keeps DeleteEpisode/BlobOrphaned from reporting a key orphaned even
+// when no episode references it, releasing frees it, and a stale (older than the
+// TTL) reservation no longer protects the key so a crashed upload cannot pin a
+// blob forever.
+func TestBlobReservationOrphan(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s)
+	ctx := t.Context()
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	now := time.Now()
+	ep := &model.Episode{ID: "e1", ChannelID: "c1", Title: "Ep", MediaKey: "k",
+		MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, Status: model.EpisodeDraft,
+		TranscriptStatus: model.TranscriptNone, CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, s.CreateEpisode(ctx, ep))
+
+	// Simulate a concurrent upload of the SAME content-addressed key that has
+	// written its blob (Put) but not yet committed its episode row: it holds a
+	// reservation. Deleting the only existing episode must NOT orphan the key.
+	require.NoError(t, s.ReserveBlob(ctx, "k", now))
+	key, orphaned, err := s.DeleteEpisode(ctx, "e1", now)
+	require.NoError(t, err)
+	require.Equal(t, "k", key)
+	require.False(t, orphaned, "an active reservation must keep the blob alive")
+
+	// BlobOrphaned (the rollback path) sees the reservation too.
+	got, err := s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.False(t, got, "an active reservation must keep the blob alive")
+
+	// Once the upload releases its reservation and no episode references the key,
+	// the blob is orphaned.
+	require.NoError(t, s.ReleaseBlob(ctx, "k"))
+	got, err = s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.True(t, got, "no episode and no reservation -> orphaned")
+
+	// A reservation older than the TTL is stale (a crashed upload) and must not
+	// protect the key: evaluating "now" well past the reservation's timestamp
+	// treats it as expired.
+	require.NoError(t, s.ReserveBlob(ctx, "k", now))
+	future := now.Add(2 * time.Hour) // beyond blobReservationTTL (1h)
+	got, err = s.BlobOrphaned(ctx, "k", future)
+	require.NoError(t, err)
+	require.True(t, got, "a stale reservation must not pin the blob")
+
+	// Concurrent identical uploads act as a refcount: two reservations, releasing
+	// one still leaves the key protected.
+	require.NoError(t, s.ReserveBlob(ctx, "k", now)) // second live reservation
+	require.NoError(t, s.ReleaseBlob(ctx, "k"))      // drop one
+	got, err = s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.False(t, got, "a remaining reservation still protects the key")
 }
 
 func TestReorderEpisodes(t *testing.T) {
