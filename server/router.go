@@ -55,5 +55,8 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /c/{id}/feed.xml", s.handleFeed)
 	mux.HandleFunc("GET /e/{id}/{$}", s.handleEpisode)
 
-	return s.logRequests(s.loadUser(mux))
+	// logRequests is outermost so a recovered panic still produces the normal
+	// completion line (with the 500 status); recoverPanic then wraps loadUser
+	// and the handlers so their panics become a logged 500.
+	return s.logRequests(s.recoverPanic(s.loadUser(mux)))
 }

@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"runtime/debug"
 
 	"github.com/castletfm/castlet/model"
 )
@@ -43,6 +45,43 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// recoverPanic converts a panic in any downstream handler into a logged 500
+// response instead of letting it propagate and crash the process. It is the
+// per-request safety net only: the process-level "let it crash" policy for
+// other goroutines is intentionally left intact. http.ErrAbortHandler is
+// re-panicked per the net/http convention so the server can abort the response.
+func (s *Server) recoverPanic(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			rec := recover()
+			if rec == nil {
+				return
+			}
+			// Re-panic ErrAbortHandler per the net/http convention. Detect it
+			// via errors.Is behind an error type-assert: a panic value can be
+			// uncomparable (e.g. a map or slice), and a bare == would itself
+			// panic, defeating the recovery.
+			if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+				panic(rec)
+			}
+			s.logger.Error("panic recovered", "method", r.Method, "path", r.URL.Path,
+				"panic", rec, "stack", string(debug.Stack()))
+			// If the handler already committed a status or body, the response is
+			// past the point of no return: the status is on the wire and a 500
+			// page would just be appended to a partial response. Abort the
+			// connection (net/http closes it on ErrAbortHandler) rather than
+			// write a bogus error page. logRequests installs the statusWriter, so
+			// in the real chain w is always one; when it is not (nothing could
+			// have been recorded) fall through to the normal 500.
+			if sw, ok := w.(*statusWriter); ok && sw.wrote {
+				panic(http.ErrAbortHandler)
+			}
+			s.renderError(w, r, http.StatusInternalServerError, "internal server error")
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // logRequests logs one line per request after it completes.
 func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -52,17 +91,26 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 	})
 }
 
-// statusWriter captures the response status code for logging.
+// statusWriter captures the response status code for logging and records
+// whether anything (a header or body byte) has been committed, so recoverPanic
+// can tell an intact response apart from one that can no longer be replaced.
 type statusWriter struct {
 	http.ResponseWriter
 	status      int
 	wroteHeader bool
+	wrote       bool
 }
 
 func (w *statusWriter) WriteHeader(code int) {
+	w.wrote = true
 	if !w.wroteHeader {
 		w.status = code
 		w.wroteHeader = true
 	}
 	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	w.wrote = true
+	return w.ResponseWriter.Write(b)
 }
