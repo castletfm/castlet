@@ -70,7 +70,7 @@ func Load(args []string) (*Config, error) {
 	fs.DurationVar(&cfg.TranscribeTimeout, "transcribe-timeout", envDuration("CASTLET_TRANSCRIBE_TIMEOUT", 2*time.Hour), "max wall-clock per transcription job; also the fallback when audio duration is unknown")
 	fs.Float64Var(&cfg.TranscribeTimeoutFactor, "transcribe-timeout-factor", envFloat("CASTLET_TRANSCRIBE_TIMEOUT_FACTOR", 1.5), "multiply audio duration by this to derive the per-job timeout (clamped to a floor and --transcribe-timeout)")
 	fs.StringVar(&cfg.LogLevel, "log-level", env("CASTLET_LOG_LEVEL", "info"), "log level: debug|info|warn|error")
-	fs.BoolVar(&cfg.AllowSignup, "allow-signup", envBool("CASTLET_ALLOW_SIGNUP", true), "enable self-service local sign-up")
+	fs.BoolVar(&cfg.AllowSignup, "allow-signup", envBool("CASTLET_ALLOW_SIGNUP", false), "enable self-service local sign-up (disabled by default)")
 	fs.StringVar(&cfg.BlobStoreConfig, "blob-store-config", env("CASTLET_BLOB_STORE_CONFIG", ""), "path to a JSON file configuring the media blob store (default: local filesystem under data-dir)")
 	fs.StringVar(&cfg.OIDCIssuer, "oidc-issuer", env("CASTLET_OIDC_ISSUER", ""), "OIDC issuer URL (enables SSO when set)")
 	fs.StringVar(&cfg.OIDCClientID, "oidc-client-id", env("CASTLET_OIDC_CLIENT_ID", ""), "OIDC client id")

@@ -42,3 +42,40 @@ func TestLoadSessionKey(t *testing.T) {
 		}
 	})
 }
+
+func TestAllowSignupDefault(t *testing.T) {
+	t.Setenv("CASTLET_SESSION_KEY", strings.Repeat("x", minSessionKeyLen))
+
+	t.Run("defaults to disabled", func(t *testing.T) {
+		t.Setenv("CASTLET_ALLOW_SIGNUP", "")
+		cfg, err := Load(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.AllowSignup {
+			t.Fatal("AllowSignup = true, want false by default (closed environments)")
+		}
+	})
+
+	t.Run("enabled via flag", func(t *testing.T) {
+		t.Setenv("CASTLET_ALLOW_SIGNUP", "")
+		cfg, err := Load([]string{"--allow-signup"})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.AllowSignup {
+			t.Fatal("AllowSignup = false, want true when --allow-signup is set")
+		}
+	})
+
+	t.Run("enabled via env", func(t *testing.T) {
+		t.Setenv("CASTLET_ALLOW_SIGNUP", "true")
+		cfg, err := Load(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !cfg.AllowSignup {
+			t.Fatal("AllowSignup = false, want true when CASTLET_ALLOW_SIGNUP=true")
+		}
+	})
+}
