@@ -12,9 +12,11 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -65,7 +67,89 @@ func New(cfg Config) (*Store, error) {
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("s3: invalid endpoint %q", cfg.Endpoint)
 	}
-	return &Store{cfg: cfg, client: &http.Client{}, scheme: u.Scheme, host: u.Host}, nil
+	return &Store{cfg: cfg, client: newClient(), scheme: u.Scheme, host: u.Host}, nil
+}
+
+// idleTimeout is how long a connection may make no progress — no bytes read or
+// written — before it is torn down. It bounds mid-body stalls (a peer that
+// accepts the connection then goes silent partway through a body) that the
+// Transport's dial/handshake/response-header timeouts do not cover.
+const idleTimeout = 30 * time.Second
+
+// newClient builds the HTTP client used for object requests. It deliberately
+// leaves http.Client.Timeout unset — a flat deadline would abort legitimate
+// large media transfers — and instead bounds *stalls*: a hung endpoint cannot
+// block Get/Put/Delete (and thus the transcription worker) forever, while a
+// healthy connection may stream a body for arbitrarily long. Per-operation
+// cancellation still flows through the request context.
+func newClient() *http.Client {
+	return newClientWithIdle(idleTimeout)
+}
+
+// newClientWithIdle is newClient with an injectable idle timeout so tests can
+// drive the idle-deadline behavior deterministically.
+func newClientWithIdle(idle time.Duration) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			// Wrap each connection so an idle deadline is enforced on every
+			// Read/Write. Unlike http.Client.Timeout this only trips when *no*
+			// data flows for the idle window, so a large body streams fine as
+			// long as bytes keep moving, but a truly stalled body (in client.Do
+			// while writing a Put, or io.Copy while reading a Get) is bounded.
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				c, err := dialer.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return &idleTimeoutConn{Conn: c, idle: idle}, nil
+			},
+			// Disable HTTP/2. The idleTimeoutConn deadline bounds a stall only
+			// when the whole TCP connection is idle; under HTTP/2 many streams
+			// multiplex over one connection, so another active stream could keep
+			// refreshing the deadline while a single stream's body stalls forever.
+			// Over HTTP/1.1 each in-flight request owns its connection, so the
+			// per-conn idle deadline reliably bounds one stalled transfer. An
+			// empty, non-nil TLSNextProto is the idiomatic way to prevent h2
+			// negotiation. S3/MinIO work fine over HTTP/1.1.
+			TLSNextProto:          make(map[string]func(string, *tls.Conn) http.RoundTripper),
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+}
+
+// idleTimeoutConn wraps a net.Conn and refreshes a single connection-wide
+// deadline before each Read/Write. Because HTTP/1.1 streams a request body while
+// concurrently waiting to read the response, read and write progress must both
+// keep the connection alive: refreshing one shared deadline (SetDeadline sets
+// both the read and write deadline) on any activity means the connection is
+// closed only when it makes no progress in *either* direction for the whole idle
+// window — bounding stalled transfers without truncating large, active ones.
+type idleTimeoutConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c *idleTimeoutConn) Read(b []byte) (int, error) {
+	if err := c.SetDeadline(time.Now().Add(c.idle)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *idleTimeoutConn) Write(b []byte) (int, error) {
+	if err := c.SetDeadline(time.Now().Add(c.idle)); err != nil {
+		return 0, err
+	}
+	return c.Conn.Write(b)
 }
 
 // objectPath is the path-style request path: /bucket/prefix+key.
