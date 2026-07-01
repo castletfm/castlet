@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // minSessionKeyLen is the minimum length, in bytes, required for an
@@ -44,6 +45,13 @@ type Config struct {
 	TranscribeCommand string   // executable for the command transcriber
 	TranscribeArgs    []string // argument template; "{{audio}}" is the audio path
 
+	// Per-job transcription timeout. The effective bound scales with the
+	// episode's audio length (factor * duration), clamped to a floor and to
+	// TranscribeTimeout. TranscribeTimeout is also the fallback cap used when an
+	// episode's duration is unknown.
+	TranscribeTimeout       time.Duration // max wall-clock per job / unknown-length fallback
+	TranscribeTimeoutFactor float64       // multiplier on the audio length
+
 	LogLevel string // debug|info|warn|error
 }
 
@@ -59,6 +67,8 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.SiteName, "site-name", env("CASTLET_SITE_NAME", "Castlet"), "site name shown in the UI")
 	fs.StringVar(&cfg.Transcriber, "transcriber", env("CASTLET_TRANSCRIBER", "null"), "transcriber backend: null|command")
 	fs.StringVar(&cfg.TranscribeCommand, "transcribe-command", env("CASTLET_TRANSCRIBE_COMMAND", ""), "executable for the command transcriber")
+	fs.DurationVar(&cfg.TranscribeTimeout, "transcribe-timeout", envDuration("CASTLET_TRANSCRIBE_TIMEOUT", 2*time.Hour), "max wall-clock per transcription job; also the fallback when audio duration is unknown")
+	fs.Float64Var(&cfg.TranscribeTimeoutFactor, "transcribe-timeout-factor", envFloat("CASTLET_TRANSCRIBE_TIMEOUT_FACTOR", 1.5), "multiply audio duration by this to derive the per-job timeout (clamped to a floor and --transcribe-timeout)")
 	fs.StringVar(&cfg.LogLevel, "log-level", env("CASTLET_LOG_LEVEL", "info"), "log level: debug|info|warn|error")
 	fs.BoolVar(&cfg.AllowSignup, "allow-signup", envBool("CASTLET_ALLOW_SIGNUP", true), "enable self-service local sign-up")
 	fs.StringVar(&cfg.BlobStoreConfig, "blob-store-config", env("CASTLET_BLOB_STORE_CONFIG", ""), "path to a JSON file configuring the media blob store (default: local filesystem under data-dir)")
@@ -108,6 +118,33 @@ func envBool(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+// envDuration reads a duration env var (e.g. "90m"); unset or unparseable
+// falls back to def.
+func envDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return def
+	}
+	return d
+}
+
+// envFloat reads a float env var; unset or unparseable falls back to def.
+func envFloat(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return f
 }
 
 func randomKey() []byte {

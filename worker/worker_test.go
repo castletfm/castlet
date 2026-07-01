@@ -27,6 +27,18 @@ func (fakeTranscriber) Transcribe(ctx context.Context, in transcribe.Input) (*tr
 	}}, nil
 }
 
+// deadlineTranscriber records whether the context it is handed carries a
+// deadline, so a test can assert the worker applies a per-job timeout.
+type deadlineTranscriber struct {
+	hasDeadline chan bool
+}
+
+func (d deadlineTranscriber) Transcribe(ctx context.Context, in transcribe.Input) (*transcribe.Result, error) {
+	_, ok := ctx.Deadline()
+	d.hasDeadline <- ok
+	return &transcribe.Result{Language: "en"}, nil
+}
+
 func setup(t *testing.T) (*sqlite.Store, *localfs.Store, *dbqueue.Queue) {
 	t.Helper()
 	st, err := sqlite.Open(filepath.Join(t.TempDir(), "w.db"))
@@ -87,6 +99,27 @@ func TestWorkerTranscribes(t *testing.T) {
 
 	cancel()
 	require.NoError(t, ctrl.Wait())
+}
+
+// TestWorkerJobHasTimeout asserts the worker hands the transcriber a context
+// with a deadline, so a hung command is eventually killed instead of blocking
+// the serial worker loop forever.
+func TestWorkerJobHasTimeout(t *testing.T) {
+	st, blobs, q := setup(t)
+	seedEpisode(t, st, blobs, q)
+
+	tr := deadlineTranscriber{hasDeadline: make(chan bool, 1)}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	_, err := worker.New(st, blobs, q, tr, worker.WithPollInterval(10*time.Millisecond)).Run(ctx)
+	require.NoError(t, err)
+
+	select {
+	case ok := <-tr.hasDeadline:
+		require.True(t, ok, "worker must pass the transcriber a context with a deadline")
+	case <-time.After(3 * time.Second):
+		t.Fatal("transcriber was not invoked in time")
+	}
 }
 
 func TestWorkerNullSettlesToNone(t *testing.T) {
