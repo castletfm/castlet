@@ -35,6 +35,9 @@ type EpisodeFilter struct {
 type Store interface {
 	// Migrate creates or upgrades the schema. Safe to call repeatedly.
 	Migrate(ctx context.Context) error
+	// Ping verifies the store is reachable, backing the server's readiness
+	// probe. It should stay cheap (a connection check or SELECT 1).
+	Ping(ctx context.Context) error
 	// Close releases underlying resources (connection pool, file handles).
 	Close() error
 
