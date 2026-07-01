@@ -10,6 +10,7 @@ import (
 	"github.com/castletfm/castlet/auth"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/server"
+	"github.com/castletfm/castlet/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -163,6 +164,104 @@ func TestOIDCLinksVerifiedEmail(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "local1", linked.ID)
 	require.NotEmpty(t, linked.PasswordHash, "linking keeps the existing password")
+}
+
+func TestOIDCRejectsUnverifiedEmailProvisioning(t *testing.T) {
+	id := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-u",
+		Email: "unverified@user.test", EmailVerified: false, Name: "Unverified"}
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: id}))
+
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+	// no account was provisioned for the unverified identity
+	_, err = h.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-u")
+	require.ErrorIs(t, err, store.ErrNotFound)
+}
+
+func TestOIDCAllowedDomains(t *testing.T) {
+	// a listed, verified domain is provisioned
+	allowed := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-ok",
+		Email: "ok@allowed.test", EmailVerified: true, Name: "OK"}
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: allowed}),
+		server.WithAllowedDomains([]string{"allowed.test"}))
+
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	_, err = h.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-ok")
+	require.NoError(t, err)
+
+	// a non-listed domain is rejected and not provisioned
+	other := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-no",
+		Email: "no@other.test", EmailVerified: true, Name: "No"}
+	h2 := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: other}),
+		server.WithAllowedDomains([]string{"allowed.test"}))
+
+	state = h2.startOIDC(t)
+	resp, err = h2.client.Get(h2.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+	_, err = h2.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-no")
+	require.ErrorIs(t, err, store.ErrNotFound)
+}
+
+func TestOIDCAllowedDomainsEnforcedOnLinkedSubject(t *testing.T) {
+	// a subject already linked to a local account, but whose current email is
+	// in a blocked domain, is rejected when an allowlist is configured.
+	blocked := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-linked",
+		Email: "user@blocked.test", EmailVerified: true, Name: "Linked"}
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: blocked}),
+		server.WithAllowedDomains([]string{"allowed.test"}))
+	require.NoError(t, h.store.CreateUser(t.Context(), &model.User{ID: "linked1",
+		Email: "user@blocked.test", DisplayName: "Linked",
+		OIDCIssuer: "https://idp.test", OIDCSubject: "sub-linked"}))
+
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+	// a linked subject on an allowed domain still signs in.
+	ok := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-linked-ok",
+		Email: "user@allowed.test", EmailVerified: true, Name: "Linked OK"}
+	h2 := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: ok}),
+		server.WithAllowedDomains([]string{"allowed.test"}))
+	require.NoError(t, h2.store.CreateUser(t.Context(), &model.User{ID: "linked2",
+		Email: "user@allowed.test", DisplayName: "Linked OK",
+		OIDCIssuer: "https://idp.test", OIDCSubject: "sub-linked-ok"}))
+
+	state = h2.startOIDC(t)
+	resp, err = h2.client.Get(h2.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	require.Equal(t, "/admin/", resp.Header.Get("Location"))
+}
+
+func TestOIDCAllowedDomainsRejectsUnverifiedEmail(t *testing.T) {
+	// a subject-linked identity whose allowed-domain email is unverified must
+	// not satisfy the allowlist.
+	unverified := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-unverified",
+		Email: "user@allowed.test", EmailVerified: false, Name: "Unverified"}
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: unverified}),
+		server.WithAllowedDomains([]string{"allowed.test"}))
+	require.NoError(t, h.store.CreateUser(t.Context(), &model.User{ID: "unverified1",
+		Email: "user@allowed.test", DisplayName: "Unverified",
+		OIDCIssuer: "https://idp.test", OIDCSubject: "sub-unverified"}))
+
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
 
 // startOIDC performs the login step and returns the state value.

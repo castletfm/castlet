@@ -120,6 +120,9 @@ func (a *App) Serve(ctx context.Context) error {
 	}
 	if a.authn != nil {
 		opts = append(opts, server.WithAuthenticator(a.authn))
+		if len(a.cfg.OIDCAllowedDomains) > 0 {
+			opts = append(opts, server.WithAllowedDomains(a.cfg.OIDCAllowedDomains))
+		}
 	}
 	srv, err := server.New(a.store, a.blobs, a.queue, a.sessions, opts...)
 	if err != nil {
