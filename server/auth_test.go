@@ -264,6 +264,50 @@ func TestOIDCAllowedDomainsRejectsUnverifiedEmail(t *testing.T) {
 	require.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
 
+// TestOIDCCallbackClearsTransientCookies verifies the callback clears the
+// transient state/nonce cookies on every exit path — the clearing Set-Cookie
+// headers must be written BEFORE the response body/redirect, so they are not
+// dropped after headers are flushed. A defer-based clear (running after
+// WriteHeader) would silently fail, leaving the cookies alive until expiry.
+func TestOIDCCallbackClearsTransientCookies(t *testing.T) {
+	id := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-clear",
+		Email: "clear@user.test", EmailVerified: true, Name: "Clear"}
+
+	// success path: matching state + good code -> session redirect
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: id}))
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	requireCookieCleared(t, resp, "castlet_oidc_state")
+	requireCookieCleared(t, resp, "castlet_oidc_nonce")
+
+	// failure path: valid state cookie present but a bad code fails the exchange
+	h2 := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: id}))
+	state = h2.startOIDC(t)
+	resp, err = h2.client.Get(h2.base + "/auth/oidc/callback?state=" + state + "&code=bad")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	requireCookieCleared(t, resp, "castlet_oidc_state")
+	requireCookieCleared(t, resp, "castlet_oidc_nonce")
+}
+
+// requireCookieCleared asserts the response carries a Set-Cookie for name that
+// expires it (empty value and a non-positive max-age).
+func requireCookieCleared(t *testing.T, resp *http.Response, name string) {
+	t.Helper()
+	for _, c := range resp.Cookies() {
+		if c.Name == name {
+			require.Empty(t, c.Value, "cleared cookie %q must have an empty value", name)
+			require.LessOrEqual(t, c.MaxAge, 0, "cleared cookie %q must have max-age<=0", name)
+			return
+		}
+	}
+	t.Fatalf("expected a clearing Set-Cookie for %q, got none", name)
+}
+
 // startOIDC performs the login step and returns the state value.
 func (h *harness) startOIDC(t *testing.T) string {
 	t.Helper()

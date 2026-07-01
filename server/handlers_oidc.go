@@ -44,9 +44,13 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		s.renderError(w, r, http.StatusNotFound, "Single sign-on is not enabled.")
 		return
 	}
-	// Always clear the transient cookies, whatever the outcome.
-	defer s.clearOIDCCookie(w, oidcStateCookie)
-	defer s.clearOIDCCookie(w, oidcNonceCookie)
+	// Clear the transient state/nonce cookies up front, before any response is
+	// written. The values were carried on the request, so reading them below is
+	// unaffected; queuing the clearing Set-Cookie headers now guarantees they
+	// survive to the client on every exit path — a deferred clear would run
+	// after WriteHeader and be silently dropped.
+	s.clearOIDCCookie(w, oidcStateCookie)
+	s.clearOIDCCookie(w, oidcNonceCookie)
 
 	if errMsg := r.URL.Query().Get("error"); errMsg != "" {
 		s.logger.Warn("oidc provider returned error", "error", errMsg, "description", r.URL.Query().Get("error_description"))
