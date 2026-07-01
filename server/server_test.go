@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -22,6 +23,7 @@ import (
 	"github.com/castletfm/castlet/blob/localfs"
 	"github.com/castletfm/castlet/internal/session"
 	"github.com/castletfm/castlet/model"
+	"github.com/castletfm/castlet/queue"
 	"github.com/castletfm/castlet/queue/dbqueue"
 	"github.com/castletfm/castlet/server"
 	"github.com/castletfm/castlet/store/sqlite"
@@ -625,6 +627,113 @@ func TestAdminUploadFlow(t *testing.T) {
 	resp, page := h.get(t, "/c/"+chID+"/")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Contains(t, page, "Hello")
+}
+
+// enqueueFailQueue wraps a real JobQueue but always fails EnqueueTranscription,
+// so tests can exercise the handlers' behaviour when a transcription job cannot
+// be queued (the atomic enqueue+mark-pending step the upload and re-transcribe
+// handlers both go through).
+type enqueueFailQueue struct {
+	queue.JobQueue
+}
+
+func (enqueueFailQueue) EnqueueTranscription(context.Context, string) error {
+	return errors.New("enqueue boom")
+}
+
+// newHarnessQueue builds a harness backed by the given JobQueue, so a test can
+// inject a queue whose Enqueue fails.
+func newHarnessQueue(t *testing.T, mkQueue func(store queue.JobQueue) queue.JobQueue) *harness {
+	t.Helper()
+	ctx := t.Context()
+
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	require.NoError(t, st.Migrate(ctx))
+
+	blobs, err := localfs.New(t.TempDir())
+	require.NoError(t, err)
+	q := mkQueue(dbqueue.New(st))
+	sess := session.NewManager([]byte("0123456789abcdef0123456789abcdef"))
+
+	srv, err := server.New(st, blobs, q, sess,
+		server.WithAddr("127.0.0.1:0"),
+		server.WithBaseURL("http://example.test"))
+	require.NoError(t, err)
+	ctrl, err := srv.Run(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { <-ctrl.Done() })
+
+	return &harness{base: "http://" + ctrl.Addr(), store: st, blobs: blobs, client: newClient()}
+}
+
+// TestUploadEnqueueFailureNotStuckPending verifies that when the transcription
+// job cannot be enqueued during upload, the episode is not left stuck 'pending'
+// (which the UI would refuse to re-queue): because enqueue and marking the
+// episode pending are one atomic step, a failure leaves the episode at its
+// initial non-pending 'none' status with no job, and the handler surfaces an
+// error to the user.
+func TestUploadEnqueueFailureNotStuckPending(t *testing.T) {
+	h := newHarnessQueue(t, func(q queue.JobQueue) queue.JobQueue { return enqueueFailQueue{q} })
+	ctx := t.Context()
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: mustHash(t, "secret"), CreatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	audio := []byte("ID3 fake mp3 payload")
+	body, contentType := multipartUpload(t, map[string]string{"title": "Hello"}, "media", "clip.mp3", "audio/mpeg", audio)
+	resp, err = h.client.Post(h.base+"/admin/channels/c1/episodes", contentType, body)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,
+		"a failed enqueue must surface an error, not silently succeed")
+
+	// The episode exists (it owns the media key) but must not be stuck pending:
+	// the atomic enqueue rolled back, so it keeps its initial non-pending status.
+	eps, err := h.store.ListEpisodes(ctx, store.EpisodeFilter{ChannelID: "c1"})
+	require.NoError(t, err)
+	require.Len(t, eps, 1)
+	require.Equal(t, model.TranscriptNone, eps[0].TranscriptStatus,
+		"an episode whose job never queued must not be stuck pending")
+}
+
+// TestReTranscribeEnqueueFailureNotStuckPending verifies that when re-enqueuing
+// transcription for an existing episode fails, the episode keeps its prior
+// (non-pending) status so the UI can still offer a re-transcribe, and the
+// handler surfaces an error.
+func TestReTranscribeEnqueueFailureNotStuckPending(t *testing.T) {
+	h := newHarnessQueue(t, func(q queue.JobQueue) queue.JobQueue { return enqueueFailQueue{q} })
+	ctx := t.Context()
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: mustHash(t, "secret"), CreatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1",
+		Title: "Ep", MediaKey: "mk1", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, MediaBytes: 5,
+		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptFailed,
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	resp, err = h.client.PostForm(h.base+"/admin/episodes/e1/transcribe", nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,
+		"a failed re-enqueue must surface an error")
+
+	ep, err := h.store.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptFailed, ep.TranscriptStatus,
+		"a failed re-enqueue must not leave the episode stuck pending")
 }
 
 func TestUploadExceedsCap(t *testing.T) {

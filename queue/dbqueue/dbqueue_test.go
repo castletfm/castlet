@@ -8,9 +8,110 @@ import (
 
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/queue/dbqueue"
+	"github.com/castletfm/castlet/store"
 	"github.com/castletfm/castlet/store/sqlite"
 	"github.com/stretchr/testify/require"
 )
+
+// seedEpisode inserts a user, channel, and episode (with the given initial
+// transcript status) so a test can exercise EnqueueTranscription against a real
+// episode row. Foreign keys are enforced, so the whole chain is required.
+func seedEpisode(t *testing.T, s *sqlite.Store, episodeID string, status model.TranscriptStatus) {
+	t.Helper()
+	ctx := t.Context()
+	now := time.Now()
+	require.NoError(t, s.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: "x", CreatedAt: now}))
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "Show", Language: "en", CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: episodeID, ChannelID: "c1",
+		Title: "Ep", MediaKey: "mk1", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, MediaBytes: 5,
+		Status: model.EpisodeDraft, TranscriptStatus: status, CreatedAt: now, UpdatedAt: now}))
+}
+
+// TestEnqueueTranscriptionMarksEpisodePending verifies the happy path: the job is
+// queued AND the episode is flipped to pending as one unit.
+func TestEnqueueTranscriptionMarksEpisodePending(t *testing.T) {
+	q, s := newQueue(t)
+	ctx := t.Context()
+	seedEpisode(t, s, "e1", model.TranscriptNone)
+
+	require.NoError(t, q.EnqueueTranscription(ctx, "e1"))
+
+	ep, err := s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptPending, ep.TranscriptStatus,
+		"a successful enqueue must mark the episode pending")
+
+	job, dead, err := q.Dequeue(ctx, model.JobTranscribe)
+	require.NoError(t, err)
+	require.False(t, dead)
+	require.NotNil(t, job, "a job must have been queued")
+	require.JSONEq(t, `{"episode_id":"e1"}`, job.Payload)
+}
+
+// TestEnqueueTranscriptionAtomicRollback verifies the reverse-gap fix: if marking
+// the episode pending fails (here the episode does not exist), the job insert is
+// rolled back too, so there is never a queued job whose episode status could not
+// be set. Neither side effect is left behind.
+func TestEnqueueTranscriptionAtomicRollback(t *testing.T) {
+	q, _ := newQueue(t)
+	ctx := t.Context()
+
+	err := q.EnqueueTranscription(ctx, "does-not-exist")
+	require.Error(t, err, "marking a missing episode pending must fail")
+	require.ErrorIs(t, err, store.ErrNotFound)
+
+	// The job insert must have rolled back with the failed episode mark: no job is
+	// runnable, so the queue never holds a job with an unset episode status.
+	job, _, err := q.Dequeue(ctx, model.JobTranscribe)
+	require.NoError(t, err)
+	require.Nil(t, job, "the job insert must roll back when the episode mark fails")
+}
+
+// TestEnqueueTranscriptionRejectsWhenAlreadyPending proves the concurrency guard:
+// once an episode is pending, a second enqueue for it must NOT queue another job
+// and must return store.ErrConflict. This is the gap two racing re-transcribe
+// requests exploit — both pass a stale handler pre-check, then both try to insert
+// a job; the transition is guarded inside the transaction so only the first wins.
+func TestEnqueueTranscriptionRejectsWhenAlreadyPending(t *testing.T) {
+	q, s := newQueue(t)
+	ctx := t.Context()
+	seedEpisode(t, s, "e1", model.TranscriptNone)
+
+	// First enqueue wins: episode flips to pending and a job is queued.
+	require.NoError(t, q.EnqueueTranscription(ctx, "e1"))
+
+	// Second enqueue for the now-pending episode is a conflict and queues nothing.
+	err := q.EnqueueTranscription(ctx, "e1")
+	require.ErrorIs(t, err, store.ErrConflict,
+		"a second enqueue for an already-pending episode must be a conflict")
+
+	// Exactly one job exists: claim it, then confirm nothing else is runnable.
+	first, _, err := q.Dequeue(ctx, model.JobTranscribe)
+	require.NoError(t, err)
+	require.NotNil(t, first, "the first enqueue must have queued exactly one job")
+	next, _, err := q.Dequeue(ctx, model.JobTranscribe)
+	require.NoError(t, err)
+	require.Nil(t, next, "the rejected second enqueue must not have queued a duplicate job")
+}
+
+// TestEnqueueTranscriptionRejectsWhenProcessing proves the guard also covers the
+// processing state, not just pending: an episode already being transcribed cannot
+// have a second job queued for it.
+func TestEnqueueTranscriptionRejectsWhenProcessing(t *testing.T) {
+	q, s := newQueue(t)
+	ctx := t.Context()
+	seedEpisode(t, s, "e1", model.TranscriptProcessing)
+
+	err := q.EnqueueTranscription(ctx, "e1")
+	require.ErrorIs(t, err, store.ErrConflict,
+		"an episode already processing must not accept a new transcription job")
+
+	job, _, err := q.Dequeue(ctx, model.JobTranscribe)
+	require.NoError(t, err)
+	require.Nil(t, job, "no job may be queued for an episode already processing")
+}
 
 func newQueue(t *testing.T, opts ...dbqueue.Option) (*dbqueue.Queue, *sqlite.Store) {
 	t.Helper()

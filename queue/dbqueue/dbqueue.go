@@ -106,6 +106,26 @@ func (q *Queue) Enqueue(ctx context.Context, kind model.JobKind, payload any) er
 	})
 }
 
+// EnqueueTranscription builds the transcription job and hands it to the store's
+// combined insert-and-mark-pending transaction, so the job row and the episode's
+// pending status commit together or not at all. See queue.JobQueue.
+func (q *Queue) EnqueueTranscription(ctx context.Context, episodeID string) error {
+	data, err := json.Marshal(model.TranscribePayload{EpisodeID: episodeID})
+	if err != nil {
+		return fmt.Errorf("dbqueue: marshal payload: %w", err)
+	}
+	now := time.Now()
+	return q.store.EnqueueTranscriptionJob(ctx, &model.Job{
+		ID:        idgen.New(),
+		Kind:      model.JobTranscribe,
+		Payload:   string(data),
+		Status:    model.JobPending,
+		RunAfter:  now,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}, episodeID, now)
+}
+
 func (q *Queue) Dequeue(ctx context.Context, kinds ...model.JobKind) (*model.Job, bool, error) {
 	j, err := q.store.ClaimJob(ctx, kinds, time.Now(), q.lease)
 	if errors.Is(err, store.ErrNotFound) {

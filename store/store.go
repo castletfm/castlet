@@ -18,7 +18,10 @@ var (
 	// ErrNotFound is returned when a lookup matches no row.
 	ErrNotFound = errors.New("store: not found")
 	// ErrConflict is returned when a write violates a uniqueness constraint
-	// (e.g. a duplicate email or id).
+	// (e.g. a duplicate email or id), and by EnqueueTranscriptionJob when the
+	// target episode is already pending/processing (a transcription is already
+	// queued or running) — in that case no additional job is queued and the
+	// existing job and status are left untouched.
 	ErrConflict = errors.New("store: conflict")
 	// ErrStaleClaim is returned by the job settlement methods (CompleteJob,
 	// RescheduleJob, FailJob, SettleEpisodeTranscript, and the combined
@@ -171,6 +174,28 @@ type Store interface {
 	// (Redis, SQS) that does not use these methods can only be paired with a worker
 	// whose settlement does not couple to the store job row.
 	EnqueueJob(ctx context.Context, j *model.Job) error
+	// EnqueueTranscriptionJob atomically inserts a transcription job AND marks the
+	// referenced episode's transcript_status = pending in ONE transaction, so the
+	// job and the episode's pending state can never diverge. Either both are
+	// committed (a job to run plus an episode that shows pending) or neither is
+	// (on any error the transaction rolls back, leaving no job and the episode's
+	// prior, non-pending status intact). This closes both windows a two-step
+	// enqueue-then-mark leaves open: an episode stuck pending with no job to run
+	// it, and a queued job whose episode status was never advanced. The pending
+	// transition is the concurrency guard: if the episode is already
+	// pending/processing the transaction commits nothing and returns ErrConflict
+	// (no second job is queued; the existing job and status are left intact), so
+	// two racing enqueues cannot both queue a job. j.Payload must
+	// already identify episodeID.
+	//
+	// The episode->pending transition is also the concurrency guard: the job is
+	// inserted ONLY when the episode was not already pending or processing, and
+	// that check happens inside the same transaction as the insert. So two
+	// concurrent enqueues for one episode cannot both queue a job — the loser sees
+	// the episode already pending/processing and returns ErrConflict, writing
+	// nothing. Returns ErrNotFound (and writes nothing) when no episode has that
+	// id.
+	EnqueueTranscriptionJob(ctx context.Context, j *model.Job, episodeID string, updatedAt time.Time) error
 	// JobByID returns a single job, or ErrNotFound.
 	JobByID(ctx context.Context, id string) (*model.Job, error)
 	// ClaimJob atomically selects the oldest runnable job whose Kind is in

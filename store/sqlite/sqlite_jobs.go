@@ -11,14 +11,87 @@ import (
 	"github.com/castletfm/castlet/store"
 )
 
-func (s *Store) EnqueueJob(ctx context.Context, j *model.Job) error {
-	_, err := s.db.ExecContext(ctx,
+// rowExecer is the subset of *sql.DB / *sql.Tx used to insert a job, so the same
+// INSERT can run standalone (EnqueueJob) or inside a larger transaction
+// (EnqueueTranscriptionJob).
+type rowExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// insertJob writes a job row using the given executor (the pool for a standalone
+// enqueue, or an open transaction when the insert must commit atomically with
+// other writes).
+func insertJob(ctx context.Context, ex rowExecer, j *model.Job) error {
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO jobs (id, kind, payload, status, attempts, last_error, run_after, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		j.ID, string(j.Kind), j.Payload, string(j.Status), j.Attempts, j.LastError,
 		toUnix(j.RunAfter), toUnix(j.CreatedAt), toUnix(j.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("sqlite: enqueue job: %w", mapErr(err))
+	}
+	return nil
+}
+
+func (s *Store) EnqueueJob(ctx context.Context, j *model.Job) error {
+	return insertJob(ctx, s.db, j)
+}
+
+// EnqueueTranscriptionJob inserts the job and marks the episode pending in one
+// transaction so the two are indivisible: on the single-writer pool either both
+// land or, on any failure, the whole thing rolls back and nothing is written.
+//
+// The episode->pending transition is the guard, not a separate pre-check: the
+// UPDATE only matches an episode that is NOT already pending or processing, and
+// the job is inserted only when that UPDATE touched its row. This makes the
+// "already queued/running" decision atomic with the insert, so two concurrent
+// enqueues for the same episode cannot both queue a job — the first flips the
+// status and inserts, the second's conditional UPDATE matches zero rows and it
+// returns ErrConflict without inserting a duplicate. A missing episode yields
+// ErrNotFound. See store.Store for the contract.
+func (s *Store) EnqueueTranscriptionJob(ctx context.Context, j *model.Job, episodeID string, updatedAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: enqueue transcription job: %w", mapErr(err))
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// Guard the transition inside the transaction: only advance an episode that is
+	// not already pending/processing. On the single-writer pool a concurrent
+	// enqueue that already flipped the status leaves zero rows here.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE episodes SET transcript_status = ?, updated_at = ?
+		 WHERE id = ? AND transcript_status NOT IN (?, ?)`,
+		string(model.TranscriptPending), toUnix(updatedAt), episodeID,
+		string(model.TranscriptPending), string(model.TranscriptProcessing))
+	if err != nil {
+		return fmt.Errorf("sqlite: mark episode pending: %w", mapErr(err))
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// The UPDATE matched no row for one of two reasons; distinguish them so a
+		// missing episode still surfaces as ErrNotFound while an already
+		// pending/processing episode is a conflict. No job is inserted either way.
+		var exists bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS(SELECT 1 FROM episodes WHERE id = ?)`, episodeID).Scan(&exists); err != nil {
+			return fmt.Errorf("sqlite: enqueue transcription job: %w", mapErr(err))
+		}
+		if !exists {
+			return store.ErrNotFound
+		}
+		return store.ErrConflict // already pending or processing
+	}
+	// The episode was advanced by this transaction: queue the job to match, so the
+	// insert and the mark commit together.
+	if err := insertJob(ctx, tx, j); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: enqueue transcription job: %w", mapErr(err))
 	}
 	return nil
 }

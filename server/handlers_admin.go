@@ -350,20 +350,34 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		MediaBytes:       n,
 		Language:         form.Language,
 		Status:           model.EpisodeDraft,
-		TranscriptStatus: model.TranscriptPending,
+		TranscriptStatus: model.TranscriptNone,
 		CreatedAt:        s.now(),
 		UpdatedAt:        s.now(),
 	}
+	// Create the episode first: it owns the content-addressed media key. Its
+	// transcript status starts at 'none' (not yet queued), and only the atomic
+	// enqueue below flips it to 'pending' together with the job insert.
 	if err := s.store.CreateEpisode(r.Context(), ep); err != nil {
 		s.deleteOrphanBlob(r.Context(), mediaKey) // only if no other episode shares it
 		s.serverError(w, r, err)
 		return
 	}
 
-	// Queue transcription; failure to enqueue is logged but does not fail the
-	// upload (the episode still exists and can be re-queued).
-	if err := s.queue.Enqueue(r.Context(), model.JobTranscribe, model.TranscribePayload{EpisodeID: ep.ID}); err != nil {
-		s.logger.Error("enqueue transcription", "episode", ep.ID, "error", err)
+	// Queue transcription atomically with marking the episode pending: either both
+	// happen or neither, so the episode is never left pending with no job to run it
+	// (the CST-011 stuck case) and no job is ever queued with a stale episode
+	// status. On failure the episode simply keeps its 'none' status with no job —
+	// safe: the UI still offers a re-transcribe (only pending/processing block it),
+	// so the user can retry. Surface the error. The episode was just created with a
+	// fresh id in status 'none', so the atomic transition proceeds; ErrConflict is
+	// not expected here, but map it to a conflict rather than a 500 if it ever races.
+	if err := s.queue.EnqueueTranscription(r.Context(), ep.ID); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			s.renderError(w, r, http.StatusConflict, "Transcription is already in progress for this episode.")
+			return
+		}
+		s.serverError(w, r, err)
+		return
 	}
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
@@ -502,19 +516,27 @@ func (s *Server) handleEpisodeTranscribe(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	// Reject overlapping requests: transcription is already queued or running.
+	// Fast-path rejection of overlapping requests from a stale view: transcription
+	// is already queued or running. This is only a UX shortcut — the authoritative
+	// guard is the atomic transition in EnqueueTranscription below, which rejects a
+	// concurrent request that raced past this check with store.ErrConflict.
 	if ep.TranscriptStatus == model.TranscriptPending || ep.TranscriptStatus == model.TranscriptProcessing {
 		s.renderError(w, r, http.StatusConflict, "Transcription is already in progress for this episode.")
 		return
 	}
-	ep.TranscriptStatus = model.TranscriptPending
-	ep.UpdatedAt = s.now()
-	if err := s.store.UpdateEpisode(r.Context(), ep); err != nil {
+	// Enqueue the job and mark the episode pending atomically: either both commit
+	// or neither. A failure leaves the episode with its current (non-pending)
+	// status and no job, so the UI still offers a re-transcribe; success can never
+	// leave the episode pending with no job, nor a queued job with a stale status.
+	// A concurrent request that already started transcription makes this one lose
+	// the atomic transition: surface that as a conflict, not a server error.
+	if err := s.queue.EnqueueTranscription(r.Context(), ep.ID); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			s.renderError(w, r, http.StatusConflict, "Transcription is already in progress for this episode.")
+			return
+		}
 		s.serverError(w, r, err)
 		return
-	}
-	if err := s.queue.Enqueue(r.Context(), model.JobTranscribe, model.TranscribePayload{EpisodeID: ep.ID}); err != nil {
-		s.logger.Error("enqueue re-transcription", "episode", ep.ID, "error", err)
 	}
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
