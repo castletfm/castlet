@@ -77,12 +77,54 @@ func New(cfg *config.Config) (*App, error) {
 		cfg:         cfg,
 		store:       st,
 		blobs:       blobs,
-		queue:       dbqueue.New(st, dbqueue.WithLease(cfg.JobLease), dbqueue.WithMaxAttempts(cfg.JobMaxAttempts)),
+		queue:       dbqueue.New(st, queueOptions(cfg)...),
 		transcriber: tr,
 		sessions:    session.NewManager(cfg.SessionKey, session.WithSecure(secure)),
 		authn:       authn,
 		logger:      logger,
 	}, nil
+}
+
+// queueOptions maps the operational knobs onto dbqueue options. A zero field
+// means "leave the component default in place": config.Load rejects non-positive
+// values, but a manually built Config (e.g. the user-create path) leaves these
+// zero, and passing 0 through would clobber the queue's own defaults (instant
+// reclaim / dead-lettering). So only positive values are forwarded.
+func queueOptions(cfg *config.Config) []dbqueue.Option {
+	var opts []dbqueue.Option
+	if cfg.JobLease > 0 {
+		opts = append(opts, dbqueue.WithLease(cfg.JobLease))
+	}
+	if cfg.JobMaxAttempts > 0 {
+		opts = append(opts, dbqueue.WithMaxAttempts(cfg.JobMaxAttempts))
+	}
+	return opts
+}
+
+// workerTuningOptions maps the operational knobs onto worker options, forwarding
+// only positive values so a zero field keeps the worker's own default. A zero
+// poll interval would panic time.NewTicker.
+func workerTuningOptions(cfg *config.Config) []worker.Option {
+	var opts []worker.Option
+	if cfg.WorkerPollInterval > 0 {
+		opts = append(opts, worker.WithPollInterval(cfg.WorkerPollInterval))
+	}
+	return opts
+}
+
+// serverTuningOptions maps the operational knobs onto server options, forwarding
+// only positive values so a zero field keeps the server's own default. A zero
+// max-upload cap would reject every upload and a zero shutdown timeout would
+// skip the drain.
+func serverTuningOptions(cfg *config.Config) []server.Option {
+	var opts []server.Option
+	if cfg.MaxUploadBytes > 0 {
+		opts = append(opts, server.WithMaxUploadBytes(cfg.MaxUploadBytes))
+	}
+	if cfg.ShutdownTimeout > 0 {
+		opts = append(opts, server.WithShutdownTimeout(cfg.ShutdownTimeout))
+	}
+	return opts
 }
 
 // Store exposes the metadata store for administrative commands.
@@ -104,16 +146,20 @@ func (a *App) Serve(ctx context.Context) error {
 	// covers HTTP, queue depth, and transcription outcomes.
 	reg := metrics.New()
 
-	wk := worker.New(a.store, a.blobs, a.queue, a.transcriber,
+	wkOpts := []worker.Option{
 		worker.WithLogger(a.logger),
 		worker.WithMetrics(reg),
-		worker.WithPollInterval(a.cfg.WorkerPollInterval),
+		// JobTimeoutPolicy applies its own per-field defaults for zero values
+		// (see JobTimeoutPolicy.withDefaults), so passing a partial/zero Config
+		// here is safe.
 		worker.WithJobTimeout(worker.JobTimeoutPolicy{
 			Factor: a.cfg.TranscribeTimeoutFactor,
 			Min:    a.cfg.TranscribeTimeoutMin,
 			Max:    a.cfg.TranscribeTimeout,
 		}),
-	)
+	}
+	wkOpts = append(wkOpts, workerTuningOptions(a.cfg)...)
+	wk := worker.New(a.store, a.blobs, a.queue, a.transcriber, wkOpts...)
 	wkCtrl, err := wk.Run(ctx)
 	if err != nil {
 		return fmt.Errorf("app: start worker: %w", err)
@@ -124,11 +170,10 @@ func (a *App) Serve(ctx context.Context) error {
 		server.WithBaseURL(a.cfg.BaseURL),
 		server.WithSiteName(a.cfg.SiteName),
 		server.WithAllowSignup(a.cfg.AllowSignup),
-		server.WithMaxUploadBytes(a.cfg.MaxUploadBytes),
-		server.WithShutdownTimeout(a.cfg.ShutdownTimeout),
 		server.WithLogger(a.logger),
 		server.WithMetrics(reg),
 	}
+	opts = append(opts, serverTuningOptions(a.cfg)...)
 	if a.authn != nil {
 		opts = append(opts, server.WithAuthenticator(a.authn))
 		if len(a.cfg.OIDCAllowedDomains) > 0 {
