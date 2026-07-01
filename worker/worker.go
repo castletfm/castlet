@@ -283,7 +283,13 @@ func (w *Worker) fail(job *model.Job, cause error) error {
 		return fmt.Errorf("nack: %w (cause: %v)", nerr, cause)
 	}
 	if dead {
-		w.markTranscript(ctx, job, model.TranscriptFailed)
+		// The dead-job status settlement gets its OWN fresh budget: Nack above
+		// may have consumed most/all of ctx, and reusing it here could skip the
+		// permanent TranscriptFailed write on an expired context, stranding the
+		// episode in "processing" even though the job is dead.
+		markCtx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
+		defer cancel()
+		w.markTranscript(markCtx, job, model.TranscriptFailed)
 	}
 	return cause
 }
