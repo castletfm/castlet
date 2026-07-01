@@ -307,15 +307,19 @@ func (s *Store) ReorderEpisodes(ctx context.Context, channelID string, orderedID
 	return nil
 }
 
-// DeleteEpisode deletes the episode row and, in the SAME transaction, re-checks
-// whether its media blob is now orphaned. See store.Store for the contract and
-// the TOCTOU it closes. Reading the media key, deleting the row, and counting the
-// remaining references (episodes, channel cover art, and active reservations) all
-// run inside one transaction on the single-writer pool, so the "is the blob still
-// referenced" answer is taken against the exact state left after the row is gone —
-// a concurrent same-content upload's insert or reservation either committed before
-// (and is counted) or serializes after (and keeps its own reference / re-writes
-// the immutable blob). The caller deletes the blob only when orphaned is true.
+// DeleteEpisode deletes the episode row and, in the SAME transaction, decides
+// whether its media blob is now orphaned and — when it is — takes a per-key delete
+// lease (tombstone). See store.Store for the contract and the TOCTOU it closes.
+//
+// Reading the media key, deleting the row, counting the remaining references
+// (episodes, channel cover art, and active reservations), and inserting the delete
+// lease all run inside one transaction on the single-writer pool. The lease is the
+// piece that closes the last window: the physical blobs.Delete runs OUTSIDE any DB
+// transaction, so a concurrent upload's reservation created after this tx commits
+// but before the physical delete would otherwise be invisible. By making the
+// delete INTENT durable and DB-visible here, a concurrent ReserveBlob serializes
+// against it and is rejected with ErrBlobDeleting until the caller finishes the
+// physical delete and releases the lease.
 func (s *Store) DeleteEpisode(ctx context.Context, id string, now time.Time) (mediaKey string, orphaned bool, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -346,7 +350,14 @@ func (s *Store) DeleteEpisode(ctx context.Context, id string, now time.Time) (me
 		if err != nil {
 			return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
 		}
-		orphaned = refs == 0
+		if refs == 0 {
+			// Take the delete lease atomically with the decision so no concurrent
+			// reserve can slip between "orphaned" and the physical delete.
+			if err := acquireDeleteLeaseTx(ctx, tx, key, now); err != nil {
+				return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
+			}
+			orphaned = true
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -355,16 +366,23 @@ func (s *Store) DeleteEpisode(ctx context.Context, id string, now time.Time) (me
 	return key, orphaned, nil
 }
 
-// blobReservationTTL bounds how long an in-flight upload's reservation protects
-// its media key from orphan deletion. It must comfortably exceed the time a live
-// upload spends between reserving a key and committing its episode row (the blob
-// Put plus the insert), so a slow-but-legitimate upload's still-needed blob is
-// never treated as unreferenced and deleted — hence a generous upper bound rather
-// than a tight one. A reservation left behind by a crashed upload simply stops
-// protecting its key after this TTL, so a leak delays orphan cleanup by at most
-// blobReservationTTL and never blocks it permanently. One hour matches the scale
-// of the server's largest allowed upload window.
-const blobReservationTTL = time.Hour
+const (
+	// blobReservationTTL bounds only how long a LEAKED reservation delays orphan
+	// cleanup: ReleaseBlob (deferred on a request-detached context) removes a live
+	// upload's reservation promptly, so this TTL matters solely when an upload
+	// crashed without releasing. It is therefore set conservatively large — a long
+	// value only postpones reclaiming a leaked blob, it never risks deleting a blob
+	// a slow-but-live upload still needs (that upload's reservation is present and
+	// counted). This is the safe upper bound a tight (e.g. 1h) value was not: a
+	// long-streaming Put could outlast a short TTL and lose its protection.
+	blobReservationTTL = 24 * time.Hour
+
+	// blobDeleteLeaseTTL bounds how long a delete lease blocks reservations for its
+	// key. It only needs to outlast a physical blobs.Delete, so it is small; a lease
+	// left behind by a crashed delete handler is ignored after this TTL and can no
+	// longer block uploads of that key.
+	blobDeleteLeaseTTL = 2 * time.Minute
+)
 
 // reservationCutoff is the created_at boundary below which a reservation is
 // considered stale (abandoned by a crashed upload) and ignored by the orphan
@@ -373,9 +391,17 @@ func reservationCutoff(now time.Time) int64 {
 	return toUnix(now.Add(-blobReservationTTL))
 }
 
+// deleteLeaseCutoff is the created_at boundary below which a delete lease is
+// considered stale (abandoned by a crashed delete handler) and ignored, so it can
+// no longer block reservations. Leases with created_at strictly greater than the
+// cutoff are active.
+func deleteLeaseCutoff(now time.Time) int64 {
+	return toUnix(now.Add(-blobDeleteLeaseTTL))
+}
+
 // rowQuerier is satisfied by both *sql.DB and *sql.Tx, letting a count run either
 // on the pool or inside an open transaction (so DeleteEpisode can count within
-// its delete transaction while BlobOrphaned counts on the pool).
+// its delete transaction while BlobOrphaned counts within its own).
 type rowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
@@ -393,43 +419,105 @@ func countBlobRefs(ctx context.Context, q rowQuerier, key string, cutoff int64) 
 	return n, err
 }
 
-// ReserveBlob records an in-flight upload of key so a concurrent episode delete's
-// orphan check counts it and does not delete the blob before the upload's episode
-// row exists. See store.Store for the contract.
-func (s *Store) ReserveBlob(ctx context.Context, key string, now time.Time) error {
-	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO blob_reservations (media_key, created_at) VALUES (?, ?)`,
-		key, toUnix(now)); err != nil {
-		return fmt.Errorf("sqlite: reserve blob: %w", mapErr(err))
-	}
-	return nil
+// acquireDeleteLeaseTx records (or refreshes) the delete lease for key within an
+// open transaction. INSERT OR REPLACE keeps at most one lease per key and stamps
+// it now, so a fresh decision always holds a fresh lease.
+func acquireDeleteLeaseTx(ctx context.Context, tx *sql.Tx, key string, now time.Time) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT OR REPLACE INTO blob_delete_leases (media_key, created_at) VALUES (?, ?)`,
+		key, toUnix(now))
+	return err
 }
 
-// ReleaseBlob drops ONE reservation for the key (a refcount decrement), so
-// concurrent uploads of identical bytes each release only their own row. A
+// ReserveBlob records an in-flight upload of key and returns the reservation's id
+// as a release token. If an active delete lease exists for key (a physical delete
+// is in progress) it inserts nothing and returns ErrBlobDeleting so the caller
+// retries once the delete finishes. See store.Store for the contract.
+func (s *Store) ReserveBlob(ctx context.Context, key string, now time.Time) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: reserve blob: %w", mapErr(err))
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	var leases int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM blob_delete_leases WHERE media_key = ? AND created_at > ?`,
+		key, deleteLeaseCutoff(now)).Scan(&leases); err != nil {
+		return 0, fmt.Errorf("sqlite: reserve blob: %w", mapErr(err))
+	}
+	if leases > 0 {
+		return 0, store.ErrBlobDeleting
+	}
+
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO blob_reservations (media_key, created_at) VALUES (?, ?)`,
+		key, toUnix(now))
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: reserve blob: %w", mapErr(err))
+	}
+	token, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: reserve blob: %w", mapErr(err))
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("sqlite: reserve blob: %w", mapErr(err))
+	}
+	return token, nil
+}
+
+// ReleaseBlob drops the exact reservation identified by token (the id ReserveBlob
+// returned), so a release never removes a different concurrent upload's row. A
 // missing reservation is not an error.
-func (s *Store) ReleaseBlob(ctx context.Context, key string) error {
+func (s *Store) ReleaseBlob(ctx context.Context, token int64) error {
 	if _, err := s.db.ExecContext(ctx,
-		`DELETE FROM blob_reservations
-		 WHERE rowid = (SELECT rowid FROM blob_reservations WHERE media_key = ? LIMIT 1)`,
-		key); err != nil {
+		`DELETE FROM blob_reservations WHERE id = ?`, token); err != nil {
 		return fmt.Errorf("sqlite: release blob: %w", mapErr(err))
 	}
 	return nil
 }
 
-// BlobOrphaned reports whether nothing references the media key: no episode, no
-// channel cover art, and no active (non-stale, per now) reservation. See
+// ReleaseDeleteLease drops the delete lease for key, unblocking reservations once
+// the physical blob delete has completed. A missing lease is not an error.
+func (s *Store) ReleaseDeleteLease(ctx context.Context, key string) error {
+	if _, err := s.db.ExecContext(ctx,
+		`DELETE FROM blob_delete_leases WHERE media_key = ?`, key); err != nil {
+		return fmt.Errorf("sqlite: release delete lease: %w", mapErr(err))
+	}
+	return nil
+}
+
+// BlobOrphaned reports whether nothing references the media key (no episode, no
+// channel cover art, no active reservation) and, when nothing does, takes the
+// delete lease in the SAME transaction — exactly like DeleteEpisode's orphan
+// branch. This backs the failed-create rollback cleanup, which has no episode row
+// to delete; when it returns true the caller must run the physical delete and then
+// ReleaseDeleteLease, so the rollback path is as race-safe as the delete path. See
 // store.Store for the contract.
 func (s *Store) BlobOrphaned(ctx context.Context, key string, now time.Time) (bool, error) {
 	if key == "" {
 		return false, nil
 	}
-	n, err := countBlobRefs(ctx, s.db, key, reservationCutoff(now))
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("sqlite: blob orphaned: %w", mapErr(err))
 	}
-	return n == 0, nil
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	refs, err := countBlobRefs(ctx, tx, key, reservationCutoff(now))
+	if err != nil {
+		return false, fmt.Errorf("sqlite: blob orphaned: %w", mapErr(err))
+	}
+	if refs != 0 {
+		return false, nil
+	}
+	if err := acquireDeleteLeaseTx(ctx, tx, key, now); err != nil {
+		return false, fmt.Errorf("sqlite: blob orphaned: %w", mapErr(err))
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("sqlite: blob orphaned: %w", mapErr(err))
+	}
+	return true, nil
 }
 
 func (s *Store) EpisodeByID(ctx context.Context, id string) (*model.Episode, error) {

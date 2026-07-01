@@ -105,6 +105,26 @@ func (s *Store) Migrate(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc ON users(oidc_issuer, oidc_subject) WHERE oidc_subject <> ''`); err != nil {
 		return fmt.Errorf("sqlite: migrate index: %w", err)
 	}
+	// Blob-lifecycle tables. These are also in schema.sql (executed above), so on a
+	// fresh database the statements here are no-ops; they are repeated
+	// imperatively so an in-place upgrade of a database created before these tables
+	// existed gains them too, following the idempotent-migration convention.
+	for _, ddl := range []string{
+		`CREATE TABLE IF NOT EXISTS blob_reservations (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			media_key  TEXT    NOT NULL,
+			created_at INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_blob_reservations_key ON blob_reservations(media_key)`,
+		`CREATE TABLE IF NOT EXISTS blob_delete_leases (
+			media_key  TEXT    PRIMARY KEY,
+			created_at INTEGER NOT NULL
+		)`,
+	} {
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("sqlite: migrate blob tables: %w", err)
+		}
+	}
 	return nil
 }
 

@@ -272,9 +272,10 @@ func TestDeleteEpisodeOrphan(t *testing.T) {
 // TestBlobReservationOrphan proves the reservation table closes the sibling race
 // (an in-flight upload writes the blob before its episode row exists): an active
 // reservation keeps DeleteEpisode/BlobOrphaned from reporting a key orphaned even
-// when no episode references it, releasing frees it, and a stale (older than the
-// TTL) reservation no longer protects the key so a crashed upload cannot pin a
-// blob forever.
+// when no episode references it, releasing (by token) frees it, and a stale (older
+// than the TTL) reservation no longer protects the key so a crashed upload cannot
+// pin a blob forever. A BlobOrphaned==true result takes a delete lease that the
+// caller releases after the notional physical delete (as the handler does).
 func TestBlobReservationOrphan(t *testing.T) {
 	s := newStore(t)
 	seedUser(t, s)
@@ -291,7 +292,8 @@ func TestBlobReservationOrphan(t *testing.T) {
 	// Simulate a concurrent upload of the SAME content-addressed key that has
 	// written its blob (Put) but not yet committed its episode row: it holds a
 	// reservation. Deleting the only existing episode must NOT orphan the key.
-	require.NoError(t, s.ReserveBlob(ctx, "k", now))
+	token, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
 	key, orphaned, err := s.DeleteEpisode(ctx, "e1", now)
 	require.NoError(t, err)
 	require.Equal(t, "k", key)
@@ -303,28 +305,106 @@ func TestBlobReservationOrphan(t *testing.T) {
 	require.False(t, got, "an active reservation must keep the blob alive")
 
 	// Once the upload releases its reservation and no episode references the key,
-	// the blob is orphaned.
-	require.NoError(t, s.ReleaseBlob(ctx, "k"))
+	// the blob is orphaned (and a delete lease is taken; release it afterwards).
+	require.NoError(t, s.ReleaseBlob(ctx, token))
 	got, err = s.BlobOrphaned(ctx, "k", now)
 	require.NoError(t, err)
 	require.True(t, got, "no episode and no reservation -> orphaned")
+	require.NoError(t, s.ReleaseDeleteLease(ctx, "k"))
 
 	// A reservation older than the TTL is stale (a crashed upload) and must not
 	// protect the key: evaluating "now" well past the reservation's timestamp
 	// treats it as expired.
-	require.NoError(t, s.ReserveBlob(ctx, "k", now))
-	future := now.Add(2 * time.Hour) // beyond blobReservationTTL (1h)
+	staleToken, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	future := now.Add(48 * time.Hour) // beyond blobReservationTTL
 	got, err = s.BlobOrphaned(ctx, "k", future)
 	require.NoError(t, err)
 	require.True(t, got, "a stale reservation must not pin the blob")
+	require.NoError(t, s.ReleaseDeleteLease(ctx, "k"))
+	require.NoError(t, s.ReleaseBlob(ctx, staleToken))
 
 	// Concurrent identical uploads act as a refcount: two reservations, releasing
 	// one still leaves the key protected.
-	require.NoError(t, s.ReserveBlob(ctx, "k", now)) // second live reservation
-	require.NoError(t, s.ReleaseBlob(ctx, "k"))      // drop one
+	t1, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	t2, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	require.NoError(t, s.ReleaseBlob(ctx, t1)) // drop one
 	got, err = s.BlobOrphaned(ctx, "k", now)
 	require.NoError(t, err)
 	require.False(t, got, "a remaining reservation still protects the key")
+	require.NoError(t, s.ReleaseBlob(ctx, t2))
+}
+
+// TestBlobDeleteLease proves the delete lease closes the residual window in which
+// a reservation created after the delete transaction commits but before the
+// physical blobs.Delete would be invisible: while the lease is held ReserveBlob is
+// rejected (ErrBlobDeleting) so a same-content upload retries instead of racing
+// the delete; a stale lease (past its TTL) no longer blocks, and after the lease
+// is released reservation succeeds again.
+func TestBlobDeleteLease(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s)
+	ctx := t.Context()
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	now := time.Now()
+	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
+		MediaKey: "k", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, Status: model.EpisodeDraft,
+		TranscriptStatus: model.TranscriptNone, CreatedAt: now, UpdatedAt: now}))
+
+	// Deleting the only referencing episode orphans "k" and takes a delete lease
+	// atomically with the decision.
+	_, orphaned, err := s.DeleteEpisode(ctx, "e1", now)
+	require.NoError(t, err)
+	require.True(t, orphaned)
+
+	// A concurrent upload reserving the same key while the lease is held is rejected.
+	_, err = s.ReserveBlob(ctx, "k", now)
+	require.ErrorIs(t, err, store.ErrBlobDeleting)
+
+	// A stale lease (older than blobDeleteLeaseTTL) no longer blocks reservations.
+	future := now.Add(10 * time.Minute) // beyond blobDeleteLeaseTTL
+	tok, err := s.ReserveBlob(ctx, "k", future)
+	require.NoError(t, err)
+	require.NoError(t, s.ReleaseBlob(ctx, tok))
+
+	// After the physical delete completes and the lease is released, reservation
+	// succeeds normally again.
+	require.NoError(t, s.ReleaseDeleteLease(ctx, "k"))
+	tok, err = s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	require.NoError(t, s.ReleaseBlob(ctx, tok))
+}
+
+// TestReleaseBlobByToken proves ReleaseBlob drops exactly the caller's reservation
+// (identified by its token), never an arbitrary row — so releasing upload A does
+// not drop a concurrent upload B's reservation for the same key.
+func TestReleaseBlobByToken(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	tokenA, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	tokenB, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	require.NotEqual(t, tokenA, tokenB)
+
+	// Releasing A must leave B's reservation intact, so the key is still protected.
+	require.NoError(t, s.ReleaseBlob(ctx, tokenA))
+	got, err := s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.False(t, got, "B's reservation must still protect the key")
+
+	// After B releases too, nothing references the key.
+	require.NoError(t, s.ReleaseBlob(ctx, tokenB))
+	got, err = s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.True(t, got)
+	require.NoError(t, s.ReleaseDeleteLease(ctx, "k"))
 }
 
 func TestReorderEpisodes(t *testing.T) {

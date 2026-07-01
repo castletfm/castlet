@@ -44,6 +44,12 @@ var (
 	// duplicates, omits a current episode, or names a foreign id). Callers
 	// should surface it as a client error (400), not a server error.
 	ErrInvalidReorder = errors.New("store: invalid reorder")
+	// ErrBlobDeleting is returned by ReserveBlob when an active delete lease exists
+	// for the media key — a physical blob delete for that key is in progress. The
+	// caller should retry the reservation shortly (the delete is quick); once the
+	// lease clears the reservation succeeds. It prevents a same-content upload from
+	// reserving a key whose bytes are about to be physically deleted.
+	ErrBlobDeleting = errors.New("store: blob delete in progress")
 )
 
 // EpisodeFilter narrows ListEpisodes. The zero value lists every episode,
@@ -100,39 +106,55 @@ type Store interface {
 	// edit to the rest of the row is not clobbered by the transcription worker.
 	SetEpisodeTranscriptStatus(ctx context.Context, id string, status model.TranscriptStatus, updatedAt time.Time) error
 	// DeleteEpisode removes the episode identified by id and, in the SAME
-	// transaction, reports whether its media blob is now orphaned: after the row
-	// is gone, orphaned is true only when no remaining episode references the
-	// media key, no channel cover art references it, AND no active (non-stale)
-	// blob reservation covers it. Media is content-addressed and immutable, so a
-	// key may be shared; coupling the delete and the reference re-check in one
-	// transaction closes the TOCTOU where a separate "check references, then
-	// delete blob" lets a concurrent same-content upload insert a new referencing
-	// episode between the check and the delete. Counting reservations closes the
-	// sibling window in which a concurrent upload has already written the blob
-	// (blobs.Put) but has not yet committed its episode row: on the single-writer
-	// store that upload's reservation serializes either fully before this
-	// transaction (and is counted, so orphaned=false) or fully after it (and the
-	// upload re-writes the immutable blob after any delete). now anchors the
-	// reservation staleness cutoff so a reservation abandoned by a crashed upload
-	// stops protecting its key. The caller deletes the blob only when orphaned is
-	// true. Returns the episode's media key (empty when it had none) and
-	// ErrNotFound (with orphaned=false) when no episode has the id.
+	// transaction, decides whether its media blob is now orphaned and, when it is,
+	// takes a per-key delete lease. orphaned is true only when after the row is gone
+	// no remaining episode references the media key, no channel cover art references
+	// it, AND no active (non-stale) blob reservation covers it. Media is
+	// content-addressed and immutable, so a key may be shared.
+	//
+	// Two coupled mechanisms make blob deletion race-free. (1) Coupling the delete
+	// and the reference re-check in one transaction closes the TOCTOU where a
+	// separate "check references, then delete" lets a concurrent same-content upload
+	// insert a new referencing episode between check and delete; counting
+	// reservations extends this to the window where a concurrent upload has written
+	// the blob (blobs.Put) but not yet committed its episode row. (2) The physical
+	// blobs.Delete necessarily runs OUTSIDE this transaction, so a reservation
+	// created after this tx commits but before the physical delete would be
+	// invisible here; to close that, when orphaned is decided this method inserts a
+	// delete lease in the SAME transaction. A concurrent ReserveBlob serializes
+	// against that lease and is rejected with ErrBlobDeleting until the caller
+	// finishes the physical delete and calls ReleaseDeleteLease. now anchors both
+	// the reservation- and lease-staleness cutoffs. The caller MUST, when orphaned
+	// is true, perform the physical delete and then ReleaseDeleteLease(mediaKey).
+	// Returns the episode's media key (empty when it had none) and ErrNotFound (with
+	// orphaned=false) when no episode has the id.
 	DeleteEpisode(ctx context.Context, id string, now time.Time) (mediaKey string, orphaned bool, err error)
-	// ReserveBlob records an in-flight media upload for key so a concurrent
-	// episode delete's orphan check counts it and cannot delete the blob before
-	// the upload's episode row is committed (media is written before its row
-	// exists). Identical content-addressed concurrent uploads each add a
-	// reservation, so reservations act as a refcount; ReleaseBlob removes one.
-	// now stamps the reservation for staleness expiry (see DeleteEpisode).
-	ReserveBlob(ctx context.Context, key string, now time.Time) error
-	// ReleaseBlob drops one reservation previously taken by ReserveBlob for key (a
-	// refcount decrement). A missing reservation is not an error: a stale row may
-	// already have been swept, and release is best-effort cleanup.
-	ReleaseBlob(ctx context.Context, key string) error
-	// BlobOrphaned reports whether nothing references the media key: no episode, no
-	// channel cover art, and no active (non-stale, per now) blob reservation. It
-	// backs the failed-create rollback cleanup, which has no episode row to delete
-	// and so cannot rely on DeleteEpisode's in-transaction recount.
+	// ReserveBlob records an in-flight media upload for key so a concurrent episode
+	// delete's orphan check counts it and cannot delete the blob before the upload's
+	// episode row is committed (media is written before its row exists). It returns
+	// the reservation's id as a release token for ReleaseBlob. Identical
+	// content-addressed concurrent uploads each add a reservation, so reservations
+	// act as a refcount. If an active delete lease exists for key (a physical delete
+	// is in progress) it reserves nothing and returns ErrBlobDeleting; the caller
+	// should retry shortly. now stamps the reservation for staleness expiry and
+	// anchors the lease-staleness check.
+	ReserveBlob(ctx context.Context, key string, now time.Time) (token int64, err error)
+	// ReleaseBlob drops the exact reservation identified by the token ReserveBlob
+	// returned, so a release never removes a different concurrent upload's
+	// reservation. A missing reservation is not an error.
+	ReleaseBlob(ctx context.Context, token int64) error
+	// ReleaseDeleteLease drops the delete lease for key, unblocking reservations
+	// once the physical blob delete has completed. Callers that acted on an
+	// orphaned=true result (from DeleteEpisode or BlobOrphaned) MUST call this after
+	// the physical delete. A missing lease is not an error.
+	ReleaseDeleteLease(ctx context.Context, key string) error
+	// BlobOrphaned reports whether nothing references the media key (no episode, no
+	// channel cover art, no active reservation) and, when nothing does, takes the
+	// delete lease in the SAME transaction — the same protocol as DeleteEpisode's
+	// orphan branch. It backs the failed-create rollback cleanup, which has no
+	// episode row to delete. When it returns true the caller MUST perform the
+	// physical delete and then ReleaseDeleteLease(key). now anchors the reservation-
+	// and lease-staleness cutoffs.
 	BlobOrphaned(ctx context.Context, key string, now time.Time) (bool, error)
 	EpisodeByID(ctx context.Context, id string) (*model.Episode, error)
 	// EpisodeByMediaKey finds an episode whose media is stored under key. Media

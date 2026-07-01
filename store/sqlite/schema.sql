@@ -59,15 +59,31 @@ CREATE TABLE IF NOT EXISTS transcripts (
 -- exists, an episode delete's orphan check would otherwise not see a concurrent
 -- upload; counting active reservations closes that window. Identical
 -- (content-addressed) concurrent uploads each add a row, so the table acts as a
--- refcount per key. A row left behind by a crashed upload is ignored once older
--- than the reservation TTL (see blobReservationTTL in sqlite_crud.go), so a leak
--- only delays orphan cleanup rather than pinning a blob forever. This table is
--- created by Migrate (which executes this schema) on new and existing databases.
+-- refcount per key. The autoincrement id is the release token: ReleaseBlob drops
+-- exactly the caller's row, never an arbitrary one. A row left behind by a crashed
+-- upload is ignored once older than the reservation TTL (see blobReservationTTL in
+-- sqlite_crud.go), so a leak only delays orphan cleanup rather than pinning a blob
+-- forever. This table is created by Migrate (which executes this schema) on new and
+-- existing databases.
 CREATE TABLE IF NOT EXISTS blob_reservations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
     media_key  TEXT    NOT NULL,
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_blob_reservations_key ON blob_reservations(media_key);
+
+-- blob_delete_leases records an in-progress PHYSICAL blob delete (a tombstone).
+-- The orphan decision and the lease insert happen in one transaction; the lease is
+-- held across the out-of-transaction blobs.Delete and released only after it. A
+-- concurrent ReserveBlob for the same key serializes against the lease and is
+-- rejected (store.ErrBlobDeleting) until the delete finishes, closing the window
+-- where a reservation created between the delete tx commit and the physical delete
+-- would be invisible. At most one lease per key (PRIMARY KEY); a lease from a
+-- crashed delete handler is ignored once older than blobDeleteLeaseTTL.
+CREATE TABLE IF NOT EXISTS blob_delete_leases (
+    media_key  TEXT    PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id         TEXT    PRIMARY KEY,
