@@ -295,13 +295,16 @@ func TestOIDCCallbackClearsTransientCookies(t *testing.T) {
 }
 
 // requireCookieCleared asserts the response carries a Set-Cookie for name that
-// expires it (empty value and a non-positive max-age).
+// deletes it (empty value and a negative max-age). Note that MaxAge==0 means "no
+// Max-Age attribute" (the cookie is NOT expired); only MaxAge<0 deletes it. Go
+// renders clearOIDCCookie's MaxAge=-1 as "Max-Age=0", which resp.Cookies() parses
+// back to MaxAge=-1, so require MaxAge<0 here.
 func requireCookieCleared(t *testing.T, resp *http.Response, name string) {
 	t.Helper()
 	for _, c := range resp.Cookies() {
 		if c.Name == name {
 			require.Empty(t, c.Value, "cleared cookie %q must have an empty value", name)
-			require.LessOrEqual(t, c.MaxAge, 0, "cleared cookie %q must have max-age<=0", name)
+			require.Less(t, c.MaxAge, 0, "cleared cookie %q must have max-age<0 to delete it", name)
 			return
 		}
 	}
