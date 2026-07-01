@@ -562,19 +562,41 @@ func (s *Server) handleEpisodeDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.store.DeleteEpisode(r.Context(), ep.ID); err != nil {
+	// Delete the row and learn, atomically, whether its blob is now orphaned. The
+	// store re-checks references in the same transaction as the delete, so there is
+	// no window in which a concurrent same-content upload could insert a new
+	// referencing episode between a reference check and the blob delete (CST-013).
+	mediaKey, orphaned, err := s.store.DeleteEpisode(r.Context(), ep.ID)
+	if err != nil {
 		s.serverError(w, r, err)
 		return
 	}
-	s.deleteOrphanBlob(r.Context(), ep.MediaKey)
+	if orphaned {
+		s.deleteBlob(r.Context(), mediaKey)
+	}
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
 
-// deleteOrphanBlob removes a media blob, but only if no other row still
-// references it. Media is content-addressed, so identical uploads share a key;
-// this keeps a delete from yanking a blob another owner depends on. Both
-// episodes and channel cover art can own a key, so both must be checked before a
-// blob is removed.
+// deleteBlob removes a media blob, logging (but not surfacing) a failure. The
+// caller is responsible for having established that the blob is no longer
+// referenced — for an episode delete this comes from DeleteEpisode's atomic,
+// same-transaction orphan check.
+func (s *Server) deleteBlob(ctx context.Context, key string) {
+	if key == "" {
+		return
+	}
+	if err := s.blobs.Delete(ctx, key); err != nil {
+		s.logger.Error("delete media blob", "key", key, "error", err)
+	}
+}
+
+// deleteOrphanBlob removes a just-uploaded media blob on a failed episode
+// create, but only if no other row already references it. Unlike the episode
+// DELETE path there is no row to remove here (the insert failed), so this is a
+// best-effort check-then-delete cleanup of an orphaned upload, run only on a rare
+// create error. Media is content-addressed, so identical uploads share a key;
+// both episodes and channel cover art can own a key, so both are checked before
+// the blob is removed.
 func (s *Server) deleteOrphanBlob(ctx context.Context, key string) {
 	if key == "" {
 		return
@@ -594,9 +616,7 @@ func (s *Server) deleteOrphanBlob(ctx context.Context, key string) {
 	} else if cover {
 		return // still referenced by a channel image
 	}
-	if err := s.blobs.Delete(ctx, key); err != nil {
-		s.logger.Error("delete media blob", "key", key, "error", err)
-	}
+	s.deleteBlob(ctx, key)
 }
 
 // --- ownership helpers ------------------------------------------------------

@@ -307,12 +307,53 @@ func (s *Store) ReorderEpisodes(ctx context.Context, channelID string, orderedID
 	return nil
 }
 
-func (s *Store) DeleteEpisode(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM episodes WHERE id = ?`, id)
+// DeleteEpisode deletes the episode row and, in the SAME transaction, re-checks
+// whether its media blob is now orphaned. See store.Store for the contract and
+// the TOCTOU it closes. Reading the media key, deleting the row, and counting the
+// remaining references all run inside one transaction on the single-writer pool,
+// so the "is the blob still referenced" answer is taken against the exact state
+// left after the row is gone — a concurrent same-content upload's insert either
+// committed before (and is counted) or serializes after (and keeps its own
+// reference). The caller deletes the blob only when orphaned is true.
+func (s *Store) DeleteEpisode(ctx context.Context, id string) (mediaKey string, orphaned bool, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
+		return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
 	}
-	return requireAffected(res)
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// Read the media key before deleting so the caller knows which blob to consider
+	// for removal. A missing row surfaces as ErrNotFound (via mapErr), matching the
+	// old requireAffected behaviour for an unknown id.
+	var key string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT media_key FROM episodes WHERE id = ?`, id).Scan(&key); err != nil {
+		return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM episodes WHERE id = ?`, id); err != nil {
+		return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
+	}
+
+	// Re-check references AFTER the row is gone, in the same transaction: the blob
+	// is orphaned only when nothing else references the (content-addressed, so
+	// possibly shared) key — neither another episode nor a channel's cover art. An
+	// empty key is never orphaned; there is no blob to delete.
+	if key != "" {
+		var refs int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT (SELECT COUNT(1) FROM episodes WHERE media_key = ?)
+			      + (SELECT COUNT(1) FROM channels WHERE image_key = ? AND image_key <> '')`,
+			key, key).Scan(&refs); err != nil {
+			return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
+		}
+		orphaned = refs == 0
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", false, fmt.Errorf("sqlite: delete episode: %w", mapErr(err))
+	}
+	return key, orphaned, nil
 }
 
 func (s *Store) EpisodeByID(ctx context.Context, id string) (*model.Episode, error) {

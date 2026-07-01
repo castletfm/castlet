@@ -99,7 +99,21 @@ type Store interface {
 	// updated_at) of an episode. It is a targeted write so a concurrent admin
 	// edit to the rest of the row is not clobbered by the transcription worker.
 	SetEpisodeTranscriptStatus(ctx context.Context, id string, status model.TranscriptStatus, updatedAt time.Time) error
-	DeleteEpisode(ctx context.Context, id string) error
+	// DeleteEpisode removes the episode identified by id and, in the SAME
+	// transaction, reports whether its media blob is now orphaned: after the row
+	// is gone, orphaned is true only when no remaining episode references the
+	// media key AND no channel cover art references it. Media is content-addressed
+	// and immutable, so a key may be shared; coupling the delete and the
+	// reference re-check in one transaction closes the TOCTOU where a separate
+	// "check references, then delete blob" lets a concurrent same-content upload
+	// insert a new referencing episode between the check and the delete. On the
+	// single-writer store any such insert serializes either fully before this
+	// transaction (and is seen by the re-check, which reports orphaned=false) or
+	// fully after it (and keeps its own reference), so the caller may delete the
+	// blob whenever orphaned is true without ever removing bytes an episode still
+	// references. Returns the episode's media key (empty when it had none) and
+	// ErrNotFound (with orphaned=false) when no episode has the id.
+	DeleteEpisode(ctx context.Context, id string) (mediaKey string, orphaned bool, err error)
 	EpisodeByID(ctx context.Context, id string) (*model.Episode, error)
 	// EpisodeByMediaKey finds an episode whose media is stored under key. Media
 	// is content-addressed, so a key may be shared by several episodes; this

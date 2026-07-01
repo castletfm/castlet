@@ -211,8 +211,60 @@ func TestChannelsAndEpisodes(t *testing.T) {
 	require.ErrorIs(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1",
 		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptNone}), store.ErrConflict)
 
-	require.NoError(t, s.DeleteEpisode(ctx, "e2"))
-	require.ErrorIs(t, s.DeleteEpisode(ctx, "e2"), store.ErrNotFound)
+	_, _, err = s.DeleteEpisode(ctx, "e2")
+	require.NoError(t, err)
+	_, _, err = s.DeleteEpisode(ctx, "e2")
+	require.ErrorIs(t, err, store.ErrNotFound)
+}
+
+// TestDeleteEpisodeOrphan proves DeleteEpisode's atomic orphan report (CST-013):
+// a shared, content-addressed media key is reported orphaned only once the LAST
+// referencing episode is gone, and a channel's cover art keeps a key alive.
+func TestDeleteEpisodeOrphan(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s)
+	ctx := t.Context()
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	mkEp := func(id, key string) *model.Episode {
+		return &model.Episode{ID: id, ChannelID: "c1", Title: id, MediaKey: key,
+			MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, Status: model.EpisodeDraft,
+			TranscriptStatus: model.TranscriptNone, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	}
+
+	// Two episodes share one content-addressed key (identical uploaded bytes).
+	require.NoError(t, s.CreateEpisode(ctx, mkEp("e1", "shared")))
+	require.NoError(t, s.CreateEpisode(ctx, mkEp("e2", "shared")))
+
+	// Deleting the first must NOT orphan the blob: e2 still references it.
+	key, orphaned, err := s.DeleteEpisode(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, "shared", key)
+	require.False(t, orphaned, "blob is still referenced by e2")
+
+	// Deleting the last referencing episode orphans the blob.
+	key, orphaned, err = s.DeleteEpisode(ctx, "e2")
+	require.NoError(t, err)
+	require.Equal(t, "shared", key)
+	require.True(t, orphaned, "no episode references the blob anymore")
+
+	// A channel cover art protects a shared key: an episode whose media key equals
+	// a channel's image key is not orphaned when deleted.
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c2", UserID: "u1", Title: "Cover",
+		ImageKey: "img", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	require.NoError(t, s.CreateEpisode(ctx, mkEp("e3", "img")))
+	key, orphaned, err = s.DeleteEpisode(ctx, "e3")
+	require.NoError(t, err)
+	require.Equal(t, "img", key)
+	require.False(t, orphaned, "channel cover art still references the key")
+
+	// An episode with no media key is never orphaned (there is no blob to delete).
+	require.NoError(t, s.CreateEpisode(ctx, mkEp("e4", "")))
+	key, orphaned, err = s.DeleteEpisode(ctx, "e4")
+	require.NoError(t, err)
+	require.Empty(t, key)
+	require.False(t, orphaned)
 }
 
 func TestReorderEpisodes(t *testing.T) {
