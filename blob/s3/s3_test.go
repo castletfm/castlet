@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -300,6 +301,92 @@ func TestGetProgressingTransferSucceeds(t *testing.T) {
 	body, err := io.ReadAll(rc)
 	require.NoError(t, err)
 	assert.Equal(t, bytes.Repeat([]byte("chunk"), chunks), body)
+}
+
+// stagedFiles lists entries in dir whose name starts with prefix. It is used to
+// observe where Put/Get stage their buffered temp files and that they are
+// cleaned up afterwards.
+func stagedFiles(t *testing.T, dir, prefix string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	var out []string
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), prefix) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// TestPutStagesInConfiguredTempDir proves Put buffers the upload into the
+// directory given by WithTempDir (not the system /tmp) and removes it afterward.
+// The staged file is captured mid-request (while it still exists) by having the
+// server list the dir as it reads the body.
+func TestPutStagesInConfiguredTempDir(t *testing.T) {
+	dir := t.TempDir()
+	staged := make(chan []string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		staged <- stagedFiles(t, dir, "castlet-s3put-")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s, err := New(Config{Endpoint: srv.URL, Bucket: "b", AccessKey: "AK", SecretKey: "SK"}, WithTempDir(dir))
+	require.NoError(t, err)
+
+	_, err = s.Put(context.Background(), "key", strings.NewReader("hello world"))
+	require.NoError(t, err)
+
+	require.Len(t, <-staged, 1, "Put must stage its buffer in the configured temp dir")
+	assert.Empty(t, stagedFiles(t, dir, "castlet-s3put-"), "staged temp file must be removed after Put")
+}
+
+// TestGetStagesInConfiguredTempDir proves Get buffers the response into the
+// WithTempDir directory and that closing the returned reader removes it.
+func TestGetStagesInConfiguredTempDir(t *testing.T) {
+	dir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "hello world")
+	}))
+	defer srv.Close()
+
+	s, err := New(Config{Endpoint: srv.URL, Bucket: "b", AccessKey: "AK", SecretKey: "SK"}, WithTempDir(dir))
+	require.NoError(t, err)
+
+	rc, n, err := s.Get(context.Background(), "key")
+	require.NoError(t, err)
+	assert.Equal(t, int64(len("hello world")), n)
+	assert.Len(t, stagedFiles(t, dir, "castlet-s3get-"), 1, "Get must stage the body in the configured temp dir")
+
+	require.NoError(t, rc.Close())
+	assert.Empty(t, stagedFiles(t, dir, "castlet-s3get-"), "staged temp file must be removed on reader Close")
+}
+
+// TestDefaultTempDirIsOSTempDir proves that without WithTempDir the store leaves
+// tempDir empty and stages under os.TempDir(). TMPDIR (honored by os.TempDir on
+// unix) is pointed at a scratch dir so the staged file can be observed there.
+func TestDefaultTempDirIsOSTempDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	require.Equal(t, dir, os.TempDir(), "test requires os.TempDir to honor TMPDIR")
+
+	staged := make(chan []string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		staged <- stagedFiles(t, dir, "castlet-s3put-")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	s, err := New(Config{Endpoint: srv.URL, Bucket: "b", AccessKey: "AK", SecretKey: "SK"})
+	require.NoError(t, err)
+	assert.Empty(t, s.tempDir, "default store must leave tempDir unset")
+
+	_, err = s.Put(context.Background(), "key", strings.NewReader("hi"))
+	require.NoError(t, err)
+	require.Len(t, <-staged, 1, "default Put must stage under os.TempDir()")
 }
 
 func TestURIEncode(t *testing.T) {

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/castletfm/castlet/blob"
+	"github.com/lestrrat-go/option/v3"
 )
 
 // emptyPayload is sha256("") — the content hash for a request with no body.
@@ -44,10 +45,11 @@ type Config struct {
 // Store is an S3-compatible BlobStore. It addresses objects path-style
 // (endpoint/bucket/key), which every S3-compatible store accepts.
 type Store struct {
-	cfg    Config
-	client *http.Client
-	scheme string
-	host   string
+	cfg     Config
+	client  *http.Client
+	scheme  string
+	host    string
+	tempDir string // staging dir for buffered bodies; "" means os.TempDir()
 }
 
 var (
@@ -55,8 +57,21 @@ var (
 	_ blob.DirectURL = (*Store)(nil)
 )
 
+// Option configures New.
+type Option = option.Interface
+
+type identTempDir struct{}
+
+// WithTempDir sets the directory in which Put/Get stage the full object body to
+// a temporary file (Put buffers to hash and length the upload; Get buffers the
+// response to satisfy the seekable-reader contract). When unset the OS default
+// (os.TempDir) is used, so existing callers are unaffected. Point this at a
+// directory on the volume provisioned for media so large or concurrent
+// transfers cannot exhaust the system /tmp.
+func WithTempDir(dir string) Option { return option.New(identTempDir{}, dir) }
+
 // New validates cfg and returns a Store. It does not contact the store.
-func New(cfg Config) (*Store, error) {
+func New(cfg Config, options ...Option) (*Store, error) {
 	if cfg.Endpoint == "" || cfg.Bucket == "" || cfg.AccessKey == "" || cfg.SecretKey == "" {
 		return nil, fmt.Errorf("s3: endpoint, bucket, access key and secret key are required")
 	}
@@ -67,7 +82,14 @@ func New(cfg Config) (*Store, error) {
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("s3: invalid endpoint %q", cfg.Endpoint)
 	}
-	return &Store{cfg: cfg, client: newClient(), scheme: u.Scheme, host: u.Host}, nil
+	s := &Store{cfg: cfg, client: newClient(), scheme: u.Scheme, host: u.Host}
+	for _, o := range options {
+		switch o.Ident().(type) {
+		case identTempDir:
+			s.tempDir = option.MustGet[string](o)
+		}
+	}
+	return s, nil
 }
 
 // idleTimeout is how long a connection may make no progress — no bytes read or
@@ -160,7 +182,7 @@ func (s *Store) objectPath(key string) string {
 func (s *Store) Put(ctx context.Context, key string, r io.Reader) (int64, error) {
 	// Buffer to a temp file so we can compute the payload hash (required to sign
 	// the request) and the content length, and replay the body if needed.
-	tmp, err := os.CreateTemp("", "castlet-s3put-*")
+	tmp, err := os.CreateTemp(s.tempDir, "castlet-s3put-*")
 	if err != nil {
 		return 0, fmt.Errorf("s3: temp file: %w", err)
 	}
@@ -210,7 +232,7 @@ func (s *Store) Get(ctx context.Context, key string) (io.ReadSeekCloser, int64, 
 	}
 	// The interface promises a seekable reader (for HTTP range serving), but an
 	// S3 body is a stream; buffer it to a temp file that cleans itself up.
-	tmp, err := os.CreateTemp("", "castlet-s3get-*")
+	tmp, err := os.CreateTemp(s.tempDir, "castlet-s3get-*")
 	if err != nil {
 		drain(resp)
 		return nil, 0, fmt.Errorf("s3: temp file: %w", err)

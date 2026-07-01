@@ -35,8 +35,9 @@ import (
 
 // Transcriber runs an external command to transcribe audio.
 type Transcriber struct {
-	name string   // executable
-	args []string // argument template; the token {{audio}} is replaced with the temp file path
+	name    string   // executable
+	args    []string // argument template; the token {{audio}} is replaced with the temp file path
+	tempDir string   // staging dir for the audio temp file; "" means os.TempDir()
 }
 
 var _ transcribe.Transcriber = (*Transcriber)(nil)
@@ -46,10 +47,19 @@ type Option = option.Interface
 
 type identArgs struct{}
 
+type identTempDir struct{}
+
 // WithArgs sets the argument template. The literal token "{{audio}}" in any
 // argument is replaced with the path to the temporary audio file. The default
 // is []string{"{{audio}}"}.
 func WithArgs(args ...string) Option { return option.New(identArgs{}, args) }
+
+// WithTempDir sets the directory in which the audio is staged to a temporary
+// file before the command runs. When unset the OS default (os.TempDir) is used,
+// so existing callers are unaffected. Point this at a directory on the volume
+// provisioned for media so large or concurrent transcriptions cannot exhaust
+// the system /tmp.
+func WithTempDir(dir string) Option { return option.New(identTempDir{}, dir) }
 
 // New returns a Transcriber that invokes the program name. By default the only
 // argument is the audio file path.
@@ -59,13 +69,15 @@ func New(name string, options ...Option) *Transcriber {
 		switch o.Ident().(type) {
 		case identArgs:
 			t.args = option.MustGet[[]string](o)
+		case identTempDir:
+			t.tempDir = option.MustGet[string](o)
 		}
 	}
 	return t
 }
 
 func (t *Transcriber) Transcribe(ctx context.Context, in transcribe.Input) (*transcribe.Result, error) {
-	tmp, err := os.CreateTemp("", "castlet-audio-*"+extFor(in))
+	tmp, err := os.CreateTemp(t.tempDir, "castlet-audio-*"+extFor(in))
 	if err != nil {
 		return nil, fmt.Errorf("command: temp file: %w", err)
 	}
