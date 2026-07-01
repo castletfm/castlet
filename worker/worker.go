@@ -37,6 +37,12 @@ const (
 	defaultTimeoutMax    = 2 * time.Hour   // cap; also the fallback when duration is unknown
 )
 
+// defaultSettleTimeout bounds each shutdown-surviving bookkeeping step. The
+// settlement writes and the queue state transition each get their OWN budget so
+// that even a settlement that consumes its full timeout cannot leave the
+// subsequent Nack/Ack running on an already-expired context.
+const defaultSettleTimeout = 10 * time.Second
+
 // JobTimeoutPolicy derives the per-job transcription timeout from the episode's
 // audio length. A single fixed timeout permanently fails long episodes, so the
 // bound scales with the input: timeout = Factor * durationSecs, clamped to
@@ -86,22 +92,24 @@ func (p JobTimeoutPolicy) timeout(durationSecs int) time.Duration {
 // Worker transcribes episodes off the job queue. The receiver holds only
 // configuration and is safe to Run multiple times.
 type Worker struct {
-	store        store.Store
-	blobs        blob.BlobStore
-	queue        queue.JobQueue
-	transcriber  transcribe.Transcriber
-	pollInterval time.Duration
-	jobTimeout   JobTimeoutPolicy
-	logger       *slog.Logger
+	store         store.Store
+	blobs         blob.BlobStore
+	queue         queue.JobQueue
+	transcriber   transcribe.Transcriber
+	pollInterval  time.Duration
+	jobTimeout    JobTimeoutPolicy
+	settleTimeout time.Duration
+	logger        *slog.Logger
 }
 
 // Option configures New.
 type Option = option.Interface
 
 type (
-	identPollInterval struct{}
-	identJobTimeout   struct{}
-	identLogger       struct{}
+	identPollInterval  struct{}
+	identJobTimeout    struct{}
+	identSettleTimeout struct{}
+	identLogger        struct{}
 )
 
 // WithPollInterval sets how often the worker polls when the queue is empty
@@ -113,18 +121,24 @@ func WithPollInterval(d time.Duration) Option { return option.New(identPollInter
 // zero field falls back to its default (factor 1.5, min 5m, max 2h).
 func WithJobTimeout(p JobTimeoutPolicy) Option { return option.New(identJobTimeout{}, p) }
 
+// WithSettleTimeout sets the per-step budget for the shutdown-surviving terminal
+// bookkeeping (settlement writes and the Ack/Nack queue transition), default
+// 10s. A non-positive value restores the default.
+func WithSettleTimeout(d time.Duration) Option { return option.New(identSettleTimeout{}, d) }
+
 // WithLogger sets the structured logger (default slog.Default()).
 func WithLogger(l *slog.Logger) Option { return option.New(identLogger{}, l) }
 
 // New constructs a Worker from its dependencies.
 func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, tr transcribe.Transcriber, options ...Option) *Worker {
 	w := &Worker{
-		store:        st,
-		blobs:        blobs,
-		queue:        q,
-		transcriber:  tr,
-		pollInterval: 5 * time.Second,
-		logger:       slog.Default(),
+		store:         st,
+		blobs:         blobs,
+		queue:         q,
+		transcriber:   tr,
+		pollInterval:  5 * time.Second,
+		settleTimeout: defaultSettleTimeout,
+		logger:        slog.Default(),
 	}
 	for _, o := range options {
 		switch o.Ident().(type) {
@@ -132,6 +146,10 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, tr transcribe.T
 			w.pollInterval = option.MustGet[time.Duration](o)
 		case identJobTimeout:
 			w.jobTimeout = option.MustGet[JobTimeoutPolicy](o)
+		case identSettleTimeout:
+			if d := option.MustGet[time.Duration](o); d > 0 {
+				w.settleTimeout = d
+			}
 		case identLogger:
 			w.logger = option.MustGet[*slog.Logger](o)
 		}
@@ -198,6 +216,15 @@ func (w *Worker) loop(ctx context.Context) error {
 	}
 }
 
+// settlement is the durable terminal outcome a job produced. It is applied by
+// settle() under the shutdown-surviving context after the (cancellable) work
+// has finished, so the episode's final state is recorded even on SIGTERM.
+type settlement struct {
+	ep         *model.Episode         // episode to update
+	transcript *model.Transcript      // saved before the status write when non-nil
+	status     model.TranscriptStatus // terminal transcript status to persist
+}
+
 // processOne claims and handles a single job. It reports whether a job was
 // processed (so the caller can keep draining) and any handling error.
 func (w *Worker) processOne(ctx context.Context) (bool, error) {
@@ -208,48 +235,120 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 	if job == nil {
 		return false, nil
 	}
-	if herr := w.handle(ctx, job); herr != nil {
-		dead, nerr := w.queue.Nack(ctx, job.ID, herr)
-		if nerr != nil {
-			return true, fmt.Errorf("nack: %w (cause: %v)", nerr, herr)
-		}
-		if dead {
-			w.markTranscript(ctx, job, model.TranscriptFailed)
-		}
-		return true, herr
+	s, herr := w.handle(ctx, job)
+
+	// The terminal bookkeeping (transcript save, status write, and Ack/Nack)
+	// must survive shutdown. handle() runs the transcription under ctx (so the
+	// work itself stops on SIGTERM), but settling with that same, now-cancelled
+	// ctx would fail with context.Canceled: the job would be acked "done" while
+	// the episode stayed stuck mid-transcription. Each terminal step below runs
+	// under its OWN fresh background-derived timeout, so the queue state
+	// transition (Nack/Ack) is always durable even if the settlement writes
+	// consumed their whole budget.
+	if herr != nil {
+		return true, w.fail(job, herr)
 	}
-	return true, w.queue.Ack(ctx, job.ID)
+	// Persist the terminal outcome durably BEFORE acking. If the settlement
+	// write is lost, do NOT ack the job as success: Nack it so it is retried
+	// rather than left terminal-done with the episode stuck processing.
+	if s != nil {
+		ctx2, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
+		err := w.settle(ctx2, s)
+		cancel()
+		if err != nil {
+			return true, w.fail(job, err)
+		}
+	}
+	return true, w.ack(job)
 }
 
-func (w *Worker) handle(ctx context.Context, job *model.Job) error {
+// ack marks a job done under a fresh shutdown-surviving context, independent of
+// whatever the settlement step consumed, so a successful job is never left in
+// "processing" because the ack ran on an already-expired context.
+func (w *Worker) ack(job *model.Job) error {
+	ctx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
+	defer cancel()
+	return w.queue.Ack(ctx, job.ID)
+}
+
+// fail Nacks a job and, if the queue reports it permanently dead, records the
+// terminal failed status. It derives its OWN fresh bounded context (not the
+// settlement context, which may already be exhausted) so the queue state
+// transition always runs live. cause is returned so the loop can log it.
+func (w *Worker) fail(job *model.Job, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
+	defer cancel()
+	dead, nerr := w.queue.Nack(ctx, job.ID, cause)
+	if nerr != nil {
+		return fmt.Errorf("nack: %w (cause: %v)", nerr, cause)
+	}
+	if dead {
+		// The dead-job status settlement gets its OWN fresh budget: Nack above
+		// may have consumed most/all of ctx, and reusing it here could skip the
+		// permanent TranscriptFailed write on an expired context, stranding the
+		// episode in "processing" even though the job is dead.
+		markCtx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
+		defer cancel()
+		w.markTranscript(markCtx, job, model.TranscriptFailed)
+	}
+	return cause
+}
+
+// settle applies a job's terminal outcome under the shutdown-surviving context:
+// the transcript (if any) then the episode status. It returns an error if either
+// write fails so the caller can avoid acking a job whose result was not durably
+// recorded.
+func (w *Worker) settle(ctx context.Context, s *settlement) error {
+	if s.transcript != nil {
+		if err := w.store.SaveTranscript(ctx, s.transcript); err != nil {
+			return fmt.Errorf("worker: save transcript: %w", err)
+		}
+	}
+	if err := w.setStatus(ctx, s.ep, s.status); err != nil {
+		return err
+	}
+	if s.transcript != nil {
+		w.logger.Info("transcribed episode", "episode", s.ep.ID, "segments", len(s.transcript.Segments))
+	}
+	return nil
+}
+
+// handle runs a job's work under ctx and returns the terminal settlement to be
+// persisted (nil when there is nothing to record, e.g. a deleted episode). The
+// error is non-nil only when the work itself failed.
+func (w *Worker) handle(ctx context.Context, job *model.Job) (*settlement, error) {
 	switch job.Kind {
 	case model.JobTranscribe:
 		return w.transcribe(ctx, job)
 	default:
-		return fmt.Errorf("worker: unknown job kind %q", job.Kind)
+		return nil, fmt.Errorf("worker: unknown job kind %q", job.Kind)
 	}
 }
 
-func (w *Worker) transcribe(ctx context.Context, job *model.Job) error {
+func (w *Worker) transcribe(ctx context.Context, job *model.Job) (*settlement, error) {
 	var p model.TranscribePayload
 	if err := json.Unmarshal([]byte(job.Payload), &p); err != nil {
-		return fmt.Errorf("worker: bad payload: %w", err)
+		return nil, fmt.Errorf("worker: bad payload: %w", err)
 	}
 
 	ep, err := w.store.EpisodeByID(ctx, p.EpisodeID)
 	if errors.Is(err, store.ErrNotFound) {
-		// Episode was deleted before transcription ran; nothing to do.
-		return nil
+		// Episode was deleted before transcription ran; nothing to settle.
+		return nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	w.setStatus(ctx, ep, model.TranscriptProcessing)
+	// Non-terminal progress marker: best-effort under the cancellable work ctx.
+	if err := w.setStatus(ctx, ep, model.TranscriptProcessing); err != nil {
+		w.logger.Error("update transcript status", "episode", ep.ID,
+			"status", model.TranscriptProcessing, "error", err)
+	}
 
 	rc, _, err := w.blobs.Get(ctx, ep.MediaKey)
 	if err != nil {
-		return fmt.Errorf("worker: open media: %w", err)
+		return nil, fmt.Errorf("worker: open media: %w", err)
 	}
 	defer rc.Close()
 
@@ -268,38 +367,33 @@ func (w *Worker) transcribe(ctx context.Context, job *model.Job) error {
 	})
 	if errors.Is(err, transcribe.ErrUnsupported) {
 		// No transcriber configured: settle to "none", not a failure.
-		w.setStatus(ctx, ep, model.TranscriptNone)
-		return nil
+		return &settlement{ep: ep, status: model.TranscriptNone}, nil
 	}
 	if err != nil {
-		return fmt.Errorf("worker: transcribe: %w", err)
+		return nil, fmt.Errorf("worker: transcribe: %w", err)
 	}
 
 	tr := &model.Transcript{EpisodeID: ep.ID, Language: res.Language, CreatedAt: time.Now()}
 	for _, s := range res.Segments {
 		tr.Segments = append(tr.Segments, model.Segment{StartSecs: s.StartSecs, EndSecs: s.EndSecs, Text: s.Text})
 	}
-	if err := w.store.SaveTranscript(ctx, tr); err != nil {
-		return fmt.Errorf("worker: save transcript: %w", err)
-	}
-	w.setStatus(ctx, ep, model.TranscriptDone)
-	w.logger.Info("transcribed episode", "episode", ep.ID, "segments", len(tr.Segments))
-	return nil
+	return &settlement{ep: ep, transcript: tr, status: model.TranscriptDone}, nil
 }
 
-// setStatus records the episode's transcript status with a targeted UPDATE.
-// It deliberately does NOT write the whole row: transcription runs for minutes,
+// setStatus records the episode's transcript status with a targeted UPDATE and
+// returns any write error so terminal callers can gate the Ack on it. It
+// deliberately does NOT write the whole row: transcription runs for minutes,
 // during which an admin may edit the episode's title/description/language/
 // position. A full read-modify-write from the worker's stale copy would silently
 // revert those edits (lost update), so only transcript_status/updated_at change.
-func (w *Worker) setStatus(ctx context.Context, ep *model.Episode, status model.TranscriptStatus) {
+func (w *Worker) setStatus(ctx context.Context, ep *model.Episode, status model.TranscriptStatus) error {
 	now := time.Now()
 	if err := w.store.SetEpisodeTranscriptStatus(ctx, ep.ID, status, now); err != nil {
-		w.logger.Error("update transcript status", "episode", ep.ID, "status", status, "error", err)
-		return
+		return fmt.Errorf("worker: update transcript status: %w", err)
 	}
 	ep.TranscriptStatus = status
 	ep.UpdatedAt = now
+	return nil
 }
 
 // markTranscript loads the job's episode and records a terminal transcript
@@ -313,5 +407,7 @@ func (w *Worker) markTranscript(ctx context.Context, job *model.Job, status mode
 	if err != nil {
 		return
 	}
-	w.setStatus(ctx, ep, status)
+	if err := w.setStatus(ctx, ep, status); err != nil {
+		w.logger.Error("mark transcript status", "episode", ep.ID, "status", status, "error", err)
+	}
 }
