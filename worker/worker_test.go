@@ -613,8 +613,9 @@ func TestWorkerReclaimDuringJobCannotDowngrade(t *testing.T) {
 		job:    seedClaimedJob(t, st, "j1", "e1"),
 		nacked: make(chan struct{}),
 	}
-	_, err = worker.New(st, blobs, q, reclaimingTranscriber{st: st},
-		worker.WithPollInterval(10*time.Millisecond)).Run(wctx)
+	reg := metrics.New()
+	ctrl, err := worker.New(st, blobs, q, reclaimingTranscriber{st: st},
+		worker.WithPollInterval(10*time.Millisecond), worker.WithMetrics(reg)).Run(wctx)
 	require.NoError(t, err)
 
 	waitStatus(t, st, "e1", model.TranscriptDone)
@@ -638,6 +639,29 @@ func TestWorkerReclaimDuringJobCannotDowngrade(t *testing.T) {
 	case <-q.nacked:
 		t.Fatal("a stale settlement must be discarded silently, not turned into a Nack")
 	default:
+	}
+
+	// Drain the worker to a full stop so the original attempt's terminal
+	// bookkeeping (its stale, discarded settlement) has definitely run before we
+	// inspect metrics. A stale no-op is not a real success: it must not increment
+	// the success counter nor advance last-success — the reclaiming attempt owns
+	// the outcome. Counting it here would double-count and wrongly move the
+	// worker's last-success forward.
+	cancel()
+	require.NoError(t, ctrl.Wait())
+
+	var b strings.Builder
+	_, err = reg.WriteTo(&b)
+	require.NoError(t, err)
+	out := b.String()
+	require.NotContains(t, out, `transcription_jobs_total{outcome="success"}`,
+		"a stale reclaimed settlement must not be counted as a success")
+	// last-success has no value written (only its # HELP/# TYPE headers), so no
+	// data line for it should exist. A data line starts with the bare metric name
+	// and a space; the header lines start with "# ".
+	for ln := range strings.SplitSeq(out, "\n") {
+		require.False(t, strings.HasPrefix(ln, "worker_last_success_timestamp_seconds "),
+			"a stale reclaimed settlement must not advance last-success, got line: %q", ln)
 	}
 }
 

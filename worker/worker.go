@@ -294,13 +294,20 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 	// recorded, so Nack the job for retry rather than leave it done with the
 	// episode stuck processing.
 	ctx2, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
-	serr := w.settleAndComplete(ctx2, job, s)
+	committed, serr := w.settleAndComplete(ctx2, job, s)
 	cancel()
 	if serr != nil {
 		return true, w.fail(job, serr)
 	}
-	w.metrics.Inc(metricJobsTotal, "outcome", "success")
-	w.metrics.Set(metricLastSuccess, float64(time.Now().Unix()))
+	// Only a settlement that actually committed is a real success. When the claim
+	// was lost to a reclaim the settlement is discarded as a no-op (committed ==
+	// false); the reclaiming attempt owns the job and will record its own outcome,
+	// so counting this stale no-op would double-count and wrongly advance
+	// last-success.
+	if committed {
+		w.metrics.Inc(metricJobsTotal, "outcome", "success")
+		w.metrics.Set(metricLastSuccess, float64(time.Now().Unix()))
+	}
 	return true, nil
 }
 
@@ -352,20 +359,25 @@ func (w *Worker) fail(job *model.Job, cause error) error {
 // episode now — so it is not an error: discard the stale result, changing
 // nothing. Any other write error is returned so the caller Nacks a job whose
 // result was not durably recorded.
-func (w *Worker) settleAndComplete(ctx context.Context, job *model.Job, s *settlement) error {
-	err := w.store.SettleEpisodeTranscriptAndCompleteJob(ctx, job.ID, job.Attempts, s.ep.ID, s.transcript, s.status, time.Now())
+//
+// committed reports whether the settlement was actually persisted: true only when
+// the fenced write landed, false when it was discarded as a stale no-op. The
+// caller uses this to record a success outcome ONLY for a real commit — a stale
+// no-op belongs to the reclaiming attempt and must not be counted here.
+func (w *Worker) settleAndComplete(ctx context.Context, job *model.Job, s *settlement) (committed bool, err error) {
+	err = w.store.SettleEpisodeTranscriptAndCompleteJob(ctx, job.ID, job.Attempts, s.ep.ID, s.transcript, s.status, time.Now())
 	if errors.Is(err, store.ErrStaleClaim) {
 		w.logger.Warn("transcription claim lost to reclaim; discarding stale settlement",
 			"job", job.ID, "episode", s.ep.ID)
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("worker: settle episode transcript and complete job: %w", err)
+		return false, fmt.Errorf("worker: settle episode transcript and complete job: %w", err)
 	}
 	if s.transcript != nil {
 		w.logger.Info("transcribed episode", "episode", s.ep.ID, "segments", len(s.transcript.Segments))
 	}
-	return nil
+	return true, nil
 }
 
 // handle runs a job's work under ctx and returns the terminal settlement to be
