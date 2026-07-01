@@ -5,10 +5,16 @@ package config
 import (
 	"crypto/rand"
 	"flag"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
 )
+
+// minSessionKeyLen is the minimum length, in bytes, required for an
+// operator-supplied CASTLET_SESSION_KEY. It matches the size of the generated
+// fallback key and the HMAC-SHA256 block-relevant entropy floor.
+const minSessionKeyLen = 32
 
 // Config is the resolved configuration for `castlet serve`.
 type Config struct {
@@ -73,6 +79,9 @@ func Load(args []string) (*Config, error) {
 	}
 
 	if key := os.Getenv("CASTLET_SESSION_KEY"); key != "" {
+		if len(key) < minSessionKeyLen {
+			return nil, fmt.Errorf("CASTLET_SESSION_KEY must be at least %d bytes", minSessionKeyLen)
+		}
 		cfg.SessionKey = []byte(key)
 	} else {
 		cfg.SessionKey = randomKey()
