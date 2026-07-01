@@ -77,7 +77,7 @@ func New(cfg *config.Config) (*App, error) {
 		cfg:         cfg,
 		store:       st,
 		blobs:       blobs,
-		queue:       dbqueue.New(st),
+		queue:       dbqueue.New(st, dbqueue.WithLease(cfg.JobLease), dbqueue.WithMaxAttempts(cfg.JobMaxAttempts)),
 		transcriber: tr,
 		sessions:    session.NewManager(cfg.SessionKey, session.WithSecure(secure)),
 		authn:       authn,
@@ -107,8 +107,10 @@ func (a *App) Serve(ctx context.Context) error {
 	wk := worker.New(a.store, a.blobs, a.queue, a.transcriber,
 		worker.WithLogger(a.logger),
 		worker.WithMetrics(reg),
+		worker.WithPollInterval(a.cfg.WorkerPollInterval),
 		worker.WithJobTimeout(worker.JobTimeoutPolicy{
 			Factor: a.cfg.TranscribeTimeoutFactor,
+			Min:    a.cfg.TranscribeTimeoutMin,
 			Max:    a.cfg.TranscribeTimeout,
 		}),
 	)
@@ -122,6 +124,8 @@ func (a *App) Serve(ctx context.Context) error {
 		server.WithBaseURL(a.cfg.BaseURL),
 		server.WithSiteName(a.cfg.SiteName),
 		server.WithAllowSignup(a.cfg.AllowSignup),
+		server.WithMaxUploadBytes(a.cfg.MaxUploadBytes),
+		server.WithShutdownTimeout(a.cfg.ShutdownTimeout),
 		server.WithLogger(a.logger),
 		server.WithMetrics(reg),
 	}

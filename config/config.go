@@ -50,11 +50,20 @@ type Config struct {
 	TranscribeArgs    []string // argument template; "{{audio}}" is the audio path
 
 	// Per-job transcription timeout. The effective bound scales with the
-	// episode's audio length (factor * duration), clamped to a floor and to
-	// TranscribeTimeout. TranscribeTimeout is also the fallback cap used when an
-	// episode's duration is unknown.
+	// episode's audio length (factor * duration), clamped to a floor
+	// (TranscribeTimeoutMin) and to TranscribeTimeout. TranscribeTimeout is also
+	// the fallback cap used when an episode's duration is unknown.
 	TranscribeTimeout       time.Duration // max wall-clock per job / unknown-length fallback
 	TranscribeTimeoutFactor float64       // multiplier on the audio length
+	TranscribeTimeoutMin    time.Duration // floor on the derived per-job timeout
+
+	// Operational tuning knobs. Defaults match the components' built-in defaults,
+	// so leaving them unset preserves the out-of-the-box behavior.
+	ShutdownTimeout    time.Duration // graceful HTTP shutdown drain bound
+	WorkerPollInterval time.Duration // how often the worker polls an idle queue
+	JobLease           time.Duration // how long a claimed job stays invisible before reclaim
+	JobMaxAttempts     int           // attempts before a job is dead-lettered
+	MaxUploadBytes     int64         // cap on an episode audio upload, in bytes
 
 	LogLevel string // debug|info|warn|error
 }
@@ -72,7 +81,13 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.Transcriber, "transcriber", env("CASTLET_TRANSCRIBER", "null"), "transcriber backend: null|command")
 	fs.StringVar(&cfg.TranscribeCommand, "transcribe-command", env("CASTLET_TRANSCRIBE_COMMAND", ""), "executable for the command transcriber")
 	fs.DurationVar(&cfg.TranscribeTimeout, "transcribe-timeout", envDuration("CASTLET_TRANSCRIBE_TIMEOUT", 2*time.Hour), "max wall-clock per transcription job; also the fallback when audio duration is unknown")
-	fs.Float64Var(&cfg.TranscribeTimeoutFactor, "transcribe-timeout-factor", envFloat("CASTLET_TRANSCRIBE_TIMEOUT_FACTOR", 1.5), "multiply audio duration by this to derive the per-job timeout (clamped to a floor and --transcribe-timeout)")
+	fs.Float64Var(&cfg.TranscribeTimeoutFactor, "transcribe-timeout-factor", envFloat("CASTLET_TRANSCRIBE_TIMEOUT_FACTOR", 1.5), "multiply audio duration by this to derive the per-job timeout (clamped to --transcribe-timeout-min and --transcribe-timeout)")
+	fs.DurationVar(&cfg.TranscribeTimeoutMin, "transcribe-timeout-min", envDuration("CASTLET_TRANSCRIBE_TIMEOUT_MIN", 5*time.Minute), "floor on the per-job transcription timeout (covers model spin-up on short clips)")
+	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", envDuration("CASTLET_SHUTDOWN_TIMEOUT", 10*time.Second), "max time to wait for in-flight requests to drain on shutdown")
+	fs.DurationVar(&cfg.WorkerPollInterval, "worker-poll-interval", envDuration("CASTLET_WORKER_POLL_INTERVAL", 5*time.Second), "how often the transcription worker polls the queue when idle")
+	fs.DurationVar(&cfg.JobLease, "job-lease", envDuration("CASTLET_JOB_LEASE", 10*time.Minute), "how long a claimed job stays invisible before another worker may reclaim it")
+	fs.IntVar(&cfg.JobMaxAttempts, "job-max-attempts", envInt("CASTLET_JOB_MAX_ATTEMPTS", 5), "how many times a job is attempted before it is dead-lettered")
+	fs.Int64Var(&cfg.MaxUploadBytes, "max-upload-bytes", envInt64("CASTLET_MAX_UPLOAD_BYTES", 512<<20), "maximum episode audio upload size, in bytes")
 	fs.StringVar(&cfg.LogLevel, "log-level", env("CASTLET_LOG_LEVEL", "info"), "log level: debug|info|warn|error")
 	fs.BoolVar(&cfg.AllowSignup, "allow-signup", envBool("CASTLET_ALLOW_SIGNUP", false), "enable self-service local sign-up (disabled by default)")
 	fs.StringVar(&cfg.BlobStoreConfig, "blob-store-config", env("CASTLET_BLOB_STORE_CONFIG", ""), "path to a JSON file configuring the media blob store (default: local filesystem under data-dir)")
@@ -92,6 +107,27 @@ func Load(args []string) (*Config, error) {
 	cfg.OIDCAllowedDomains = parseDomains(*domains)
 	if cfg.OIDCRedirectURL == "" {
 		cfg.OIDCRedirectURL = strings.TrimRight(cfg.BaseURL, "/") + "/auth/oidc/callback"
+	}
+
+	// The operational knobs feed component constructors that misbehave on a
+	// non-positive value (e.g. time.NewTicker panics), so reject them here rather
+	// than let a bad value surface later.
+	for _, c := range []struct {
+		name string
+		ok   bool
+	}{
+		{"transcribe-timeout-min", cfg.TranscribeTimeoutMin > 0},
+		{"shutdown-timeout", cfg.ShutdownTimeout > 0},
+		{"worker-poll-interval", cfg.WorkerPollInterval > 0},
+		{"job-lease", cfg.JobLease > 0},
+		{"max-upload-bytes", cfg.MaxUploadBytes > 0},
+	} {
+		if !c.ok {
+			return nil, fmt.Errorf("--%s must be positive", c.name)
+		}
+	}
+	if cfg.JobMaxAttempts < 1 {
+		return nil, fmt.Errorf("--job-max-attempts must be at least 1")
 	}
 
 	if key := os.Getenv("CASTLET_SESSION_KEY"); key != "" {
@@ -150,6 +186,32 @@ func envDuration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// envInt reads an int env var; unset or unparseable falls back to def.
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// envInt64 reads an int64 env var; unset or unparseable falls back to def.
+func envInt64(key string, def int64) int64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 // envFloat reads a float env var; unset or unparseable falls back to def.

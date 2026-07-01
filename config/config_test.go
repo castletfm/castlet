@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadSessionKey(t *testing.T) {
@@ -76,6 +77,104 @@ func TestAllowSignupDefault(t *testing.T) {
 		}
 		if !cfg.AllowSignup {
 			t.Fatal("AllowSignup = false, want true when CASTLET_ALLOW_SIGNUP=true")
+		}
+	})
+}
+
+// TestOperationalKnobs covers the scalar operational tuning flags: the defaults
+// must match the components' built-in behavior, flags and env override, and a
+// non-positive value is rejected.
+func TestOperationalKnobs(t *testing.T) {
+	t.Setenv("CASTLET_SESSION_KEY", strings.Repeat("x", minSessionKeyLen))
+
+	t.Run("defaults preserve current behavior", func(t *testing.T) {
+		cfg, err := Load(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ShutdownTimeout != 10*time.Second {
+			t.Fatalf("ShutdownTimeout = %v, want 10s", cfg.ShutdownTimeout)
+		}
+		if cfg.WorkerPollInterval != 5*time.Second {
+			t.Fatalf("WorkerPollInterval = %v, want 5s", cfg.WorkerPollInterval)
+		}
+		if cfg.JobLease != 10*time.Minute {
+			t.Fatalf("JobLease = %v, want 10m", cfg.JobLease)
+		}
+		if cfg.JobMaxAttempts != 5 {
+			t.Fatalf("JobMaxAttempts = %d, want 5", cfg.JobMaxAttempts)
+		}
+		if cfg.MaxUploadBytes != 512<<20 {
+			t.Fatalf("MaxUploadBytes = %d, want %d", cfg.MaxUploadBytes, int64(512<<20))
+		}
+		if cfg.TranscribeTimeoutMin != 5*time.Minute {
+			t.Fatalf("TranscribeTimeoutMin = %v, want 5m", cfg.TranscribeTimeoutMin)
+		}
+	})
+
+	t.Run("overridden via flags", func(t *testing.T) {
+		cfg, err := Load([]string{
+			"--shutdown-timeout", "20s",
+			"--worker-poll-interval", "1s",
+			"--job-lease", "30m",
+			"--job-max-attempts", "3",
+			"--max-upload-bytes", "1048576",
+			"--transcribe-timeout-min", "2m",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.ShutdownTimeout != 20*time.Second {
+			t.Fatalf("ShutdownTimeout = %v, want 20s", cfg.ShutdownTimeout)
+		}
+		if cfg.WorkerPollInterval != time.Second {
+			t.Fatalf("WorkerPollInterval = %v, want 1s", cfg.WorkerPollInterval)
+		}
+		if cfg.JobLease != 30*time.Minute {
+			t.Fatalf("JobLease = %v, want 30m", cfg.JobLease)
+		}
+		if cfg.JobMaxAttempts != 3 {
+			t.Fatalf("JobMaxAttempts = %d, want 3", cfg.JobMaxAttempts)
+		}
+		if cfg.MaxUploadBytes != 1048576 {
+			t.Fatalf("MaxUploadBytes = %d, want 1048576", cfg.MaxUploadBytes)
+		}
+		if cfg.TranscribeTimeoutMin != 2*time.Minute {
+			t.Fatalf("TranscribeTimeoutMin = %v, want 2m", cfg.TranscribeTimeoutMin)
+		}
+	})
+
+	t.Run("overridden via env", func(t *testing.T) {
+		t.Setenv("CASTLET_JOB_MAX_ATTEMPTS", "7")
+		t.Setenv("CASTLET_MAX_UPLOAD_BYTES", "2048")
+		t.Setenv("CASTLET_JOB_LEASE", "45m")
+		cfg, err := Load(nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.JobMaxAttempts != 7 {
+			t.Fatalf("JobMaxAttempts = %d, want 7", cfg.JobMaxAttempts)
+		}
+		if cfg.MaxUploadBytes != 2048 {
+			t.Fatalf("MaxUploadBytes = %d, want 2048", cfg.MaxUploadBytes)
+		}
+		if cfg.JobLease != 45*time.Minute {
+			t.Fatalf("JobLease = %v, want 45m", cfg.JobLease)
+		}
+	})
+
+	t.Run("non-positive values rejected", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"--shutdown-timeout", "0"},
+			{"--worker-poll-interval", "-1s"},
+			{"--job-lease", "0"},
+			{"--job-max-attempts", "0"},
+			{"--max-upload-bytes", "0"},
+			{"--transcribe-timeout-min", "-5m"},
+		} {
+			if _, err := Load(args); err == nil {
+				t.Fatalf("expected error for %v, got nil", args)
+			}
 		}
 	})
 }
