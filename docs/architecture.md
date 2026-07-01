@@ -171,8 +171,13 @@ completing the job). `Ack` is reserved for completions with no episode side
 effects; `Nack` remains the failure/dead-letter path.
 
 The default `dbqueue` implements this over the metadata `Store`, which is why
-`Store` carries the job methods (`EnqueueJob`, `JobByID`, `ClaimJob`,
-`CompleteJob`, `RescheduleJob`, `FailJob`). `ClaimJob` leases a job (marks it
+`Store` carries the job methods (`EnqueueJob`, `EnqueueTranscriptionJob`,
+`JobByID`, `ClaimJob`, `CompleteJob`, `RescheduleJob`, `FailJob`).
+`EnqueueTranscriptionJob` inserts a transcription job AND marks the referenced
+episode's `transcript_status = pending` in ONE transaction, so the two can never
+diverge (either both commit or, on any error, neither does — never a pending
+episode with no job, nor a queued job whose episode status was left stale); it
+backs `JobQueue.EnqueueTranscription`. `ClaimJob` leases a job (marks it
 `processing`, pushes `run_after` out, and increments `Attempts`) so a crashed
 worker's job becomes reclaimable once its lease expires; it claims with a guarded
 conditional `UPDATE` that commits only when it affects exactly one row, so two
@@ -222,9 +227,20 @@ build gains the OIDC columns/index on the next `castlet migrate` or `serve`.
    the upload into `BlobStore.Put` → gets a `media_key`; `media_kind` is derived
    from the upload's content type (audio or video).
 2. `Store.CreateEpisode` persists metadata (`status=draft`,
-   `transcript_status=pending`).
-3. Handler enqueues a `transcribe` job via `JobQueue.Enqueue`.
+   `transcript_status=none` — not yet queued).
+3. Handler calls `JobQueue.EnqueueTranscription(ctx, episodeID)`, which routes to
+   the store's `EnqueueTranscriptionJob`: in ONE sqlite transaction it inserts the
+   `transcribe` job AND flips the episode to `transcript_status=pending`. The two
+   are indivisible — either both commit or neither does — so an episode is never
+   left pending with no job to run it, and no job is ever queued against a stale
+   episode status. On failure the episode simply keeps its `none` status with no
+   job, and the UI still offers a re-transcribe.
 4. Admin publishes → `status=published`, `published_at=now`.
+
+Re-transcribe (`POST` from the admin episode page) takes the same atomic path:
+it calls `JobQueue.EnqueueTranscription` (rejecting episodes already `pending`/
+`processing`), so a fresh job and the episode's pending state are set together or
+not at all.
 
 **Transcription (worker):**
 1. `Worker` loop calls `JobQueue.Dequeue(ctx, JobTranscribe)` (atomic; marks job
