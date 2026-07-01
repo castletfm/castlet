@@ -56,6 +56,9 @@ type Server struct {
 	renderer    Renderer
 	authn       auth.Authenticator // nil when OIDC is disabled
 	metrics     *metrics.Registry
+	// loginLimiter throttles password-login brute force per client IP. OIDC SSO
+	// and GET routes are unaffected.
+	loginLimiter *loginLimiter
 
 	addr            string
 	baseURL         string
@@ -145,6 +148,7 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *sessi
 		shutdownTimeout: 10 * time.Second,
 		logger:          slog.Default(),
 		now:             time.Now,
+		loginLimiter:    newLoginLimiter(loginRateLimitMax, loginRateLimitWindow, loginLimiterMaxEntries),
 	}
 	for _, o := range options {
 		switch o.Ident().(type) {

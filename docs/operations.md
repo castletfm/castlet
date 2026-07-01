@@ -92,6 +92,22 @@ the media root), `--site-name`, `--log-level` (`debug|info|warn|error`), and the
 transcription flags `--transcriber` (`null`|`command`), `--transcribe-command`,
 `--transcribe-args`.
 
+### Operational tuning knobs
+
+Scalar server/worker/queue knobs. Every one **defaults to the value that was
+previously hardcoded**, so leaving them unset changes nothing; tune them only if
+your workload needs it. Durations take Go duration syntax (`10s`, `30m`, `2h`);
+a non-positive value is rejected at startup.
+
+| Flag | Env | Default | Notes |
+|------|-----|---------|-------|
+| `--shutdown-timeout` | `CASTLET_SHUTDOWN_TIMEOUT` | `10s` | How long a context-driven shutdown waits for in-flight requests to drain before remaining connections are force-closed. |
+| `--worker-poll-interval` | `CASTLET_WORKER_POLL_INTERVAL` | `5s` | How often the transcription worker polls the queue when idle. When a job is found the queue is drained without waiting for the next tick. |
+| `--job-lease` | `CASTLET_JOB_LEASE` | `10m` | How long a claimed job stays invisible before another worker may reclaim it. Governs *reclaim* only; it does not kill a running job. Raise it above your largest expected job runtime to avoid redundant overlap. |
+| `--job-max-attempts` | `CASTLET_JOB_MAX_ATTEMPTS` | `5` | Attempts a job gets before it is dead-lettered (permanently failed). Must be at least 1. |
+| `--max-upload-bytes` | `CASTLET_MAX_UPLOAD_BYTES` | `536870912` (512 MiB) | Maximum episode audio upload size, in bytes. |
+| `--transcribe-timeout-min` | `CASTLET_TRANSCRIBE_TIMEOUT_MIN` | `5m` | Floor on the per-job transcription timeout (covers model spin-up on short clips). Companion to `--transcribe-timeout` (cap) and `--transcribe-timeout-factor` (multiplier). |
+
 ## Reverse proxy / TLS
 
 Castlet serves plain HTTP and has no built-in TLS. In production, run it behind
