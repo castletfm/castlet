@@ -1,0 +1,38 @@
+# Keep the build context small and reproducible.
+
+# VCS and worktrees
+.git
+.gitignore
+.worktrees
+
+# Agent / review scratch
+.tmp
+.review-gauntlet
+CLAUDE.md
+AGENTS.md
+
+# Local data / runtime artifacts
+data
+*.db
+*.sqlite
+*.sqlite3
+
+# Build output
+castlet
+/out
+
+# Tests and CI (not needed to build the binary)
+**/*_test.go
+.github
+
+# Docs and examples (containers/scripts not part of the server build)
+docs
+examples
+README.md
+LICENSE
+
+# Editor / OS noise
+.vscode
+.idea
+*.swp
+.DS_Store
