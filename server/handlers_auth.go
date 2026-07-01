@@ -69,25 +69,29 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Look up by the canonical form so a login with different casing than at
 	// signup ("Alice@Example.com" vs "alice@example.com") still finds the account.
-	// A malformed address cannot match any account: fall through to the same
-	// invalid-credentials response rather than short-circuiting, so the form never
-	// reveals whether an address is well-formed or exists.
+	// A malformed address must never authenticate: only a successfully canonicalized
+	// email is eligible to be a real login (canonOK). We still run the lookup and a
+	// bcrypt compare below so the response time never reveals whether the address is
+	// well-formed or exists — but a malformed address (which could otherwise match a
+	// legacy/direct-write row stored verbatim) can never satisfy realAccount.
 	lookup := rawEmail
+	canonOK := false
 	if canonical, cerr := email.Canonical(rawEmail); cerr == nil {
 		lookup = canonical
+		canonOK = true
 	}
 
 	user, err := s.store.UserByEmail(r.Context(), lookup)
 
-	// Pick the hash to verify against. For an unknown email or an OIDC-only
-	// account (no local password), fall back to the constant dummy hash so the
-	// bcrypt comparison below always runs; otherwise the response time would
+	// Pick the hash to verify against. For a malformed/unknown email or an
+	// OIDC-only account (no local password), fall back to the constant dummy hash
+	// so the bcrypt comparison below always runs; otherwise the response time would
 	// reveal whether the account exists. realAccount records whether this is a
-	// genuine local login, so a chance match against the dummy hash can never
-	// authenticate.
+	// genuine local login (requires a well-formed email), so neither a chance match
+	// against the dummy hash nor a malformed-email row can authenticate.
 	hash := dummyPasswordHash
 	realAccount := 0
-	if err == nil && user.PasswordHash != "" {
+	if canonOK && err == nil && user.PasswordHash != "" {
 		hash = []byte(user.PasswordHash)
 		realAccount = 1
 	}
