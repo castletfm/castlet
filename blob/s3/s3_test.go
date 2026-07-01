@@ -364,29 +364,43 @@ func TestGetStagesInConfiguredTempDir(t *testing.T) {
 	assert.Empty(t, stagedFiles(t, dir, "castlet-s3get-"), "staged temp file must be removed on reader Close")
 }
 
-// TestDefaultTempDirIsOSTempDir proves that without WithTempDir the store leaves
-// tempDir empty and stages under os.TempDir(). TMPDIR (honored by os.TempDir on
-// unix) is pointed at a scratch dir so the staged file can be observed there.
-func TestDefaultTempDirIsOSTempDir(t *testing.T) {
+// TestPutRemovesStagedFileOnHTTPError proves the buffered temp file is removed
+// even when the object store returns a non-2xx status (Put fails after staging).
+func TestPutRemovesStagedFileOnHTTPError(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("TMPDIR", dir)
-	require.Equal(t, dir, os.TempDir(), "test requires os.TempDir to honor TMPDIR")
-
-	staged := make(chan []string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(io.Discard, r.Body)
-		staged <- stagedFiles(t, dir, "castlet-s3put-")
-		w.WriteHeader(http.StatusOK)
+		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
 
-	s, err := New(Config{Endpoint: srv.URL, Bucket: "b", AccessKey: "AK", SecretKey: "SK"})
+	s, err := New(Config{Endpoint: srv.URL, Bucket: "b", AccessKey: "AK", SecretKey: "SK"}, WithTempDir(dir))
 	require.NoError(t, err)
-	assert.Empty(t, s.tempDir, "default store must leave tempDir unset")
 
-	_, err = s.Put(context.Background(), "key", strings.NewReader("hi"))
+	_, err = s.Put(context.Background(), "key", strings.NewReader("hello world"))
+	require.Error(t, err, "a non-2xx status must fail Put")
+	assert.Empty(t, stagedFiles(t, dir, "castlet-s3put-"), "staged temp file must be removed on Put error")
+}
+
+// TestGetRemovesStagedFileOnCopyError proves the buffered temp file is removed
+// when copying the response body fails (here the server declares a longer
+// Content-Length than it delivers, so the client's io.Copy hits an unexpected
+// EOF after the temp file is created).
+func TestGetRemovesStagedFileOnCopyError(t *testing.T) {
+	dir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "short") // fewer bytes than promised, then close
+	}))
+	defer srv.Close()
+
+	s, err := New(Config{Endpoint: srv.URL, Bucket: "b", AccessKey: "AK", SecretKey: "SK"}, WithTempDir(dir))
 	require.NoError(t, err)
-	require.Len(t, <-staged, 1, "default Put must stage under os.TempDir()")
+
+	_, _, err = s.Get(context.Background(), "key")
+	require.Error(t, err, "a truncated body must fail Get")
+	assert.Empty(t, stagedFiles(t, dir, "castlet-s3get-"), "staged temp file must be removed on Get copy error")
 }
 
 func TestURIEncode(t *testing.T) {

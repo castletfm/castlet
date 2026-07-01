@@ -210,6 +210,12 @@ func (a *App) Serve(ctx context.Context) error {
 	// srv.Run binds the listener; both can fail synchronously (e.g. the address
 	// is already in use). Doing this before the worker starts means such a
 	// failure returns with no background goroutine running to race App.Close.
+	// Stage streamed uploads on the data volume, not the system /tmp, so large or
+	// concurrent uploads cannot exhaust it.
+	uploadStaging, err := stagingDir(a.cfg)
+	if err != nil {
+		return err
+	}
 	opts := []server.Option{
 		server.WithAddr(a.cfg.Addr),
 		server.WithBaseURL(a.cfg.BaseURL),
@@ -217,6 +223,7 @@ func (a *App) Serve(ctx context.Context) error {
 		server.WithAllowSignup(a.cfg.AllowSignup),
 		server.WithLogger(a.logger),
 		server.WithMetrics(reg),
+		server.WithUploadTempDir(uploadStaging),
 	}
 	opts = append(opts, serverTuningOptions(a.cfg)...)
 	if a.authn != nil {

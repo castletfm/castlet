@@ -74,6 +74,35 @@ func TestTempDir(t *testing.T) {
 	})
 }
 
+// TestTempDirCleanupOnError proves the staged audio is removed from the
+// configured temp dir even when the command fails or produces unparseable
+// output, so a failed transcription never leaks a staged file.
+func TestTempDirCleanupOnError(t *testing.T) {
+	requireSh(t)
+
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"command_failure", []string{"-c", "exit 1"}},
+		{"parse_failure", []string{"-c", "printf 'not json'"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tr := command.New("/bin/sh", command.WithArgs(tc.args...), command.WithTempDir(dir))
+			_, err := tr.Transcribe(t.Context(), transcribe.Input{Audio: strings.NewReader("x"), Filename: "a.wav"})
+			require.Error(t, err)
+
+			ents, rerr := os.ReadDir(dir)
+			require.NoError(t, rerr)
+			for _, e := range ents {
+				assert.NotContains(t, e.Name(), "castlet-audio-", "staged audio must be removed on error")
+			}
+		})
+	}
+}
+
 // TestNormalOutput confirms that output within the caps is parsed as before.
 func TestNormalOutput(t *testing.T) {
 	requireSh(t)

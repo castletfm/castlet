@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/castletfm/castlet/internal/idgen"
@@ -45,6 +46,90 @@ func (s *Server) uploadReadTimeout() time.Duration {
 		return uploadTimeoutFloor
 	}
 	return d
+}
+
+// maxUploadFieldBytes bounds each non-file multipart field (title, description,
+// language). These are small; the cap stops a hostile client from spending the
+// whole (large) upload budget on an enormous text field buffered in memory.
+const maxUploadFieldBytes = 1 << 20 // 1 MiB
+
+// stagedUpload is a streamed multipart upload: the "media" file part written to a
+// temp file (seekable, positioned at start) plus the small non-file form fields.
+type stagedUpload struct {
+	file     *os.File // media part; nil when the upload carried no media file
+	mediaKey string   // sha256 hex of the media bytes
+	mime     string   // detected media content type
+	fields   map[string]string
+}
+
+func (u *stagedUpload) field(name string) string { return u.fields[name] }
+
+// stageMultipartUpload streams the multipart request without buffering the media
+// into memory or the system /tmp: non-file fields are read (bounded) into memory
+// and the "media" file part is streamed into a temp file under s.uploadTempDir
+// while its sha256 is computed. The returned file is seekable and positioned at
+// start; the caller owns closing and removing it. Total bytes read are already
+// bounded by the MaxBytesReader the caller wrapped around r.Body, so an over-cap
+// body surfaces here as *http.MaxBytesError. On any error the partially staged
+// temp file is removed before returning, so a failed upload never leaks one.
+func (s *Server) stageMultipartUpload(r *http.Request) (_ *stagedUpload, err error) {
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return nil, err
+	}
+	u := &stagedUpload{fields: map[string]string{}}
+	defer func() {
+		if err != nil && u.file != nil {
+			name := u.file.Name()
+			u.file.Close()
+			_ = os.Remove(name)
+			u.file = nil
+		}
+	}()
+	for {
+		part, perr := mr.NextPart()
+		if perr == io.EOF {
+			break
+		}
+		if perr != nil {
+			return nil, perr
+		}
+		name := part.FormName()
+		if name == "media" && part.FileName() != "" {
+			if u.file != nil { // only one media file is accepted
+				part.Close()
+				return nil, errors.New("server: multiple media parts in upload")
+			}
+			u.mime = detectUploadMIME(part.Header.Get("Content-Type"), part.FileName())
+			f, ferr := os.CreateTemp(s.uploadTempDir, "castlet-upload-*")
+			if ferr != nil {
+				part.Close()
+				return nil, ferr
+			}
+			u.file = f
+			hasher := sha256.New()
+			_, cerr := io.Copy(io.MultiWriter(f, hasher), part)
+			part.Close()
+			if cerr != nil {
+				return nil, cerr
+			}
+			u.mediaKey = hex.EncodeToString(hasher.Sum(nil))
+			continue
+		}
+		// A non-file form field: read it bounded into memory.
+		v, rerr := io.ReadAll(io.LimitReader(part, maxUploadFieldBytes))
+		part.Close()
+		if rerr != nil {
+			return nil, rerr
+		}
+		u.fields[name] = string(v)
+	}
+	if u.file != nil {
+		if _, serr := u.file.Seek(0, io.SeekStart); serr != nil {
+			return nil, serr
+		}
+	}
+	return u, nil
 }
 
 // abortUpload bounds a rejection that happens after the long upload deadline was
@@ -234,13 +319,11 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// (1)/(2) This endpoint only handles multipart file uploads. Require a
-	// multipart/form-data Content-Type before touching the body: for any other
-	// type ParseMultipartForm falls back to ParseForm, which reads the whole
-	// request up to the (large) upload cap into memory. Guarding here avoids
-	// that allocation for non-multipart requests. The boundary param is required
-	// too: without it ParseMultipartForm fails only after the body is read, so a
-	// boundary-less multipart/form-data would otherwise be granted the long
-	// upload deadline before failing.
+	// multipart/form-data Content-Type WITH a boundary before touching the body:
+	// r.MultipartReader (used below to stream the parts) needs both, and a
+	// non-multipart or boundary-less request must be rejected here — while still
+	// bounded by the global ReadTimeout — so it is never granted the long upload
+	// deadline extended just below.
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "multipart/form-data" {
 		s.renderError(w, r, http.StatusUnsupportedMediaType, "The upload must be sent as multipart/form-data.")
@@ -261,10 +344,10 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// (5) The request is a validated multipart upload. Cap the request body
-	// before anything reads it. r.FormValue/r.FormFile trigger multipart
-	// parsing, which would otherwise spool the entire upload to memory (then
-	// disk) with no limit, so the cap must wrap r.Body first — after a FormValue
-	// call it is too late. Hand MaxBytesReader the UNWRAPPED ResponseWriter: it
+	// before anything reads it. The streaming reader below (stageMultipartUpload)
+	// reads r.Body as it iterates parts, so the cap must wrap r.Body first for
+	// MaxBytesError to bound the total bytes read (media + fields). Hand
+	// MaxBytesReader the UNWRAPPED ResponseWriter: it
 	// does not follow Unwrap, and only when given net/http's real *response can
 	// it fire the oversized-body hook that flags the connection to close instead
 	// of draining the remaining body.
@@ -280,14 +363,15 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// (6) Parse the (capped) multipart body explicitly so an over-cap upload
-	// surfaces as a clean 413 instead of being silently swallowed by FormValue.
-	// On ANY parse failure the body is only partially read, so abortUpload first
-	// revokes the long deadline and marks the connection to close — otherwise a
-	// hostile chunked/unknown-length body that stalls after crossing the cap (or
-	// any malformed body) could be held/drained under the long upload window
-	// before or after the 4xx is written.
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// (6) Stream the (capped) multipart body straight to a staged temp file on the
+	// data volume instead of letting net/http spool the media into the system
+	// /tmp (and copy it a second time). On ANY read/parse failure the body is only
+	// partially read, so abortUpload first revokes the long deadline and marks the
+	// connection to close — otherwise a hostile chunked/unknown-length body that
+	// stalls after crossing the cap (or any malformed body) could be held/drained
+	// under the long upload window before or after the 4xx is written.
+	staged, err := s.stageMultipartUpload(r)
+	if err != nil {
 		s.abortUpload(w)
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
@@ -297,9 +381,17 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		s.renderError(w, r, http.StatusBadRequest, "The upload could not be read.")
 		return
 	}
+	// Remove the staged media on EVERY exit path (success or error) once it exists.
+	if staged.file != nil {
+		defer func() {
+			name := staged.file.Name()
+			staged.file.Close()
+			_ = os.Remove(name)
+		}()
+	}
 
-	form := episodeForm{Channel: ch, Title: r.FormValue("title"),
-		Description: r.FormValue("description"), Language: r.FormValue("language")}
+	form := episodeForm{Channel: ch, Title: staged.field("title"),
+		Description: staged.field("description"), Language: staged.field("language")}
 	reRender := func(status int, msg string) {
 		form.Error = msg
 		s.render(w, r, status, "admin_episode_form", "New episode", form)
@@ -309,30 +401,18 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		reRender(http.StatusBadRequest, "Title is required.")
 		return
 	}
-
-	// Read the uploaded file from the already-parsed multipart form.
-	file, header, err := r.FormFile("media")
-	if err != nil {
+	if staged.file == nil {
 		reRender(http.StatusBadRequest, "A media file is required (audio or video).")
 		return
 	}
-	defer file.Close()
 
-	mimeType := detectUploadMIME(header)
-	// Content-address the media: the blob key is the sha256 of the bytes, so a
-	// media URL is permanently bound to exactly those bytes — they cannot change
-	// without becoming a different URL. (The uploaded file is seekable, so we can
-	// hash it and then rewind to store it.)
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		s.serverError(w, r, err)
-		return
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		s.serverError(w, r, err)
-		return
-	}
-	mediaKey := hex.EncodeToString(hasher.Sum(nil))
+	// The staged file is seekable and positioned at start; hand it to Put.
+	file := staged.file
+	mimeType := staged.mime
+	// Content-address the media: the blob key is the sha256 of the bytes, computed
+	// while the upload was streamed to disk, so a media URL is permanently bound to
+	// exactly those bytes — they cannot change without becoming a different URL.
+	mediaKey := staged.mediaKey
 
 	// Bound the whole reserve->Put->CreateEpisode section to a hard deadline
 	// (store.UploadProtectWindow) that is strictly less than store.BlobReservationTTL.
