@@ -239,6 +239,67 @@ func TestAdminUploadFlow(t *testing.T) {
 	require.Contains(t, page, "Hello")
 }
 
+func TestUploadExceedsCap(t *testing.T) {
+	// Cap uploads tiny so a modest body trips the limit; the multipart parse
+	// must be bounded, so an oversized body is rejected without spooling it all.
+	h := newHarness(t, server.WithMaxUploadBytes(64))
+	ctx := t.Context()
+	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: string(hash), CreatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	// A payload well over the 64-byte cap.
+	audio := bytes.Repeat([]byte("x"), 4096)
+	body, contentType := multipartUpload(t, map[string]string{"title": "Hello"}, "media", "clip.mp3", "audio/mpeg", audio)
+	resp, err = h.client.Post(h.base+"/admin/channels/c1/episodes", contentType, body)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
+
+	// Nothing was persisted.
+	eps, err := h.store.ListEpisodes(ctx, store.EpisodeFilter{ChannelID: "c1"})
+	require.NoError(t, err)
+	require.Empty(t, eps)
+}
+
+func TestUploadRejectsNonMultipart(t *testing.T) {
+	// A non-multipart Content-Type must be rejected up front: otherwise
+	// ParseMultipartForm falls back to ParseForm and would read the whole body
+	// up to the (large) upload cap. The cap is tiny here only so the body used
+	// below is trivially within it — the point is that we reject before parsing.
+	h := newHarness(t, server.WithMaxUploadBytes(64))
+	ctx := t.Context()
+	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: string(hash), CreatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	// application/x-www-form-urlencoded is not a multipart upload.
+	resp, err = h.client.PostForm(h.base+"/admin/channels/c1/episodes",
+		url.Values{"title": {"Hello"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusUnsupportedMediaType, resp.StatusCode)
+
+	// Nothing was persisted.
+	eps, err := h.store.ListEpisodes(ctx, store.EpisodeFilter{ChannelID: "c1"})
+	require.NoError(t, err)
+	require.Empty(t, eps)
+}
+
 func multipartUpload(t *testing.T, fields map[string]string, fileField, filename, mime string, content []byte) (*bytes.Buffer, string) {
 	t.Helper()
 	var buf bytes.Buffer
