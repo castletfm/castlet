@@ -125,6 +125,18 @@ type Store interface {
 	// UserByOIDCSubject finds the user linked to an identity provider subject,
 	// or ErrNotFound.
 	UserByOIDCSubject(ctx context.Context, issuer, subject string) (*model.User, error)
+	// LinkOIDCIdentity links the (issuer, subject) identity to the user, but ONLY
+	// when the account is not already linked to a DIFFERENT identity. The write is
+	// a single conditional UPDATE that matches only when the user's oidc_subject is
+	// currently empty (unlinked) OR already equals the incoming (issuer, subject)
+	// (an idempotent re-link). This closes the check-then-write race in the OIDC
+	// callback's email-linking path: the "is this account unlinked?" test and the
+	// write are one atomic statement, so two concurrent callbacks can never both
+	// link the same account to different identities, nor can one overwrite an
+	// existing link (an account-takeover vector). When no row matches — the account
+	// is already linked to a different identity, or no user has the id — it returns
+	// ErrConflict and writes nothing; callers should reject the sign-in.
+	LinkOIDCIdentity(ctx context.Context, userID, issuer, subject string) error
 
 	CreateChannel(ctx context.Context, c *model.Channel) error
 	UpdateChannel(ctx context.Context, c *model.Channel) error

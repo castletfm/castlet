@@ -76,6 +76,34 @@ func (s *Store) UserByOIDCSubject(ctx context.Context, issuer, subject string) (
 	return scanUser(row)
 }
 
+// LinkOIDCIdentity links the (issuer, subject) to the user with a single
+// conditional UPDATE that only matches an account which is currently unlinked
+// (oidc_subject = ”) or already linked to the SAME (issuer, subject). Because
+// the unlinked/same-identity test lives in the WHERE clause, the check and the
+// write are atomic: a concurrent callback cannot slip a different link in
+// between, and an account already linked to a DIFFERENT identity never matches,
+// so its link is never overwritten. Zero rows affected means exactly that (or a
+// missing id) and is reported as ErrConflict.
+func (s *Store) LinkOIDCIdentity(ctx context.Context, userID, issuer, subject string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE users SET oidc_issuer = ?, oidc_subject = ?
+		 WHERE id = ? AND (oidc_subject = '' OR (oidc_issuer = ? AND oidc_subject = ?))`,
+		issuer, subject, userID, issuer, subject)
+	if err != nil {
+		return fmt.Errorf("sqlite: link oidc identity: %w", mapErr(err))
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		// The account exists but is already linked to a different identity (or the
+		// id is unknown): either way there is nothing to safely link.
+		return store.ErrConflict
+	}
+	return nil
+}
+
 func (s *Store) userWhere(ctx context.Context, cond string, arg any) (*model.User, error) {
 	return scanUser(s.db.QueryRowContext(ctx, `SELECT `+userCols+` FROM users WHERE `+cond, arg))
 }
