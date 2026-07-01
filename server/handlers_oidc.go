@@ -146,17 +146,32 @@ func (s *Server) resolveOIDCUser(r *http.Request, id *auth.Identity) (*model.Use
 		if !id.EmailVerified {
 			return nil, errors.New("An account with this email exists but the provider did not verify the address.")
 		}
-		existing.OIDCIssuer = id.Issuer
-		existing.OIDCSubject = id.Subject
-		if err := s.store.UpdateUser(ctx, existing); err != nil {
+		// Never overwrite an existing OIDC link with a different identity: if the
+		// account is already bound to another (issuer, subject), reusing/aliasing
+		// its verified email — or a second issuer asserting the same address — must
+		// not silently rebind it to the newcomer (account takeover). Reject up
+		// front for a clear error; the conditional LinkOIDCIdentity below then
+		// closes the check-then-write race so a concurrent link cannot slip in
+		// after this test. Only an unlinked account (empty subject) — or one whose
+		// link already matches the incoming identity (idempotent) — may be linked.
+		if existing.OIDCSubject != "" && (existing.OIDCIssuer != id.Issuer || existing.OIDCSubject != id.Subject) {
+			return nil, errors.New("This account is already linked to a different identity provider identity.")
+		}
+		if err := s.store.LinkOIDCIdentity(ctx, existing.ID, id.Issuer, id.Subject); err != nil {
+			if errors.Is(err, store.ErrConflict) {
+				// A concurrent callback linked this account to a different identity
+				// between the check above and this write; fail closed rather than
+				// overwrite it.
+				return nil, errors.New("This account is already linked to a different identity provider identity.")
+			}
 			return nil, err
 		}
 		// Reload before returning so the caller issues the session from the CURRENT
-		// epoch. UpdateUser deliberately never writes session_epoch, so the struct
-		// still carries whatever epoch UserByEmail read; an epoch bump ("log out
-		// everywhere" / password change) racing between that read and here would
-		// otherwise mint a cookie at the stale epoch that is immediately revoked.
-		// Honor the "reload before issuing a session after an update" contract.
+		// epoch. The struct from UserByEmail still carries whatever epoch that read
+		// saw; an epoch bump ("log out everywhere" / password change) racing between
+		// that read and here would otherwise mint a cookie at the stale epoch that is
+		// immediately revoked. Honor the "reload before issuing a session after an
+		// update" contract.
 		reloaded, err := s.store.UserByID(ctx, existing.ID)
 		if err != nil {
 			return nil, err
