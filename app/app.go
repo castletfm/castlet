@@ -56,6 +56,16 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Close the freshly-opened store if we bail out before handing it to a
+	// fully-constructed App (a later backend build can fail); the caller only
+	// owns App.Close on success.
+	ok := false
+	defer func() {
+		if !ok {
+			st.Close()
+		}
+	}()
+
 	blobs, err := buildBlobStore(cfg)
 	if err != nil {
 		return nil, err
@@ -70,6 +80,7 @@ func New(cfg *config.Config) (*App, error) {
 	}
 
 	secure := strings.HasPrefix(cfg.BaseURL, "https://")
+	ok = true
 	return &App{
 		cfg:         cfg,
 		store:       st,
