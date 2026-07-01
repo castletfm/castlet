@@ -248,24 +248,32 @@ func sha256hex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// canonicalQuery renders query params sorted and RFC3986-encoded, the form
-// SigV4 requires (and a valid query string for the actual request too).
+// canonicalQuery renders query params RFC3986-encoded then sorted, the form
+// SigV4 requires (and a valid query string for the actual request too). SigV4
+// mandates encoding each name and value first and sorting by the encoded bytes
+// (name, then value): encoding can change the ordering (e.g. '%5B' < 'A'), so
+// sorting the raw params first would produce a wrong canonical query.
 func canonicalQuery(q url.Values) string {
 	if len(q) == 0 {
 		return ""
 	}
-	keys := make([]string, 0, len(q))
-	for k := range q {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var parts []string
-	for _, k := range keys {
-		vals := append([]string(nil), q[k]...)
-		sort.Strings(vals)
+	type pair struct{ name, value string }
+	pairs := make([]pair, 0, len(q))
+	for k, vals := range q {
+		ek := uriEncode(k)
 		for _, v := range vals {
-			parts = append(parts, uriEncode(k)+"="+uriEncode(v))
+			pairs = append(pairs, pair{ek, uriEncode(v)})
 		}
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].name != pairs[j].name {
+			return pairs[i].name < pairs[j].name
+		}
+		return pairs[i].value < pairs[j].value
+	})
+	parts := make([]string, len(pairs))
+	for i, p := range pairs {
+		parts[i] = p.name + "=" + p.value
 	}
 	return strings.Join(parts, "&")
 }
