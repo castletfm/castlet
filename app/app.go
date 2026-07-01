@@ -210,6 +210,12 @@ func (a *App) Serve(ctx context.Context) error {
 	// srv.Run binds the listener; both can fail synchronously (e.g. the address
 	// is already in use). Doing this before the worker starts means such a
 	// failure returns with no background goroutine running to race App.Close.
+	// Stage streamed uploads on the data volume, not the system /tmp, so large or
+	// concurrent uploads cannot exhaust it.
+	uploadStaging, err := stagingDir(a.cfg)
+	if err != nil {
+		return err
+	}
 	opts := []server.Option{
 		server.WithAddr(a.cfg.Addr),
 		server.WithBaseURL(a.cfg.BaseURL),
@@ -217,6 +223,7 @@ func (a *App) Serve(ctx context.Context) error {
 		server.WithAllowSignup(a.cfg.AllowSignup),
 		server.WithLogger(a.logger),
 		server.WithMetrics(reg),
+		server.WithUploadTempDir(uploadStaging),
 	}
 	opts = append(opts, serverTuningOptions(a.cfg)...)
 	if a.authn != nil {
@@ -287,6 +294,43 @@ func buildAuthenticator(cfg *config.Config, logger *slog.Logger) (auth.Authentic
 	return authn, nil
 }
 
+// stagingDir returns (creating it if needed, 0o700) the directory under DataDir
+// where backends stage full object bodies to temp files. Keeping this on the
+// data volume — rather than the system /tmp — means large or concurrent uploads
+// and transcriptions exhaust the operator-provisioned data disk, not the host's
+// (often tiny) /tmp. It is owner-only (0o700) because staged media may be private.
+func stagingDir(cfg *config.Config) (string, error) {
+	dir := filepath.Join(cfg.DataDir, "tmp")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("app: create staging dir: %w", err)
+	}
+	// MkdirAll only applies the 0o700 mode when it *creates* the directory. A dir
+	// left over from a prior run (or pre-created by the operator) could be
+	// world-/group-readable, leaking private staged media. Lstat (not Stat) so a
+	// symlink is seen as a symlink: reject a symlink or a non-directory rather
+	// than staging into an unexpected or attacker-pointed path, then tighten the
+	// mode so an existing looser directory is corrected to owner-only.
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return "", fmt.Errorf("app: stat staging dir: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("app: staging dir %q is a symlink", dir)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("app: staging dir %q is not a directory", dir)
+	}
+	// Only chmod if the mode is actually looser than owner-only; this avoids a
+	// spurious failure on filesystems that don't support chmod (e.g. some
+	// network mounts) when the directory is already correct.
+	if fi.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return "", fmt.Errorf("app: secure staging dir: %w", err)
+		}
+	}
+	return dir, nil
+}
+
 // buildBlobStore selects the media blob backend. With no config file it is the
 // local filesystem under DataDir/media. Otherwise the JSON file's "type" field
 // picks the backend ("fs" or "s3") and supplies its settings.
@@ -319,7 +363,13 @@ func buildBlobStore(cfg *config.Config) (blob.BlobStore, error) {
 		if err := json.Unmarshal(data, &c); err != nil {
 			return nil, fmt.Errorf("app: parse s3 blob store config: %w", err)
 		}
-		return s3.New(c)
+		staging, err := stagingDir(cfg)
+		if err != nil {
+			return nil, err
+		}
+		// Stage buffered upload/download bodies on the data volume, not the
+		// system /tmp, so large or concurrent transfers cannot exhaust it.
+		return s3.New(c, s3.WithTempDir(staging))
 	default:
 		return nil, fmt.Errorf("app: unknown blob store type %q", head.Type)
 	}
@@ -333,7 +383,15 @@ func buildTranscriber(cfg *config.Config) (transcribe.Transcriber, error) {
 		if cfg.TranscribeCommand == "" {
 			return nil, errors.New("app: transcriber=command requires --transcribe-command")
 		}
-		return command.New(cfg.TranscribeCommand, command.WithArgs(cfg.TranscribeArgs...)), nil
+		staging, err := stagingDir(cfg)
+		if err != nil {
+			return nil, err
+		}
+		// Stage the audio on the data volume, not the system /tmp, so large or
+		// concurrent transcriptions cannot exhaust it.
+		return command.New(cfg.TranscribeCommand,
+			command.WithArgs(cfg.TranscribeArgs...),
+			command.WithTempDir(staging)), nil
 	default:
 		return nil, fmt.Errorf("app: unknown transcriber %q", cfg.Transcriber)
 	}

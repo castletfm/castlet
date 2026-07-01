@@ -77,6 +77,10 @@ type Server struct {
 	allowedDomains  []string // email domains permitted to sign in via OIDC; empty allows any
 	maxUploadBytes  int64
 	shutdownTimeout time.Duration
+	// uploadTempDir is where a streamed media upload is staged to a temp file
+	// before it is stored. Empty means os.TempDir(); the app points it at a
+	// directory on the data volume so large uploads don't exhaust the system /tmp.
+	uploadTempDir string
 	// mediaWriteIdle is the idle window that bounds each streamed /media write;
 	// defaulted to the mediaWriteIdle constant in New. Kept as a field so tests
 	// can shrink it without waiting on the production window.
@@ -100,6 +104,7 @@ type (
 	identAllowedDomains  struct{}
 	identMetrics         struct{}
 	identShutdownTimeout struct{}
+	identUploadTempDir   struct{}
 )
 
 // WithAddr sets the listen address (default ":8080").
@@ -145,6 +150,12 @@ func WithMetrics(r *metrics.Registry) Option { return option.New(identMetrics{},
 // (default 10s).
 func WithShutdownTimeout(d time.Duration) Option { return option.New(identShutdownTimeout{}, d) }
 
+// WithUploadTempDir sets the directory in which a streamed media upload is staged
+// to a temporary file before being stored. When unset the OS default
+// (os.TempDir) is used. Point this at a directory on the volume provisioned for
+// media so large or concurrent uploads cannot exhaust the system /tmp.
+func WithUploadTempDir(dir string) Option { return option.New(identUploadTempDir{}, dir) }
+
 // New constructs a Server from its dependencies. It returns an error only if
 // the default renderer fails to parse its templates.
 func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *session.Manager, options ...Option) (*Server, error) {
@@ -189,6 +200,8 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *sessi
 			s.metrics = option.MustGet[*metrics.Registry](o)
 		case identShutdownTimeout:
 			s.shutdownTimeout = option.MustGet[time.Duration](o)
+		case identUploadTempDir:
+			s.uploadTempDir = option.MustGet[string](o)
 		}
 	}
 	if s.metrics == nil {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/castletfm/castlet/internal/idgen"
@@ -45,6 +46,163 @@ func (s *Server) uploadReadTimeout() time.Duration {
 		return uploadTimeoutFloor
 	}
 	return d
+}
+
+const (
+	// maxUploadFieldBytes bounds a single non-file multipart field. The known
+	// fields (title, description, language) are short; this cap stops a hostile
+	// client from pinning the handler on one enormous text field.
+	maxUploadFieldBytes = 64 << 10 // 64 KiB
+
+	// maxUploadFieldsBytes bounds the total bytes read across ALL non-file fields
+	// (known and unknown), so a body full of medium fields can't accumulate work
+	// beyond this even under the large upload cap.
+	maxUploadFieldsBytes = 256 << 10 // 256 KiB
+
+	// maxUploadParts bounds how many multipart parts we will iterate before
+	// rejecting, so a body made of many tiny parts can't pin the handler.
+	maxUploadParts = 100
+)
+
+// Form field names shared by the admin channel and episode form handlers.
+const (
+	fieldTitle       = "title"
+	fieldDescription = "description"
+	fieldLanguage    = "language"
+	fieldMedia       = "media"
+)
+
+// knownUploadFields are the non-file form fields the upload form actually posts
+// (see web/templates/admin_episode_form.html: "language" is the spoken language).
+// Any other field name is read (bounded) to advance the stream but not retained,
+// so unknown fields cannot accumulate in memory.
+var knownUploadFields = map[string]bool{fieldTitle: true, fieldDescription: true, fieldLanguage: true}
+
+// stagedUpload is a streamed multipart upload: the "media" file part written to a
+// temp file (seekable, positioned at start) plus the small known non-file fields.
+type stagedUpload struct {
+	file     *os.File // media part; nil when the upload carried no media file
+	mediaKey string   // sha256 hex of the media bytes
+	mime     string   // detected media content type
+	fields   map[string]string
+}
+
+func (u *stagedUpload) field(name string) string { return u.fields[name] }
+
+// errUploadFields is returned when the request violates an upload bound (a single
+// field or the aggregate text is too large, too many parts, or a missing/extra/
+// duplicate media part). It is a CLIENT error: the caller aborts the connection
+// promptly (rather than draining the offending part) and renders a 4xx.
+var errUploadFields = errors.New("server: upload form fields exceed limits")
+
+// errServerStaging wraps a SERVER-side staging/storage failure (temp-file
+// create/write/seek). The caller renders a 5xx and logs it, so a disk,
+// permission, or storage fault is not misreported as a client 4xx. Client-side
+// problems (malformed/oversized upload) are returned unwrapped (or as
+// errUploadFields / *http.MaxBytesError) and map to a 4xx instead.
+var errServerStaging = errors.New("server: upload staging failed")
+
+// stageMultipartUpload streams the multipart request without buffering the media
+// into memory or the system /tmp: the "media" file part is streamed into a temp
+// file under s.uploadTempDir while its sha256 is computed, and the known non-file
+// fields are read (bounded) into memory. The returned file is seekable and
+// positioned at start; the caller owns closing and removing it. Total bytes read
+// are already bounded by the MaxBytesReader the caller wrapped around r.Body, so
+// an over-cap body surfaces here as *http.MaxBytesError.
+//
+// On ANY error it returns without draining the offending part (a multipart.Part's
+// Close drains its unread remainder, which under the long, size-derived upload
+// deadline would let a slow/oversized field or a bad file part pin the handler).
+// The caller's abortUpload + the MaxBytesReader on r.Body tear the connection
+// down instead. The partially staged temp file is removed before returning, so a
+// failed upload never leaks one.
+func (s *Server) stageMultipartUpload(r *http.Request) (_ *stagedUpload, err error) {
+	mr, err := r.MultipartReader()
+	if err != nil {
+		return nil, err
+	}
+	u := &stagedUpload{fields: map[string]string{}}
+	defer func() {
+		if err != nil && u.file != nil {
+			name := u.file.Name()
+			u.file.Close()
+			_ = os.Remove(name)
+			u.file = nil
+		}
+	}()
+	var parts int
+	var fieldsTotal int
+	for {
+		part, perr := mr.NextPart()
+		if perr == io.EOF {
+			break
+		}
+		if perr != nil {
+			return nil, perr
+		}
+		parts++
+		if parts > maxUploadParts {
+			return nil, errUploadFields // do not Close/drain
+		}
+		name := part.FormName()
+
+		// File parts: only a single "media" part is accepted. Any other file part
+		// (or a duplicate media part) is rejected without draining it.
+		if part.FileName() != "" {
+			if name != fieldMedia || u.file != nil {
+				return nil, errUploadFields // do not Close/drain
+			}
+			u.mime = detectUploadMIME(part.Header.Get("Content-Type"), part.FileName())
+			f, ferr := os.CreateTemp(s.uploadTempDir, "castlet-upload-*")
+			if ferr != nil {
+				return nil, errors.Join(errServerStaging, ferr) // server: no Close/drain
+			}
+			u.file = f
+			hasher := sha256.New()
+			// io.Copy is bounded by the MaxBytesReader on r.Body; an over-cap body
+			// surfaces as *http.MaxBytesError (the caller classifies that as a client
+			// 413). Any other copy failure is a temp-file write / storage fault, so
+			// mark it as a server error. Either way, do not Close/drain the part.
+			if _, cerr := io.Copy(io.MultiWriter(f, hasher), part); cerr != nil {
+				return nil, errors.Join(errServerStaging, cerr)
+			}
+			part.Close() // fully consumed to EOF above; no drain
+			u.mediaKey = hex.EncodeToString(hasher.Sum(nil))
+			continue
+		}
+
+		// Non-file field: bound EACH read to the smaller of the per-field cap and
+		// the REMAINING aggregate budget, so the TOTAL text ever read is hard-capped
+		// at ~maxUploadFieldsBytes no matter how the client splits it across fields
+		// (not the per-field cap times the field count). Reading limit+1 lets an
+		// over-limit field be caught without draining it. A read error here is a body
+		// read (client) — including *http.MaxBytesError — so it is returned unwrapped
+		// (the caller maps it to a 4xx), not marked as a server error.
+		limit := maxUploadFieldBytes
+		if rem := maxUploadFieldsBytes - fieldsTotal; rem < limit {
+			limit = rem
+		}
+		v, rerr := io.ReadAll(io.LimitReader(part, int64(limit)+1))
+		if rerr != nil {
+			return nil, rerr // do not Close/drain
+		}
+		if len(v) > limit {
+			// Over the per-field cap or the remaining aggregate budget: client error.
+			return nil, errUploadFields // do not Close/drain
+		}
+		fieldsTotal += len(v)
+		part.Close() // fully consumed (read <= limit -> reached part EOF); no drain
+		if knownUploadFields[name] {
+			u.fields[name] = string(v)
+		}
+		// Unknown field: consumed to advance the stream, but not retained.
+	}
+	if u.file != nil {
+		if _, serr := u.file.Seek(0, io.SeekStart); serr != nil {
+			return nil, errors.Join(errServerStaging, serr) // server: rewind failed
+		}
+	}
+	return u, nil
 }
 
 // abortUpload bounds a rejection that happens after the long upload deadline was
@@ -94,9 +252,9 @@ func (s *Server) handleChannelCreate(w http.ResponseWriter, r *http.Request) {
 	ch := &model.Channel{
 		ID:          idgen.New(),
 		UserID:      user.ID,
-		Title:       r.FormValue("title"),
-		Description: r.FormValue("description"),
-		Language:    orDefault(r.FormValue("language"), "en"),
+		Title:       r.FormValue(fieldTitle),
+		Description: r.FormValue(fieldDescription),
+		Language:    orDefault(r.FormValue(fieldLanguage), "en"),
 		CreatedAt:   s.now(),
 		UpdatedAt:   s.now(),
 	}
@@ -130,9 +288,9 @@ func (s *Server) handleChannelUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ch.Title = r.FormValue("title")
-	ch.Description = r.FormValue("description")
-	ch.Language = orDefault(r.FormValue("language"), "en")
+	ch.Title = r.FormValue(fieldTitle)
+	ch.Description = r.FormValue(fieldDescription)
+	ch.Language = orDefault(r.FormValue(fieldLanguage), "en")
 	ch.UpdatedAt = s.now()
 
 	action := "/admin/channels/" + ch.ID
@@ -240,13 +398,11 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// (1)/(2) This endpoint only handles multipart file uploads. Require a
-	// multipart/form-data Content-Type before touching the body: for any other
-	// type ParseMultipartForm falls back to ParseForm, which reads the whole
-	// request up to the (large) upload cap into memory. Guarding here avoids
-	// that allocation for non-multipart requests. The boundary param is required
-	// too: without it ParseMultipartForm fails only after the body is read, so a
-	// boundary-less multipart/form-data would otherwise be granted the long
-	// upload deadline before failing.
+	// multipart/form-data Content-Type WITH a boundary before touching the body:
+	// r.MultipartReader (used below to stream the parts) needs both, and a
+	// non-multipart or boundary-less request must be rejected here — while still
+	// bounded by the global ReadTimeout — so it is never granted the long upload
+	// deadline extended just below.
 	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "multipart/form-data" {
 		s.renderError(w, r, http.StatusUnsupportedMediaType, "The upload must be sent as multipart/form-data.")
@@ -267,10 +423,10 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// (5) The request is a validated multipart upload. Cap the request body
-	// before anything reads it. r.FormValue/r.FormFile trigger multipart
-	// parsing, which would otherwise spool the entire upload to memory (then
-	// disk) with no limit, so the cap must wrap r.Body first — after a FormValue
-	// call it is too late. Hand MaxBytesReader the UNWRAPPED ResponseWriter: it
+	// before anything reads it. The streaming reader below (stageMultipartUpload)
+	// reads r.Body as it iterates parts, so the cap must wrap r.Body first for
+	// MaxBytesError to bound the total bytes read (media + fields). Hand
+	// MaxBytesReader the UNWRAPPED ResponseWriter: it
 	// does not follow Unwrap, and only when given net/http's real *response can
 	// it fire the oversized-body hook that flags the connection to close instead
 	// of draining the remaining body.
@@ -286,26 +442,44 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// (6) Parse the (capped) multipart body explicitly so an over-cap upload
-	// surfaces as a clean 413 instead of being silently swallowed by FormValue.
-	// On ANY parse failure the body is only partially read, so abortUpload first
-	// revokes the long deadline and marks the connection to close — otherwise a
-	// hostile chunked/unknown-length body that stalls after crossing the cap (or
-	// any malformed body) could be held/drained under the long upload window
-	// before or after the 4xx is written.
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// (6) Stream the (capped) multipart body straight to a staged temp file on the
+	// data volume instead of letting net/http spool the media into the system
+	// /tmp (and copy it a second time). On ANY read/parse failure the body is only
+	// partially read, so abortUpload first revokes the long deadline and marks the
+	// connection to close — otherwise a hostile chunked/unknown-length body that
+	// stalls after crossing the cap (or any malformed body) could be held/drained
+	// under the long upload window before or after the 4xx is written.
+	staged, err := s.stageMultipartUpload(r)
+	if err != nil {
+		// Tear the connection down (revoke the long deadline, mark it to close) on
+		// every failure, then classify: an over-cap body is a 413, a server-side
+		// staging/storage fault is a logged 500, and any other problem (malformed
+		// multipart, over-limit field, missing/duplicate/extra media part, too many
+		// parts) is a client 400. errServerStaging is checked after MaxBytesError so
+		// an over-cap copy still reports 413, not 500.
 		s.abortUpload(w)
 		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
+		switch {
+		case errors.As(err, &maxErr):
 			s.renderError(w, r, http.StatusRequestEntityTooLarge, "The uploaded file is too large.")
-			return
+		case errors.Is(err, errServerStaging):
+			s.serverError(w, r, err) // logs + renders 500
+		default:
+			s.renderError(w, r, http.StatusBadRequest, "The upload could not be read.")
 		}
-		s.renderError(w, r, http.StatusBadRequest, "The upload could not be read.")
 		return
 	}
+	// Remove the staged media on EVERY exit path (success or error) once it exists.
+	if staged.file != nil {
+		defer func() {
+			name := staged.file.Name()
+			staged.file.Close()
+			_ = os.Remove(name)
+		}()
+	}
 
-	form := episodeForm{Channel: ch, Title: r.FormValue("title"),
-		Description: r.FormValue("description"), Language: r.FormValue("language")}
+	form := episodeForm{Channel: ch, Title: staged.field(fieldTitle),
+		Description: staged.field(fieldDescription), Language: staged.field(fieldLanguage)}
 	reRender := func(status int, msg string) {
 		form.Error = msg
 		s.render(w, r, status, "admin_episode_form", "New episode", form)
@@ -315,30 +489,18 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		reRender(http.StatusBadRequest, "Title is required.")
 		return
 	}
-
-	// Read the uploaded file from the already-parsed multipart form.
-	file, header, err := r.FormFile("media")
-	if err != nil {
+	if staged.file == nil {
 		reRender(http.StatusBadRequest, "A media file is required (audio or video).")
 		return
 	}
-	defer file.Close()
 
-	mimeType := detectUploadMIME(header)
-	// Content-address the media: the blob key is the sha256 of the bytes, so a
-	// media URL is permanently bound to exactly those bytes — they cannot change
-	// without becoming a different URL. (The uploaded file is seekable, so we can
-	// hash it and then rewind to store it.)
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		s.serverError(w, r, err)
-		return
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		s.serverError(w, r, err)
-		return
-	}
-	mediaKey := hex.EncodeToString(hasher.Sum(nil))
+	// The staged file is seekable and positioned at start; hand it to Put.
+	file := staged.file
+	mimeType := staged.mime
+	// Content-address the media: the blob key is the sha256 of the bytes, computed
+	// while the upload was streamed to disk, so a media URL is permanently bound to
+	// exactly those bytes — they cannot change without becoming a different URL.
+	mediaKey := staged.mediaKey
 
 	// Bound the whole reserve->Put->CreateEpisode section to a hard deadline
 	// (store.UploadProtectWindow) that is strictly less than store.BlobReservationTTL.
@@ -469,8 +631,8 @@ func (s *Server) handleEpisodeUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	form := episodeEditForm{Episode: ep, Channel: ch, Title: r.FormValue("title"),
-		Description: r.FormValue("description"), Language: r.FormValue("language")}
+	form := episodeEditForm{Episode: ep, Channel: ch, Title: r.FormValue(fieldTitle),
+		Description: r.FormValue(fieldDescription), Language: r.FormValue(fieldLanguage)}
 	if form.Title == "" {
 		form.Error = "Title is required."
 		s.render(w, r, http.StatusBadRequest, "admin_episode_edit", "Edit episode", form)

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"mime"
-	"mime/multipart"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -243,21 +242,26 @@ func (s *Server) handleFeed(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(xml)
 }
 
+// defaultUploadMIME is the fallback content type when neither the declared
+// Content-Type nor the filename extension yields a usable media type.
+const defaultUploadMIME = "audio/mpeg"
+
 // detectUploadMIME picks a content type for an uploaded file: the browser's
 // declared type when specific, otherwise a guess from the file extension,
-// falling back to a generic audio type.
-func detectUploadMIME(header *multipart.FileHeader) string {
-	if ct := header.Header.Get("Content-Type"); ct != "" && ct != "application/octet-stream" {
-		if mt, _, err := mime.ParseMediaType(ct); err == nil {
+// falling back to a generic audio type. contentType is the upload part's
+// declared Content-Type and filename its declared filename.
+func detectUploadMIME(contentType, filename string) string {
+	if contentType != "" && contentType != "application/octet-stream" {
+		if mt, _, err := mime.ParseMediaType(contentType); err == nil {
 			return mt
 		}
 	}
-	if ext := filepath.Ext(header.Filename); ext != "" {
+	if ext := filepath.Ext(filename); ext != "" {
 		if byExt := mime.TypeByExtension(ext); byExt != "" {
 			if mt, _, err := mime.ParseMediaType(byExt); err == nil {
 				return mt
 			}
 		}
 	}
-	return "audio/mpeg"
+	return defaultUploadMIME
 }
