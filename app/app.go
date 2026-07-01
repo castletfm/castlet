@@ -85,11 +85,19 @@ func New(cfg *config.Config) (*App, error) {
 	}, nil
 }
 
-// queueOptions maps the operational knobs onto dbqueue options. A zero field
-// means "leave the component default in place": config.Load rejects non-positive
-// values, but a manually built Config (e.g. the user-create path) leaves these
-// zero, and passing 0 through would clobber the queue's own defaults (instant
-// reclaim / dead-lettering). So only positive values are forwarded.
+// The operational knobs all follow one invariant: a zero field means "use the
+// component's own default". config.Load rejects non-positive operator input, but
+// a manually built Config (e.g. the user-create path in cmd/castlet) leaves these
+// zero, and forwarding 0 would clobber the components' defaults. Five of the six
+// are scalar options, so the helpers below simply omit the option when the field
+// is zero. The sixth, TranscribeTimeoutMin, is carried inside the whole
+// JobTimeoutPolicy struct (alongside Factor/Max) and cannot be individually
+// omitted; instead the worker normalizes any zero field via
+// JobTimeoutPolicy.withDefaults (Min<=0 -> 5m). See jobTimeoutPolicy.
+
+// queueOptions maps the operational knobs onto dbqueue options, forwarding only
+// positive values so a zero field keeps the queue's own default (a zero lease is
+// instantly reclaimable; zero max-attempts dead-letters immediately).
 func queueOptions(cfg *config.Config) []dbqueue.Option {
 	var opts []dbqueue.Option
 	if cfg.JobLease > 0 {
@@ -127,6 +135,20 @@ func serverTuningOptions(cfg *config.Config) []server.Option {
 	return opts
 }
 
+// jobTimeoutPolicy maps the transcription-timeout knobs onto a JobTimeoutPolicy.
+// Unlike the scalar tuning helpers above, this cannot omit a single zero field —
+// the whole struct is forwarded — so a zero field is left zero here and defaulted
+// inside the worker by JobTimeoutPolicy.withDefaults (Factor->1.5, Min->5m,
+// Max->2h). That keeps the component the single source of these defaults, so a
+// partial/zero Config still gets the prior behavior.
+func jobTimeoutPolicy(cfg *config.Config) worker.JobTimeoutPolicy {
+	return worker.JobTimeoutPolicy{
+		Factor: cfg.TranscribeTimeoutFactor,
+		Min:    cfg.TranscribeTimeoutMin,
+		Max:    cfg.TranscribeTimeout,
+	}
+}
+
 // Store exposes the metadata store for administrative commands.
 func (a *App) Store() store.Store { return a.store }
 
@@ -149,14 +171,7 @@ func (a *App) Serve(ctx context.Context) error {
 	wkOpts := []worker.Option{
 		worker.WithLogger(a.logger),
 		worker.WithMetrics(reg),
-		// JobTimeoutPolicy applies its own per-field defaults for zero values
-		// (see JobTimeoutPolicy.withDefaults), so passing a partial/zero Config
-		// here is safe.
-		worker.WithJobTimeout(worker.JobTimeoutPolicy{
-			Factor: a.cfg.TranscribeTimeoutFactor,
-			Min:    a.cfg.TranscribeTimeoutMin,
-			Max:    a.cfg.TranscribeTimeout,
-		}),
+		worker.WithJobTimeout(jobTimeoutPolicy(a.cfg)),
 	}
 	wkOpts = append(wkOpts, workerTuningOptions(a.cfg)...)
 	wk := worker.New(a.store, a.blobs, a.queue, a.transcriber, wkOpts...)
