@@ -1,8 +1,13 @@
 // Package session implements stateless, HMAC-signed cookie sessions. The
-// signed value carries only the user id and an expiry, so no server-side
-// session storage is required for the default install. A deployment that needs
-// revocation or SSO can replace this with a server-side implementation behind
-// the same Manager surface used by the server package.
+// signed value carries the user id, an expiry, and the user's session epoch, so
+// no server-side session storage is required for the default install. The epoch
+// is a per-user revocation counter kept in the store: a request's session is
+// accepted only while the epoch signed into the cookie still matches the user's
+// current epoch, so bumping it (on logout or a password change) invalidates
+// every session issued before the bump — a "log out everywhere" that a purely
+// stateless cookie cannot provide. A deployment that needs full server-side
+// sessions or SSO can replace this behind the same Manager surface used by the
+// server package.
 package session
 
 import (
@@ -56,10 +61,13 @@ func NewManager(key []byte, options ...Option) *Manager {
 	return m
 }
 
-// Issue writes a signed session cookie identifying userID.
-func (m *Manager) Issue(w http.ResponseWriter, userID string, now time.Time) {
+// Issue writes a signed session cookie identifying userID at the given session
+// epoch. The epoch is the user's current revocation counter (model.User's
+// SessionEpoch); UserID later returns it so the caller can reject a cookie whose
+// epoch is stale.
+func (m *Manager) Issue(w http.ResponseWriter, userID string, epoch int, now time.Time) {
 	exp := now.Add(m.ttl)
-	value := m.sign(userID, exp)
+	value := m.sign(userID, epoch, exp)
 	http.SetCookie(w, &http.Cookie{
 		Name:     m.cookieName,
 		Value:    value,
@@ -85,56 +93,68 @@ func (m *Manager) Clear(w http.ResponseWriter) {
 	})
 }
 
-// UserID returns the authenticated user id from the request, or ("", false)
-// if there is no valid, unexpired session.
-func (m *Manager) UserID(r *http.Request, now time.Time) (string, bool) {
+// UserID returns the authenticated user id and the session epoch signed into
+// the cookie, or ("", 0, false) if there is no valid, unexpired session. The
+// caller must still confirm the epoch matches the user's current epoch to honor
+// revocation.
+func (m *Manager) UserID(r *http.Request, now time.Time) (string, int, bool) {
 	c, err := r.Cookie(m.cookieName)
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
-	uid, err := m.verify(c.Value, now)
+	uid, epoch, err := m.verify(c.Value, now)
 	if err != nil {
-		return "", false
+		return "", 0, false
 	}
-	return uid, true
+	return uid, epoch, true
 }
 
-// signed value layout: base64url(userID) "." base64url(expiryUnix) "." base64url(mac)
-func (m *Manager) sign(userID string, exp time.Time) string {
-	payload := b64(userID) + "." + b64(strconv.FormatInt(exp.Unix(), 10))
+// signed value layout:
+// base64url(userID) "." base64url(expiryUnix) "." base64url(epoch) "." base64url(mac)
+func (m *Manager) sign(userID string, epoch int, exp time.Time) string {
+	payload := b64(userID) + "." + b64(strconv.FormatInt(exp.Unix(), 10)) +
+		"." + b64(strconv.Itoa(epoch))
 	mac := m.mac(payload)
 	return payload + "." + base64.RawURLEncoding.EncodeToString(mac)
 }
 
-func (m *Manager) verify(value string, now time.Time) (string, error) {
+func (m *Manager) verify(value string, now time.Time) (string, int, error) {
 	parts := strings.Split(value, ".")
-	if len(parts) != 3 {
-		return "", errInvalid
+	if len(parts) != 4 {
+		return "", 0, errInvalid
 	}
-	payload := parts[0] + "." + parts[1]
-	gotMAC, err := base64.RawURLEncoding.DecodeString(parts[2])
+	payload := parts[0] + "." + parts[1] + "." + parts[2]
+	gotMAC, err := base64.RawURLEncoding.DecodeString(parts[3])
 	if err != nil {
-		return "", errInvalid
+		return "", 0, errInvalid
 	}
 	if subtle.ConstantTimeCompare(gotMAC, m.mac(payload)) != 1 {
-		return "", errInvalid
+		return "", 0, errInvalid
 	}
 	expRaw, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", errInvalid
+		return "", 0, errInvalid
 	}
 	expUnix, err := strconv.ParseInt(string(expRaw), 10, 64)
 	if err != nil {
-		return "", errInvalid
+		return "", 0, errInvalid
 	}
 	if now.Unix() >= expUnix {
-		return "", errInvalid
+		return "", 0, errInvalid
+	}
+	epochRaw, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return "", 0, errInvalid
+	}
+	epoch, err := strconv.Atoi(string(epochRaw))
+	if err != nil {
+		return "", 0, errInvalid
 	}
 	uidRaw, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return "", errInvalid
+		return "", 0, errInvalid
 	}
-	return string(uidRaw), nil
+	return string(uidRaw), epoch, nil
 }
 
 func (m *Manager) mac(payload string) []byte {

@@ -48,6 +48,41 @@ func TestUsers(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrConflict)
 }
 
+func TestBumpSessionEpoch(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	u := seedUser(t, s)
+	require.Zero(t, u.SessionEpoch, "new users start at epoch 0")
+
+	require.NoError(t, s.BumpSessionEpoch(ctx, u.ID))
+	got, err := s.UserByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, got.SessionEpoch)
+
+	require.NoError(t, s.BumpSessionEpoch(ctx, u.ID))
+	got, err = s.UserByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, 2, got.SessionEpoch)
+
+	require.ErrorIs(t, s.BumpSessionEpoch(ctx, "nope"), store.ErrNotFound)
+}
+
+// Migrate must be safe to run repeatedly (it runs on every startup), including
+// its ALTER TABLE backfills, and must preserve existing data.
+func TestMigrateIdempotent(t *testing.T) {
+	s := newStore(t) // already migrated once by newStore
+	ctx := t.Context()
+	u := seedUser(t, s)
+	require.NoError(t, s.BumpSessionEpoch(ctx, u.ID))
+
+	require.NoError(t, s.Migrate(ctx))
+	require.NoError(t, s.Migrate(ctx))
+
+	got, err := s.UserByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, got.SessionEpoch, "re-running Migrate must not reset data")
+}
+
 func TestUserOIDC(t *testing.T) {
 	s := newStore(t)
 	ctx := t.Context()

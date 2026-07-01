@@ -73,6 +73,54 @@ func TestSignupFlow(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+// A session issued before the user's epoch is bumped (logout / password change)
+// stops validating, even when the raw cookie is replayed by another client — a
+// leaked cookie cannot outlive a "log out everywhere".
+func TestLogoutRevokesExistingSessions(t *testing.T) {
+	h := newHarness(t)
+	h.seed(t) // user a@b.c / "secret"
+
+	// Log in and capture the raw session cookie, as a leaked copy would have it.
+	resp, err := h.client.PostForm(h.base+"/login", url.Values{
+		"email": {"a@b.c"}, "password": {"secret"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	var sessionCookie *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == "castlet_session" && c.Value != "" {
+			sessionCookie = c
+		}
+	}
+	require.NotNil(t, sessionCookie, "login must set a session cookie")
+
+	// The session is live.
+	resp, _ = h.get(t, "/admin/")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Log out: the epoch is bumped server-side.
+	before, err := h.store.UserByID(t.Context(), "u1")
+	require.NoError(t, err)
+	resp, err = h.client.PostForm(h.base+"/logout", nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	after, err := h.store.UserByID(t.Context(), "u1")
+	require.NoError(t, err)
+	require.Equal(t, before.SessionEpoch+1, after.SessionEpoch, "logout must bump the epoch")
+
+	// Replay the captured cookie from a fresh client: the stale epoch is rejected.
+	leaked := newClient()
+	req, err := http.NewRequest(http.MethodGet, h.base+"/admin/", nil)
+	require.NoError(t, err)
+	req.AddCookie(sessionCookie)
+	resp, err = leaked.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	require.Equal(t, "/login", resp.Header.Get("Location"))
+}
+
 // fakeAuthn is a stand-in OIDC authenticator for tests.
 type fakeAuthn struct {
 	identity *auth.Identity

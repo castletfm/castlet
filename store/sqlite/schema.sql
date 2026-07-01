@@ -8,10 +8,11 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT    NOT NULL,
     oidc_issuer   TEXT    NOT NULL DEFAULT '',
     oidc_subject  TEXT    NOT NULL DEFAULT '',
+    session_epoch INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL
 );
--- The oidc columns and this index are also ensured imperatively in Migrate so
--- databases created before they existed are upgraded in place.
+-- The oidc/session_epoch columns and this index are also ensured imperatively
+-- in Migrate so databases created before they existed are upgraded in place.
 
 CREATE TABLE IF NOT EXISTS channels (
     id          TEXT    PRIMARY KEY,

@@ -14,13 +14,13 @@ import (
 
 // --- users ------------------------------------------------------------------
 
-const userCols = `id, email, display_name, password_hash, oidc_issuer, oidc_subject, created_at`
+const userCols = `id, email, display_name, password_hash, oidc_issuer, oidc_subject, session_epoch, created_at`
 
 func (s *Store) CreateUser(ctx context.Context, u *model.User) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO users (id, email, display_name, password_hash, oidc_issuer, oidc_subject, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		u.ID, u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, toUnix(u.CreatedAt))
+		`INSERT INTO users (id, email, display_name, password_hash, oidc_issuer, oidc_subject, session_epoch, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, u.SessionEpoch, toUnix(u.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("sqlite: create user: %w", mapErr(err))
 	}
@@ -29,11 +29,22 @@ func (s *Store) CreateUser(ctx context.Context, u *model.User) error {
 
 func (s *Store) UpdateUser(ctx context.Context, u *model.User) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET email = ?, display_name = ?, password_hash = ?, oidc_issuer = ?, oidc_subject = ?
+		`UPDATE users SET email = ?, display_name = ?, password_hash = ?, oidc_issuer = ?, oidc_subject = ?, session_epoch = ?
 		 WHERE id = ?`,
-		u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, u.ID)
+		u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, u.SessionEpoch, u.ID)
 	if err != nil {
 		return fmt.Errorf("sqlite: update user: %w", mapErr(err))
+	}
+	return requireAffected(res)
+}
+
+// BumpSessionEpoch atomically increments the user's session epoch so every
+// session issued at the prior epoch stops validating on its next request.
+func (s *Store) BumpSessionEpoch(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE users SET session_epoch = session_epoch + 1 WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("sqlite: bump session epoch: %w", mapErr(err))
 	}
 	return requireAffected(res)
 }
@@ -63,7 +74,7 @@ func scanUser(sc interface{ Scan(...any) error }) (*model.User, error) {
 		created int64
 	)
 	if err := sc.Scan(&u.ID, &u.Email, &u.DisplayName, &u.PasswordHash,
-		&u.OIDCIssuer, &u.OIDCSubject, &created); err != nil {
+		&u.OIDCIssuer, &u.OIDCSubject, &u.SessionEpoch, &created); err != nil {
 		return nil, mapErr(err)
 	}
 	u.CreatedAt = fromUnix(created)

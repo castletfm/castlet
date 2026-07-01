@@ -83,7 +83,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.sessions.Issue(w, user.ID, s.now())
+	s.sessions.Issue(w, user.ID, user.SessionEpoch, s.now())
 	s.redirect(w, r, "/admin/")
 }
 

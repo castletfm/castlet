@@ -41,11 +41,19 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.sessions.Issue(w, user.ID, s.now())
+	s.sessions.Issue(w, user.ID, user.SessionEpoch, s.now())
 	s.redirect(w, r, "/admin/")
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Bump the epoch so every session for this user (not just this browser's
+	// cookie) is invalidated — "log out everywhere". Clearing the cookie only
+	// affects the current client.
+	if u := userFrom(r.Context()); u != nil {
+		if err := s.store.BumpSessionEpoch(r.Context(), u.ID); err != nil {
+			s.logger.Warn("failed to bump session epoch on logout", "user", u.ID, "error", err)
+		}
+	}
 	s.sessions.Clear(w)
 	s.redirect(w, r, "/")
 }
@@ -122,6 +130,6 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.sessions.Issue(w, user.ID, s.now())
+	s.sessions.Issue(w, user.ID, user.SessionEpoch, s.now())
 	s.redirect(w, r, "/admin/")
 }

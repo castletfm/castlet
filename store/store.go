@@ -64,6 +64,10 @@ type Store interface {
 
 	CreateUser(ctx context.Context, u *model.User) error
 	UpdateUser(ctx context.Context, u *model.User) error
+	// BumpSessionEpoch increments the user's session epoch, invalidating every
+	// session issued before the bump (a "log out everywhere", used on logout and
+	// after a password change). Returns ErrNotFound when no user has the id.
+	BumpSessionEpoch(ctx context.Context, id string) error
 	UserByID(ctx context.Context, id string) (*model.User, error)
 	UserByEmail(ctx context.Context, email string) (*model.User, error)
 	// UserByOIDCSubject finds the user linked to an identity provider subject,
