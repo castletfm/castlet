@@ -352,16 +352,21 @@ func (s *Server) handleEpisodeMove(w http.ResponseWriter, r *http.Request) {
 	}
 	eps[i], eps[j] = eps[j], eps[i]
 
+	// Renumber densely in one transaction so a mid-way failure cannot leave the
+	// channel's positions partially renumbered.
+	ids := make([]string, len(eps))
 	for idx, e := range eps {
-		if e.Position == idx {
-			continue
-		}
-		e.Position = idx
-		e.UpdatedAt = s.now()
-		if err := s.store.UpdateEpisode(r.Context(), e); err != nil {
-			s.serverError(w, r, err)
+		ids[idx] = e.ID
+	}
+	if err := s.store.ReorderEpisodes(r.Context(), ch.ID, ids, s.now()); err != nil {
+		if errors.Is(err, store.ErrInvalidReorder) {
+			// A concurrent add/delete left our snapshot stale; ask the user to retry.
+			s.renderError(w, r, http.StatusBadRequest,
+				"The episode order is out of date. Please reload and try again.")
 			return
 		}
+		s.serverError(w, r, err)
+		return
 	}
 	s.redirect(w, r, dest)
 }
