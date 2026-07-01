@@ -306,6 +306,70 @@ func TestJobSettlementFencedByClaimToken(t *testing.T) {
 	require.Equal(t, model.JobDone, got.Status)
 }
 
+// TestSettleEpisodeTranscriptFencedByClaimToken proves that the episode and
+// transcript side effects are fenced by the job's claim exactly like the queue
+// job status: once the lease expires and another worker reclaims the job
+// (advancing Attempts), the ORIGINAL attempt can no longer write the episode
+// status or save a transcript — its fenced call is a no-op returning
+// ErrStaleClaim — while the reclaiming attempt's write succeeds.
+func TestSettleEpisodeTranscriptFencedByClaimToken(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	seedUser(t, s)
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
+		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptPending, CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "j1", Kind: model.JobTranscribe,
+		Payload: `{"episode_id":"e1"}`, Status: model.JobPending, RunAfter: now, CreatedAt: now, UpdatedAt: now}))
+
+	// First worker claims the job: token (Attempts) = 1.
+	first, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 1, first.Attempts)
+
+	// The current claim can settle a non-terminal progress marker.
+	require.NoError(t, s.SettleEpisodeTranscript(ctx, "j1", first.Attempts, "e1", nil, model.TranscriptProcessing, now))
+	ep, err := s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptProcessing, ep.TranscriptStatus)
+
+	// Its lease expires and a second worker reclaims the still-"running" job,
+	// advancing the token to 2.
+	later := now.Add(2 * time.Minute)
+	second, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, later, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 2, second.Attempts)
+
+	// The original attempt (stale token 1) now tries to settle a done result:
+	// rejected as a no-op. Neither the transcript nor the status is written.
+	staleTr := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: later,
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 1, Text: "stale"}}}
+	require.ErrorIs(t, s.SettleEpisodeTranscript(ctx, "j1", first.Attempts, "e1", staleTr, model.TranscriptDone, later),
+		store.ErrStaleClaim)
+	_, err = s.TranscriptByEpisode(ctx, "e1")
+	require.ErrorIs(t, err, store.ErrNotFound, "stale attempt must not save a transcript")
+	ep, err = s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptProcessing, ep.TranscriptStatus,
+		"stale attempt must not overwrite the episode status")
+
+	// The reclaiming attempt (current token 2) settles normally: transcript saved
+	// and status advanced to done.
+	freshTr := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: later,
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 2, Text: "fresh"}}}
+	require.NoError(t, s.SettleEpisodeTranscript(ctx, "j1", second.Attempts, "e1", freshTr, model.TranscriptDone, later))
+	got, err := s.TranscriptByEpisode(ctx, "e1")
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	require.Equal(t, "fresh", got.Segments[0].Text)
+	ep, err = s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptDone, ep.TranscriptStatus)
+}
+
 func TestJobClaimReclaimsExpiredLease(t *testing.T) {
 	s := newStore(t)
 	ctx := t.Context()

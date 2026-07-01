@@ -104,6 +104,19 @@ type Store interface {
 	// SaveTranscript replaces any existing transcript for the episode.
 	SaveTranscript(ctx context.Context, t *model.Transcript) error
 	TranscriptByEpisode(ctx context.Context, episodeID string) (*model.Transcript, error)
+	// SettleEpisodeTranscript atomically records a transcription job's episode
+	// side effects, fenced by the job's claim so a stale worker cannot clobber a
+	// reclaiming attempt. In one transaction it verifies job (id, token) is still
+	// this attempt's claim — the row exists with attempts == token (the fencing
+	// token bumped on every reclaim) and a status of processing or failed (the
+	// two states a live or just-failed claim holds) — and only then, in the same
+	// transaction, saves transcript when non-nil and applies a targeted write of
+	// the episode's transcript_status (leaving the rest of the row untouched, so a
+	// concurrent admin edit is not reverted). It returns ErrStaleClaim and changes
+	// nothing when the job is no longer this attempt's claim (its lease expired and
+	// another worker reclaimed it, bumping attempts), so episode/transcript writes
+	// are as fenced as the queue's own Ack/Nack.
+	SettleEpisodeTranscript(ctx context.Context, jobID string, token int, episodeID string, transcript *model.Transcript, status model.TranscriptStatus, updatedAt time.Time) error
 
 	// Job persistence backs queue/dbqueue. A queue backed by an external
 	// service (Redis, SQS) implements queue.JobQueue directly and need not

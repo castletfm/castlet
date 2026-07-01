@@ -426,6 +426,62 @@ func (s *Store) TranscriptByEpisode(ctx context.Context, episodeID string) (*mod
 	return &t, nil
 }
 
+// SettleEpisodeTranscript atomically records a transcription job's episode side
+// effects under the fence of its claim. See store.Store for the contract.
+//
+// The fence is the claim token (jobs.attempts), which ClaimJob bumps on every
+// (re)claim: a stale attempt whose job was reclaimed no longer matches and
+// affects zero rows, so it gets ErrStaleClaim and touches neither the episode nor
+// the transcript. The status set (processing, failed) recognizes the two states a
+// job holds while its current claim settles the episode: 'processing' for the
+// success/none/progress writes made before the queue Ack, and 'failed' for the
+// terminal failed marking made right after the same claim's Nack/dead-letter has
+// failed the job. Doing the claim check and the mutations in one transaction (on
+// the single-writer pool) makes the check-and-write indivisible.
+func (s *Store) SettleEpisodeTranscript(ctx context.Context, jobID string, token int, episodeID string, transcript *model.Transcript, status model.TranscriptStatus, updatedAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: settle episode transcript: %w", mapErr(err))
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	var claimed int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM jobs WHERE id = ? AND attempts = ? AND status IN (?, ?)`,
+		jobID, token, string(model.JobProcessing), string(model.JobFailed)).Scan(&claimed); err != nil {
+		return fmt.Errorf("sqlite: verify job claim: %w", mapErr(err))
+	}
+	if claimed == 0 {
+		return store.ErrStaleClaim
+	}
+
+	if transcript != nil {
+		segs, err := json.Marshal(transcript.Segments)
+		if err != nil {
+			return fmt.Errorf("sqlite: marshal segments: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO transcripts (episode_id, language, segments, created_at)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(episode_id) DO UPDATE SET language = excluded.language,
+				segments = excluded.segments, created_at = excluded.created_at`,
+			transcript.EpisodeID, transcript.Language, string(segs), toUnix(transcript.CreatedAt)); err != nil {
+			return fmt.Errorf("sqlite: save transcript: %w", mapErr(err))
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE episodes SET transcript_status = ?, updated_at = ? WHERE id = ?`,
+		string(status), toUnix(updatedAt), episodeID); err != nil {
+		return fmt.Errorf("sqlite: set episode transcript status: %w", mapErr(err))
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: settle episode transcript: %w", mapErr(err))
+	}
+	return nil
+}
+
 // requireAffected converts a zero-rows-affected result into ErrNotFound so
 // updates/deletes of missing ids surface consistently.
 func requireAffected(res interface{ RowsAffected() (int64, error) }) error {

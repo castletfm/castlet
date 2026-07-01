@@ -93,6 +93,22 @@ func seedEpisode(t *testing.T, st *sqlite.Store, blobs *localfs.Store, q *dbqueu
 	return "e1"
 }
 
+// seedClaimedJob inserts a job row that stands in for a fake queue's in-flight
+// job, so the worker's claim-fenced episode settlement (SettleEpisodeTranscript)
+// recognizes this attempt as the active claim. Its Attempts — the fencing token —
+// matches the job the fake queue hands the worker, and it is left "processing" as
+// a live claim would be. Returns the job to serve from the fake queue.
+func seedClaimedJob(t *testing.T, st *sqlite.Store, id, episodeID string) *model.Job {
+	t.Helper()
+	now := time.Now()
+	j := &model.Job{ID: id, Kind: model.JobTranscribe,
+		Payload: `{"episode_id":"` + episodeID + `"}`,
+		Status:  model.JobProcessing, Attempts: 1,
+		RunAfter: now, CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, st.EnqueueJob(t.Context(), j))
+	return j
+}
+
 // waitStatus polls until the episode reaches want or the deadline passes.
 func waitStatus(t *testing.T, st *sqlite.Store, id string, want model.TranscriptStatus) {
 	t.Helper()
@@ -339,7 +355,7 @@ func TestWorkerAckSurvivesShutdownSuccess(t *testing.T) {
 	defer cancel()
 
 	q := &ackRecordingQueue{
-		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
+		job:    seedClaimedJob(t, st, "j1", "e1"),
 		acked:  make(chan struct{}),
 		nacked: make(chan struct{}),
 	}
@@ -365,14 +381,19 @@ func TestWorkerAckSurvivesShutdownSuccess(t *testing.T) {
 	require.Len(t, tr.Segments, 1)
 }
 
-// budgetExhaustingStore blocks SaveTranscript until the settlement context it is
-// handed expires, simulating a settlement step that consumes its entire budget.
-// Every other call delegates to the embedded store.
+// budgetExhaustingStore blocks the terminal fenced settlement (the one that
+// carries a transcript) until the settlement context it is handed expires,
+// simulating a settlement step that consumes its entire budget. The non-terminal
+// progress marker (no transcript) and every other call delegate to the embedded
+// store.
 type budgetExhaustingStore struct {
 	store.Store
 }
 
-func (s budgetExhaustingStore) SaveTranscript(ctx context.Context, _ *model.Transcript) error {
+func (s budgetExhaustingStore) SettleEpisodeTranscript(ctx context.Context, jobID string, token int, episodeID string, tr *model.Transcript, status model.TranscriptStatus, at time.Time) error {
+	if tr == nil {
+		return s.Store.SettleEpisodeTranscript(ctx, jobID, token, episodeID, tr, status, at)
+	}
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -455,8 +476,8 @@ type deadStatusRecordingStore struct {
 	recorded     chan struct{}
 }
 
-func (s *deadStatusRecordingStore) SetEpisodeTranscriptStatus(ctx context.Context, id string, status model.TranscriptStatus, at time.Time) error {
-	err := s.Store.SetEpisodeTranscriptStatus(ctx, id, status, at)
+func (s *deadStatusRecordingStore) SettleEpisodeTranscript(ctx context.Context, jobID string, token int, episodeID string, tr *model.Transcript, status model.TranscriptStatus, at time.Time) error {
+	err := s.Store.SettleEpisodeTranscript(ctx, jobID, token, episodeID, tr, status, at)
 	if status == model.TranscriptFailed {
 		s.statusCtxErr = ctx.Err()
 		close(s.recorded)
@@ -479,7 +500,7 @@ func TestWorkerDeadJobStatusSurvivesNackBudgetExhaustion(t *testing.T) {
 	defer cancel()
 
 	q := &deadNackQueue{
-		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
+		job:    seedClaimedJob(t, base, "j1", "e1"),
 		nacked: make(chan struct{}),
 	}
 	// A tiny settle budget means Nack draining its context to expiry is quick;
