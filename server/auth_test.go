@@ -25,7 +25,7 @@ func TestSignupDisabledByDefault(t *testing.T) {
 	resp, _ := h.get(t, "/signup")
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
-	resp, err := h.client.PostForm(h.base+"/signup", url.Values{
+	resp, err := h.postForm(t, "/signup", url.Values{
 		"email": {"x@y.z"}, "password": {"longenough"}, "password_confirm": {"longenough"}})
 	require.NoError(t, err)
 	resp.Body.Close()
@@ -40,21 +40,21 @@ func TestSignupFlow(t *testing.T) {
 	require.Contains(t, body, "Create your account")
 
 	// too-short password is rejected
-	resp, err := h.client.PostForm(h.base+"/signup", url.Values{
+	resp, err := h.postForm(t, "/signup", url.Values{
 		"email": {"new@user.test"}, "name": {"New"}, "password": {"short"}, "password_confirm": {"short"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 
 	// mismatch is rejected
-	resp, err = h.client.PostForm(h.base+"/signup", url.Values{
+	resp, err = h.postForm(t, "/signup", url.Values{
 		"email": {"new@user.test"}, "password": {"longenough1"}, "password_confirm": {"longenough2"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 
 	// success creates the account and an active session
-	resp, err = h.client.PostForm(h.base+"/signup", url.Values{
+	resp, err = h.postForm(t, "/signup", url.Values{
 		"email": {"new@user.test"}, "name": {"New"}, "password": {"longenough"}, "password_confirm": {"longenough"}})
 	require.NoError(t, err)
 	resp.Body.Close()
@@ -72,7 +72,7 @@ func TestSignupFlow(t *testing.T) {
 
 	// duplicate email is reported
 	jar2 := newClient()
-	resp, err = jar2.PostForm(h.base+"/signup", url.Values{
+	resp, err = postFormCSRF(t, jar2, h.base, "/signup", url.Values{
 		"email": {"new@user.test"}, "password": {"longenough"}, "password_confirm": {"longenough"}})
 	require.NoError(t, err)
 	resp.Body.Close()
@@ -87,7 +87,7 @@ func TestLogoutRevokesExistingSessions(t *testing.T) {
 	h.seed(t) // user a@b.c / "secret"
 
 	// Log in and capture the raw session cookie, as a leaked copy would have it.
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{
+	resp, err := h.postForm(t, "/login", url.Values{
 		"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
@@ -107,7 +107,7 @@ func TestLogoutRevokesExistingSessions(t *testing.T) {
 	// Log out: the epoch is bumped server-side.
 	before, err := h.store.UserByID(t.Context(), "u1")
 	require.NoError(t, err)
-	resp, err = h.client.PostForm(h.base+"/logout", nil)
+	resp, err = h.postForm(t, "/logout", nil)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -139,14 +139,14 @@ func TestLoginRateLimit(t *testing.T) {
 	// The first loginRateLimitMax (5) attempts are processed and rejected as
 	// invalid credentials (401).
 	for i := range 5 {
-		resp, err := h.client.PostForm(h.base+"/login", wrong)
+		resp, err := h.postForm(t, "/login", wrong)
 		require.NoError(t, err)
 		resp.Body.Close()
 		require.Equal(t, http.StatusUnauthorized, resp.StatusCode, "attempt %d", i)
 	}
 
 	// The next attempt is throttled with 429 and a Retry-After header.
-	resp, err := h.client.PostForm(h.base+"/login", wrong)
+	resp, err := h.postForm(t, "/login", wrong)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
@@ -154,7 +154,7 @@ func TestLoginRateLimit(t *testing.T) {
 
 	// A correct password would also be throttled now, proving the block is on
 	// the IP, not credential correctness.
-	resp, err = h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err = h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
@@ -178,14 +178,14 @@ func TestLoginRateLimitResetOnSuccess(t *testing.T) {
 
 	// Four failures — one under the budget of five.
 	for range 4 {
-		resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
+		resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
 		require.NoError(t, err)
 		resp.Body.Close()
 		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	}
 
 	// A success clears the counter.
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -193,7 +193,7 @@ func TestLoginRateLimitResetOnSuccess(t *testing.T) {
 	// The budget is full again: five more failures are all processed (401), none
 	// throttled, which would be impossible if the counter had not reset.
 	for i := range 5 {
-		resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
+		resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
 		require.NoError(t, err)
 		resp.Body.Close()
 		require.Equal(t, http.StatusUnauthorized, resp.StatusCode, "post-reset attempt %d", i)
@@ -237,13 +237,13 @@ func TestLogoutRevocationFailureReturnsError(t *testing.T) {
 	base := "http://" + ctrl.Addr()
 
 	client := newClient()
-	resp, err := client.PostForm(base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := postFormCSRF(t, client, base, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 
 	// Logout fails to bump the epoch: it must surface a 500, not a success redirect.
-	resp, err = client.PostForm(base+"/logout", nil)
+	resp, err = postFormCSRF(t, client, base, "/logout", nil)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,
@@ -291,14 +291,14 @@ func TestLogoutFailsClosedWhenUserLookupFails(t *testing.T) {
 
 	// Login issues a valid signed cookie (login uses UserByEmail, which still works).
 	client := newClient()
-	resp, err := client.PostForm(base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := postFormCSRF(t, client, base, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 
 	// Logout re-parses the cookie itself and looks the user up; that lookup fails,
 	// so revocation cannot be confirmed and logout must return 500, not a redirect.
-	resp, err = client.PostForm(base+"/logout", nil)
+	resp, err = postFormCSRF(t, client, base, "/logout", nil)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,

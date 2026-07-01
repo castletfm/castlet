@@ -3,6 +3,7 @@
   <h1>Create your account</h1>
   {{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
   <form method="post" action="/signup" class="stack">
+    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
     <label>Display name
       <input type="text" name="name" value="{{.Data.Name}}" autofocus>
     </label>

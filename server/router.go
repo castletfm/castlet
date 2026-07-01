@@ -60,7 +60,10 @@ func (s *Server) handler() http.Handler {
 	// the handlers so their panics become a logged 500. instrumentHTTP sits just
 	// inside logRequests so it observes the final status (including a recovered
 	// 500) and resolves the matched route pattern from mux for its metric labels.
-	app := s.logRequests(s.instrumentHTTP(mux, s.recoverPanic(s.loadUser(mux))))
+	// csrf sits just inside loadUser so the authenticated user is already in
+	// context when it renders a 403, and it wraps every application route so all
+	// state-changing POSTs are guarded and every rendered form gets a token.
+	app := s.logRequests(s.instrumentHTTP(mux, s.recoverPanic(s.loadUser(s.csrf(mux)))))
 
 	// Health probes are mounted on an outer mux so they bypass request logging
 	// (they are polled constantly by load balancers / supervisors) and the auth

@@ -7,6 +7,7 @@
 {{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
 
 <form method="post" action="{{.Data.Action}}" class="stack">
+  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
   <label>Title
     <input type="text" name="title" value="{{$ch.Title}}" required autofocus>
   </label>

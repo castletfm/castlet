@@ -11,6 +11,7 @@
 {{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
 
 <form method="post" action="/admin/episodes/{{$ep.ID}}" class="stack">
+  <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
   <label>Title
     <input type="text" name="title" value="{{.Data.Title}}" required autofocus>
   </label>
@@ -41,6 +42,7 @@
   <button class="btn ghost" disabled>Transcribing…</button>
   {{else}}
   <form method="post" action="/admin/episodes/{{$ep.ID}}/transcribe" class="inline">
+    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
     <button class="btn ghost" type="submit">Re-transcribe</button>
   </form>
   {{end}}

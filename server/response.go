@@ -15,6 +15,7 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, status int, page
 		Title:       title,
 		AllowSignup: s.allowSignup,
 		OIDCEnabled: s.authn != nil,
+		CSRFToken:   csrfFrom(r.Context()),
 		Data:        data,
 	}
 	var buf bytes.Buffer

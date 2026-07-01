@@ -3,6 +3,7 @@
   <h1>Log in</h1>
   {{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
   <form method="post" action="/login" class="stack">
+    <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
     <label>Email
       <input type="email" name="email" value="{{.Data.Email}}" required autofocus>
     </label>
