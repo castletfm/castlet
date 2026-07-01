@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"net/mail"
@@ -16,6 +17,27 @@ import (
 
 // minPasswordLen is the minimum length for a local account password.
 const minPasswordLen = 8
+
+// dummyPasswordHash is a precomputed bcrypt hash of an arbitrary password,
+// generated once at package load. When the login email is unknown, or the
+// account has no usable local password (an OIDC-only user with an empty
+// PasswordHash), the login handler still runs bcrypt against this constant hash
+// so the request pays the same ~100ms hashing cost as a real account would.
+// Without it the handler would return before any bcrypt work whenever the email
+// did not resolve to a password, letting an attacker enumerate which accounts
+// exist purely from the ~100x difference in response latency.
+var dummyPasswordHash = mustDummyPasswordHash()
+
+func mustDummyPasswordHash() []byte {
+	// bcrypt.GenerateFromPassword only errors on an invalid cost or an
+	// over-length password, neither of which applies to these constants, so a
+	// failure here is a programming error worth failing loudly at startup.
+	h, err := bcrypt.GenerateFromPassword([]byte("castlet-timing-equalizer"), bcrypt.DefaultCost)
+	if err != nil {
+		panic("server: precompute dummy bcrypt hash: " + err.Error())
+	}
+	return h
+}
 
 type loginPage struct {
 	Email string
@@ -46,7 +68,43 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user, err := s.store.UserByEmail(r.Context(), email)
-	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {
+
+	// Pick the hash to verify against. For an unknown email or an OIDC-only
+	// account (no local password), fall back to the constant dummy hash so the
+	// bcrypt comparison below always runs; otherwise the response time would
+	// reveal whether the account exists. realAccount records whether this is a
+	// genuine local login, so a chance match against the dummy hash can never
+	// authenticate.
+	hash := dummyPasswordHash
+	realAccount := 0
+	if err == nil && user.PasswordHash != "" {
+		hash = []byte(user.PasswordHash)
+		realAccount = 1
+	}
+
+	// Always pay the full bcrypt cost regardless of which hash was selected, so
+	// response time never reveals whether the account exists. A nil result means
+	// the password matched; a plain mismatch has already paid the KDF cost. Any
+	// OTHER error means the stored hash was structurally unusable (empty, wrong
+	// prefix, bad cost, corrupt salt, …) so bcrypt returned cheaply before the
+	// KDF — burn a full comparison against the known-good dummy hash and never
+	// treat it as a real login. This closes the whole malformed-stored-hash
+	// timing class without trying to pre-validate every hash field.
+	match := 0
+	switch cmpErr := bcrypt.CompareHashAndPassword(hash, []byte(password)); {
+	case cmpErr == nil:
+		match = 1
+	case errors.Is(cmpErr, bcrypt.ErrMismatchedHashAndPassword):
+		// Full KDF paid; wrong password.
+	default:
+		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(password))
+		realAccount = 0
+	}
+
+	// A login succeeds only for a real account whose password matched. subtle
+	// combines the two flags without a short-circuit so the decision itself adds
+	// no data-dependent branch on top of the (dominant) hashing cost.
+	if subtle.ConstantTimeEq(int32(realAccount&match), 1) != 1 {
 		// Same response whether the email is unknown or the password is wrong,
 		// so the form does not reveal which accounts exist.
 		s.loginLimiter.fail(key, s.now())
