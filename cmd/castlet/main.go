@@ -115,7 +115,21 @@ func cmdUserCreate(args []string) error {
 		return fmt.Errorf("--email is required")
 	}
 
-	plaintext, err := resolvePassword(*passwordFile, *password, os.Stdin, os.Stderr)
+	// Determine which password source flags were actually supplied on the
+	// command line, so precedence keys on whether a flag was provided rather
+	// than on whether its value happens to be non-empty. This makes an explicit
+	// --password "" or --password-file "" behave as the user selected them.
+	var passwordFileSet, passwordSet bool
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "password-file":
+			passwordFileSet = true
+		case "password":
+			passwordSet = true
+		}
+	})
+
+	plaintext, err := resolvePassword(*passwordFile, passwordFileSet, *password, passwordSet, os.Stdin, os.Stderr)
 	if err != nil {
 		return err
 	}
@@ -159,17 +173,22 @@ func cmdUserCreate(args []string) error {
 }
 
 // resolvePassword returns the plaintext password using the following
-// precedence: (1) --password-file if set; (2) the --password flag if non-empty
-// (kept for backward compatibility but insecure); (3) an interactive prompt
-// when stdin is a terminal; (4) otherwise an error, since no password source is
-// available. An explicitly supplied --password is always honored, so the prompt
-// only appears when neither a file nor a flag is provided. in is the file used
-// to detect and read from a terminal, out is where the prompt is written.
-func resolvePassword(passwordFile, passwordFlag string, in *os.File, out io.Writer) (string, error) {
-	if passwordFile != "" {
+// precedence, keyed on which flags were SUPPLIED (fileSet/flagSet) rather than
+// on whether their values are non-empty: (1) --password-file if supplied (this
+// source wins even when --password is also given; an empty or unreadable path
+// is a clear error); (2) the --password flag if supplied (returned verbatim,
+// even when empty, so the caller's empty-password validation can reject it);
+// (3) an interactive prompt when stdin is a terminal; (4) otherwise an error,
+// since no password source is available. in is the file used to detect and read
+// from a terminal, out is where the prompt is written.
+func resolvePassword(passwordFile string, fileSet bool, passwordFlag string, flagSet bool, in *os.File, out io.Writer) (string, error) {
+	if fileSet {
+		if passwordFile == "" {
+			return "", fmt.Errorf("--password-file requires a path")
+		}
 		return readPasswordFile(passwordFile)
 	}
-	if passwordFlag != "" {
+	if flagSet {
 		return passwordFlag, nil
 	}
 	if in != nil && term.IsTerminal(int(in.Fd())) {
