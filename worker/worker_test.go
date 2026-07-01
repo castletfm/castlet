@@ -669,9 +669,11 @@ func TestWorkerNullSettlesToNone(t *testing.T) {
 	st, blobs, q := setup(t)
 	id := seedEpisode(t, st, blobs, q)
 
+	reg := metrics.New()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	_, err := worker.New(st, blobs, q, null.New(), worker.WithPollInterval(10*time.Millisecond)).Run(ctx)
+	ctrl, err := worker.New(st, blobs, q, null.New(),
+		worker.WithPollInterval(10*time.Millisecond), worker.WithMetrics(reg)).Run(ctx)
 	require.NoError(t, err)
 
 	// null transcriber reports unsupported -> transcript status becomes "none"
@@ -679,4 +681,23 @@ func TestWorkerNullSettlesToNone(t *testing.T) {
 
 	_, err = st.TranscriptByEpisode(t.Context(), id)
 	require.Error(t, err, "no transcript should be saved")
+
+	cancel()
+	require.NoError(t, ctrl.Wait())
+
+	// A committed TranscriptNone produced no transcript: it must be counted as
+	// "skipped", NOT "success", and must not advance last-success — otherwise the
+	// default null transcriber would report phantom successful transcriptions.
+	var b strings.Builder
+	_, err = reg.WriteTo(&b)
+	require.NoError(t, err)
+	out := b.String()
+	require.Contains(t, out, `transcription_jobs_total{outcome="skipped"} 1`)
+	require.NotContains(t, out, `transcription_jobs_total{outcome="success"}`,
+		"a no-op TranscriptNone settlement must not be counted as a success")
+	// last-success has no value line written (only its # HELP/# TYPE headers).
+	for ln := range strings.SplitSeq(out, "\n") {
+		require.False(t, strings.HasPrefix(ln, "worker_last_success_timestamp_seconds "),
+			"a skipped settlement must not advance last-success, got line: %q", ln)
+	}
 }

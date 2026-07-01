@@ -174,7 +174,7 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, tr transcribe.T
 	if w.metrics == nil {
 		w.metrics = metrics.New()
 	}
-	w.metrics.Register(metricJobsTotal, metrics.Counter, "Transcription job attempts by outcome (success or failure).")
+	w.metrics.Register(metricJobsTotal, metrics.Counter, "Transcription job attempts by outcome (success, skipped, or failure).")
 	w.metrics.Register(metricLastSuccess, metrics.Gauge, "Unix timestamp of the worker's last successful transcription.")
 	return w
 }
@@ -299,14 +299,24 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 	if serr != nil {
 		return true, w.fail(job, serr)
 	}
-	// Only a settlement that actually committed is a real success. When the claim
-	// was lost to a reclaim the settlement is discarded as a no-op (committed ==
+	// Only a settlement that actually committed is counted. When the claim was
+	// lost to a reclaim the settlement is discarded as a no-op (committed ==
 	// false); the reclaiming attempt owns the job and will record its own outcome,
 	// so counting this stale no-op would double-count and wrongly advance
 	// last-success.
 	if committed {
-		w.metrics.Inc(metricJobsTotal, "outcome", "success")
-		w.metrics.Set(metricLastSuccess, float64(time.Now().Unix()))
+		// A committed settlement is only a real success when it actually produced
+		// a transcript (terminal status Done / transcript != nil). A committed
+		// TranscriptNone is the unsupported/no-op path (e.g. the null transcriber):
+		// nothing was transcribed, so count it as "skipped" and do NOT advance
+		// last-success — otherwise /metrics would report a successful transcription
+		// and move the worker's last-success forward without any transcript.
+		if s.status == model.TranscriptDone {
+			w.metrics.Inc(metricJobsTotal, "outcome", "success")
+			w.metrics.Set(metricLastSuccess, float64(time.Now().Unix()))
+		} else {
+			w.metrics.Inc(metricJobsTotal, "outcome", "skipped")
+		}
 	}
 	return true, nil
 }
