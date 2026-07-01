@@ -753,3 +753,85 @@ func TestOIDCProvisionCanonicalizesEmail(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, u.ID, byEmail.ID)
 }
+
+// A malformed email at login (one net/mail rejects) cannot canonicalize and so
+// cannot match any account. It must take the ordinary invalid-credentials path:
+// the same 401 + "Invalid email or password." as a wrong password, never a 500
+// or a different status, and it must not authenticate.
+func TestLoginMalformedEmailFailsAsInvalidCredentials(t *testing.T) {
+	h := newHarness(t)
+	h.seed(t) // a@b.c / "secret"
+
+	// Baseline: a wrong password for a real account renders the 401 error page.
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
+	require.NoError(t, err)
+	baseBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	require.Contains(t, string(baseBody), "Invalid email or password.")
+
+	// A malformed address takes the identical path: 401, same message, no session.
+	// (Kept under the per-IP failure budget so the limiter does not turn later
+	// attempts into 429s.)
+	for _, bad := range []string{"not-an-email", "alice@"} {
+		client := newClient()
+		resp, err := postFormCSRF(t, client, h.base, "/login",
+			url.Values{"email": {bad}, "password": {"whatever"}})
+		require.NoError(t, err)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+			"malformed email %q must return the standard 401, not a 500 or other status", bad)
+		require.Contains(t, string(body), "Invalid email or password.",
+			"malformed email must render the same invalid-credentials message as a wrong password")
+		for _, c := range resp.Cookies() {
+			require.NotEqual(t, "castlet_session", c.Name,
+				"malformed login must not issue a session")
+		}
+	}
+}
+
+// When the provider reports a malformed email (net/mail rejects it), it is
+// treated as "no usable email": neither a new account is provisioned nor an
+// existing account is linked. Both paths must reject with 403 and write nothing.
+func TestOIDCMalformedProviderEmailRejected(t *testing.T) {
+	t.Run("provision", func(t *testing.T) {
+		id := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-bad",
+			Email: "not-an-email", EmailVerified: true, Name: "Bad"}
+		h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: id}))
+
+		state := h.startOIDC(t)
+		resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+		// no account provisioned for the malformed identity
+		_, err = h.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-bad")
+		require.ErrorIs(t, err, store.ErrNotFound)
+	})
+
+	t.Run("link", func(t *testing.T) {
+		id := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-bad-link",
+			Email: "not-an-email", EmailVerified: true, Name: "Bad"}
+		h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: id}))
+
+		// A pre-existing local account exists, but the malformed provider email
+		// cannot be used to find (and thus must not link) it.
+		require.NoError(t, h.store.CreateUser(t.Context(), &model.User{ID: "local1",
+			Email: "existing@user.test", DisplayName: "Existing", PasswordHash: mustHash(t, "secret")}))
+
+		state := h.startOIDC(t)
+		resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+		// the existing account was NOT linked to the malformed identity
+		_, err = h.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-bad-link")
+		require.ErrorIs(t, err, store.ErrNotFound)
+		unchanged, err := h.store.UserByEmail(t.Context(), "existing@user.test")
+		require.NoError(t, err)
+		require.Empty(t, unchanged.OIDCSubject, "malformed provider email must not link the existing account")
+	})
+}
