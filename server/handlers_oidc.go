@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/castletfm/castlet/auth"
+	"github.com/castletfm/castlet/internal/email"
 	"github.com/castletfm/castlet/internal/idgen"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/store"
@@ -97,17 +98,30 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 func (s *Server) resolveOIDCUser(r *http.Request, id *auth.Identity) (*model.User, error) {
 	ctx := r.Context()
 
+	// Canonicalize the provider-supplied email once so every downstream decision
+	// (allowlist, linking a pre-existing password account, and just-in-time
+	// provisioning) agrees on one form. This is what lets OIDC link/resolve the
+	// same mailbox case-insensitively: a provider reporting "Alice@Example.com"
+	// resolves to the account created as "alice@example.com". A non-empty but
+	// malformed provider email is treated as no usable email.
+	canonicalEmail := ""
+	if id.Email != "" {
+		if c, err := email.Canonical(id.Email); err == nil {
+			canonicalEmail = c
+		}
+	}
+
 	// When an email-domain allowlist is configured, enforce it on every
 	// sign-in path, including accounts already linked by subject, so removing
 	// a domain from the allowlist blocks its previously linked users too.
 	if len(s.allowedDomains) > 0 {
-		if id.Email == "" {
+		if canonicalEmail == "" {
 			return nil, errors.New("Your identity provider did not share an email address.")
 		}
 		if !id.EmailVerified {
 			return nil, errors.New("Your identity provider did not verify your email address.")
 		}
-		if !s.emailDomainAllowed(id.Email) {
+		if !s.emailDomainAllowed(canonicalEmail) {
 			return nil, errors.New("Your email domain is not permitted to sign in.")
 		}
 	}
@@ -120,14 +134,14 @@ func (s *Server) resolveOIDCUser(r *http.Request, id *auth.Identity) (*model.Use
 		return nil, err
 	}
 
-	if id.Email == "" {
+	if canonicalEmail == "" {
 		return nil, errors.New("Your identity provider did not share an email address.")
 	}
 
 	// Link an existing local account, but only when the provider vouches for
 	// the email, so a password account cannot be hijacked via an unverified
 	// claim.
-	existing, err := s.store.UserByEmail(ctx, id.Email)
+	existing, err := s.store.UserByEmail(ctx, canonicalEmail)
 	if err == nil {
 		if !id.EmailVerified {
 			return nil, errors.New("An account with this email exists but the provider did not verify the address.")
@@ -160,11 +174,11 @@ func (s *Server) resolveOIDCUser(r *http.Request, id *auth.Identity) (*model.Use
 	}
 	name := id.Name
 	if name == "" {
-		name = id.Email
+		name = canonicalEmail
 	}
 	user = &model.User{
 		ID:          idgen.New(),
-		Email:       id.Email,
+		Email:       canonicalEmail,
 		DisplayName: name,
 		OIDCIssuer:  id.Issuer,
 		OIDCSubject: id.Subject,

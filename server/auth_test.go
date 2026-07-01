@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -631,4 +632,124 @@ func (h *harness) startOIDC(t *testing.T) string {
 	loc, err := url.Parse(resp.Header.Get("Location"))
 	require.NoError(t, err)
 	return loc.Query().Get("state")
+}
+
+// Signing up with mixed-case input stores the mailbox in canonical (lower-cased,
+// display-name-stripped) form, and a later login with any casing of the same
+// mailbox resolves that one account — one mailbox = one account.
+func TestSignupCanonicalizesEmail(t *testing.T) {
+	h := newHarness(t, server.WithAllowSignup(true))
+
+	// A display name and mixed case are both normalized away on write.
+	resp, err := h.postForm(t, "/signup", url.Values{
+		"email": {"Alice <Alice@Example.com>"}, "name": {"Alice"},
+		"password": {"longenough"}, "password_confirm": {"longenough"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	// Stored canonical: bare, lower-cased address.
+	u, err := h.store.UserByEmail(t.Context(), "alice@example.com")
+	require.NoError(t, err)
+	require.Equal(t, "alice@example.com", u.Email)
+
+	// Login with a different casing of the same mailbox resolves the SAME account.
+	for _, cred := range []string{"alice@example.com", "ALICE@EXAMPLE.COM", "Alice@Example.com"} {
+		client := newClient()
+		resp, err := postFormCSRF(t, client, h.base, "/login", url.Values{
+			"email": {cred}, "password": {"longenough"}})
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusSeeOther, resp.StatusCode, "login with %q must succeed", cred)
+		require.Equal(t, "/admin/", resp.Header.Get("Location"))
+	}
+}
+
+// A second signup for the same mailbox under a different case is rejected as a
+// duplicate: the canonical form collides on the case-insensitive unique index.
+func TestSignupRejectsCaseVariantDuplicate(t *testing.T) {
+	h := newHarness(t, server.WithAllowSignup(true))
+
+	resp, err := h.postForm(t, "/signup", url.Values{
+		"email": {"dup@example.com"}, "password": {"longenough"}, "password_confirm": {"longenough"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	client := newClient()
+	resp, err = postFormCSRF(t, client, h.base, "/signup", url.Values{
+		"email": {"DUP@Example.com"}, "password": {"longenough"}, "password_confirm": {"longenough"}})
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Contains(t, string(body), "already registered")
+
+	// Only the original account exists.
+	u, err := h.store.UserByEmail(t.Context(), "dup@example.com")
+	require.NoError(t, err)
+	require.NotEmpty(t, u.ID)
+}
+
+// A malformed email is rejected at signup via the bad-request path, before any
+// account is created.
+func TestSignupRejectsMalformedEmail(t *testing.T) {
+	h := newHarness(t, server.WithAllowSignup(true))
+
+	resp, err := h.postForm(t, "/signup", url.Values{
+		"email": {"not-an-email"}, "password": {"longenough"}, "password_confirm": {"longenough"}})
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Contains(t, string(body), "valid email")
+}
+
+// OIDC links a pre-existing password account when the provider reports the same
+// mailbox in a different case, instead of provisioning a duplicate.
+func TestOIDCLinksCaseInsensitiveEmail(t *testing.T) {
+	// Provider reports the mailbox with different casing than it was stored under.
+	id := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-ci",
+		Email: "Existing@User.Test", EmailVerified: true, Name: "Existing"}
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: id}))
+
+	// pre-existing local account stored in canonical (lower-case) form
+	require.NoError(t, h.store.CreateUser(t.Context(), &model.User{ID: "local1",
+		Email: "existing@user.test", DisplayName: "Existing", PasswordHash: mustHash(t, "secret")}))
+
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	// the existing account was linked (matched case-insensitively), not duplicated
+	linked, err := h.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-ci")
+	require.NoError(t, err)
+	require.Equal(t, "local1", linked.ID)
+	require.NotEmpty(t, linked.PasswordHash, "linking keeps the existing password")
+	require.Equal(t, "existing@user.test", linked.Email, "linking does not rewrite the stored canonical email")
+}
+
+// OIDC just-in-time provisioning stores the provider email in canonical form, so
+// a later provider report under a different case resolves the same account.
+func TestOIDCProvisionCanonicalizesEmail(t *testing.T) {
+	id := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-prov",
+		Email: "New.User@Example.COM", EmailVerified: true, Name: "New User"}
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: id}))
+
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	u, err := h.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-prov")
+	require.NoError(t, err)
+	require.Equal(t, "new.user@example.com", u.Email, "provisioning stores the canonical email")
+
+	// The canonical address is now discoverable via the case-insensitive lookup.
+	byEmail, err := h.store.UserByEmail(t.Context(), "new.user@example.com")
+	require.NoError(t, err)
+	require.Equal(t, u.ID, byEmail.ID)
 }

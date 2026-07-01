@@ -48,6 +48,17 @@ func TestUsers(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrConflict)
 }
 
+// The email unique index is case-INSENSITIVE (COLLATE NOCASE): a case-only
+// variant of an existing address must collide, backstopping the app-level
+// canonicalization so one mailbox maps to one account even for a direct writer.
+func TestUsersEmailUniqueCaseInsensitive(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s) // a@example.com
+
+	err := s.CreateUser(t.Context(), &model.User{ID: "u2", Email: "A@Example.com", DisplayName: "B"})
+	require.ErrorIs(t, err, store.ErrConflict)
+}
+
 func TestBumpSessionEpoch(t *testing.T) {
 	s := newStore(t)
 	ctx := t.Context()

@@ -3,7 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS users (
     id            TEXT    PRIMARY KEY,
-    email         TEXT    NOT NULL UNIQUE,
+    email         TEXT    NOT NULL,
     display_name  TEXT    NOT NULL,
     password_hash TEXT    NOT NULL,
     oidc_issuer   TEXT    NOT NULL DEFAULT '',
@@ -11,8 +11,13 @@ CREATE TABLE IF NOT EXISTS users (
     session_epoch INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL
 );
--- The oidc/session_epoch columns and this index are also ensured imperatively
--- in Migrate so databases created before they existed are upgraded in place.
+-- Email uniqueness is case-INSENSITIVE (COLLATE NOCASE): the identity model is
+-- one mailbox = one account, so Alice@x and alice@x must collide. Writers also
+-- store the canonicalized (lower-cased) address (see internal/email), so this
+-- index is defense in depth for any path that reaches the store directly. This
+-- index and the oidc/session_epoch columns are also ensured imperatively in
+-- Migrate so databases created before they existed are upgraded in place.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS channels (
     id          TEXT    PRIMARY KEY,

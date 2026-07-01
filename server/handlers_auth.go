@@ -3,11 +3,11 @@ package server
 import (
 	"errors"
 	"net/http"
-	"net/mail"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/castletfm/castlet/internal/email"
 	"github.com/castletfm/castlet/internal/idgen"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/store"
@@ -31,7 +31,7 @@ func (s *Server) handleLoginForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	email := r.FormValue("email")
+	rawEmail := r.FormValue("email")
 	password := r.FormValue("password")
 
 	// Brute-force speed bump: refuse further attempts from an IP that has
@@ -41,17 +41,27 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if retryAfter, blocked := s.loginLimiter.blocked(key, s.now()); blocked {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
 		s.render(w, r, http.StatusTooManyRequests, "login", "Log in",
-			loginPage{Email: email, Error: "Too many failed login attempts. Please wait and try again."})
+			loginPage{Email: rawEmail, Error: "Too many failed login attempts. Please wait and try again."})
 		return
 	}
 
-	user, err := s.store.UserByEmail(r.Context(), email)
+	// Look up by the canonical form so a login with different casing than at
+	// signup ("Alice@Example.com" vs "alice@example.com") still finds the account.
+	// A malformed address cannot match any account: fall through to the same
+	// invalid-credentials response rather than short-circuiting, so the form never
+	// reveals whether an address is well-formed or exists.
+	lookup := rawEmail
+	if canonical, cerr := email.Canonical(rawEmail); cerr == nil {
+		lookup = canonical
+	}
+
+	user, err := s.store.UserByEmail(r.Context(), lookup)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {
 		// Same response whether the email is unknown or the password is wrong,
 		// so the form does not reveal which accounts exist.
 		s.loginLimiter.fail(key, s.now())
 		s.render(w, r, http.StatusUnauthorized, "login", "Log in",
-			loginPage{Email: email, Error: "Invalid email or password."})
+			loginPage{Email: rawEmail, Error: "Invalid email or password."})
 		return
 	}
 
@@ -154,18 +164,23 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email := strings.TrimSpace(r.FormValue("email"))
+	rawEmail := strings.TrimSpace(r.FormValue("email"))
 	name := strings.TrimSpace(r.FormValue("name"))
 	password := r.FormValue("password")
 	confirm := r.FormValue("password_confirm")
 
-	form := signupPage{Email: email, Name: name}
+	form := signupPage{Email: rawEmail, Name: name}
 	fail := func(msg string) {
 		form.Error = msg
 		s.render(w, r, http.StatusBadRequest, "signup", "Sign up", form)
 	}
 
-	if _, err := mail.ParseAddress(email); err != nil {
+	// Canonicalize before any store write so accounts are keyed on the mailbox:
+	// a malformed address is rejected here, and the stored value is the bare,
+	// lower-cased address so the case-insensitive unique index rejects a later
+	// duplicate signup under a different case with ErrConflict.
+	canonicalEmail, err := email.Canonical(rawEmail)
+	if err != nil {
 		fail("Enter a valid email address.")
 		return
 	}
@@ -184,11 +199,11 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if name == "" {
-		name = email
+		name = canonicalEmail
 	}
 	user := &model.User{
 		ID:           idgen.New(),
-		Email:        email,
+		Email:        canonicalEmail,
 		DisplayName:  name,
 		PasswordHash: string(hash),
 		CreatedAt:    s.now(),
