@@ -211,8 +211,235 @@ func TestChannelsAndEpisodes(t *testing.T) {
 	require.ErrorIs(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1",
 		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptNone}), store.ErrConflict)
 
-	require.NoError(t, s.DeleteEpisode(ctx, "e2"))
-	require.ErrorIs(t, s.DeleteEpisode(ctx, "e2"), store.ErrNotFound)
+	delKey, _, _, err := s.DeleteEpisode(ctx, "e2", time.Now())
+	require.NoError(t, err)
+	require.Empty(t, delKey, "e2 is a draft with no media")
+	missKey, _, _, missErr := s.DeleteEpisode(ctx, "e2", time.Now())
+	require.ErrorIs(t, missErr, store.ErrNotFound)
+	require.Empty(t, missKey)
+}
+
+// TestDeleteEpisodeOrphan proves DeleteEpisode's atomic orphan report (CST-013):
+// a shared, content-addressed media key is reported orphaned only once the LAST
+// referencing episode is gone, and a channel's cover art keeps a key alive.
+func TestDeleteEpisodeOrphan(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s)
+	ctx := t.Context()
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	mkEp := func(id, key string) *model.Episode {
+		return &model.Episode{ID: id, ChannelID: "c1", Title: id, MediaKey: key,
+			MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, Status: model.EpisodeDraft,
+			TranscriptStatus: model.TranscriptNone, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	}
+
+	// Two episodes share one content-addressed key (identical uploaded bytes).
+	require.NoError(t, s.CreateEpisode(ctx, mkEp("e1", "shared")))
+	require.NoError(t, s.CreateEpisode(ctx, mkEp("e2", "shared")))
+
+	now := time.Now()
+
+	// Deleting the first must NOT orphan the blob: e2 still references it.
+	key, orphaned, _, err := s.DeleteEpisode(ctx, "e1", now)
+	require.NoError(t, err)
+	require.Equal(t, "shared", key)
+	require.False(t, orphaned, "blob is still referenced by e2")
+
+	// Deleting the last referencing episode orphans the blob (and takes a delete
+	// lease; release it as the handler would).
+	key, orphaned, tok, err := s.DeleteEpisode(ctx, "e2", now)
+	require.NoError(t, err)
+	require.Equal(t, "shared", key)
+	require.True(t, orphaned, "no episode references the blob anymore")
+	require.NoError(t, s.ReleaseDeleteLease(ctx, tok))
+
+	// A channel cover art protects a shared key: an episode whose media key equals
+	// a channel's image key is not orphaned when deleted.
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c2", UserID: "u1", Title: "Cover",
+		ImageKey: "img", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	require.NoError(t, s.CreateEpisode(ctx, mkEp("e3", "img")))
+	key, orphaned, _, err = s.DeleteEpisode(ctx, "e3", now)
+	require.NoError(t, err)
+	require.Equal(t, "img", key)
+	require.False(t, orphaned, "channel cover art still references the key")
+
+	// An episode with no media key is never orphaned (there is no blob to delete).
+	require.NoError(t, s.CreateEpisode(ctx, mkEp("e4", "")))
+	key, orphaned, _, err = s.DeleteEpisode(ctx, "e4", now)
+	require.NoError(t, err)
+	require.Empty(t, key)
+	require.False(t, orphaned)
+}
+
+// TestBlobReservationOrphan proves the reservation table closes the sibling race
+// (an in-flight upload writes the blob before its episode row exists): an active
+// reservation keeps DeleteEpisode/BlobOrphaned from reporting a key orphaned even
+// when no episode references it, releasing (by token) frees it, and a stale (older
+// than the TTL) reservation no longer protects the key so a crashed upload cannot
+// pin a blob forever. A BlobOrphaned==true result takes a delete lease that the
+// caller releases after the notional physical delete (as the handler does).
+func TestBlobReservationOrphan(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s)
+	ctx := t.Context()
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	now := time.Now()
+	ep := &model.Episode{ID: "e1", ChannelID: "c1", Title: "Ep", MediaKey: "k",
+		MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, Status: model.EpisodeDraft,
+		TranscriptStatus: model.TranscriptNone, CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, s.CreateEpisode(ctx, ep))
+
+	// Simulate a concurrent upload of the SAME content-addressed key that has
+	// written its blob (Put) but not yet committed its episode row: it holds a
+	// reservation. Deleting the only existing episode must NOT orphan the key.
+	token, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	key, orphaned, _, err := s.DeleteEpisode(ctx, "e1", now)
+	require.NoError(t, err)
+	require.Equal(t, "k", key)
+	require.False(t, orphaned, "an active reservation must keep the blob alive")
+
+	// BlobOrphaned (the rollback path) sees the reservation too.
+	got, _, err := s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.False(t, got, "an active reservation must keep the blob alive")
+
+	// Once the upload releases its reservation and no episode references the key,
+	// the blob is orphaned (and a delete lease is taken; release it afterwards).
+	require.NoError(t, s.ReleaseBlob(ctx, token))
+	got, dtok, err := s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.True(t, got, "no episode and no reservation -> orphaned")
+	require.NoError(t, s.ReleaseDeleteLease(ctx, dtok))
+
+	// A reservation older than the TTL is stale (a crashed upload) and must not
+	// protect the key: evaluating "now" well past the reservation's timestamp
+	// treats it as expired.
+	staleToken, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	future := now.Add(48 * time.Hour) // beyond store.BlobReservationTTL (24h)
+	got, dtok, err = s.BlobOrphaned(ctx, "k", future)
+	require.NoError(t, err)
+	require.True(t, got, "a stale reservation must not pin the blob")
+	require.NoError(t, s.ReleaseDeleteLease(ctx, dtok))
+	require.NoError(t, s.ReleaseBlob(ctx, staleToken))
+
+	// Concurrent identical uploads act as a refcount: two reservations, releasing
+	// one still leaves the key protected.
+	t1, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	t2, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	require.NoError(t, s.ReleaseBlob(ctx, t1)) // drop one
+	got, _, err = s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.False(t, got, "a remaining reservation still protects the key")
+	require.NoError(t, s.ReleaseBlob(ctx, t2))
+}
+
+// TestBlobDeleteLease proves the delete lease closes the residual window in which
+// a reservation created after the delete transaction commits but before the
+// physical blobs.Delete would be invisible: while the lease is held ReserveBlob is
+// rejected (ErrBlobDeleting) so a same-content upload retries instead of racing
+// the delete; a stale lease (past its TTL) no longer blocks, and after the lease
+// is released reservation succeeds again.
+func TestBlobDeleteLease(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s)
+	ctx := t.Context()
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	now := time.Now()
+	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
+		MediaKey: "k", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio, Status: model.EpisodeDraft,
+		TranscriptStatus: model.TranscriptNone, CreatedAt: now, UpdatedAt: now}))
+
+	// Deleting the only referencing episode orphans "k" and takes a delete lease
+	// (owner token) atomically with the decision.
+	_, orphaned, dtok, err := s.DeleteEpisode(ctx, "e1", now)
+	require.NoError(t, err)
+	require.True(t, orphaned)
+
+	// A concurrent upload reserving the same key while the lease is held is rejected.
+	_, err = s.ReserveBlob(ctx, "k", now)
+	require.ErrorIs(t, err, store.ErrBlobDeleting)
+
+	// A stale lease (older than store.BlobDeleteLeaseTTL) no longer blocks reservations.
+	future := now.Add(10 * time.Minute) // beyond store.BlobDeleteLeaseTTL (5m)
+	tok, err := s.ReserveBlob(ctx, "k", future)
+	require.NoError(t, err)
+	require.NoError(t, s.ReleaseBlob(ctx, tok))
+
+	// After the physical delete completes and the lease is released (by token),
+	// reservation succeeds normally again.
+	require.NoError(t, s.ReleaseDeleteLease(ctx, dtok))
+	tok, err = s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	require.NoError(t, s.ReleaseBlob(ctx, tok))
+}
+
+// TestDeleteLeaseSingleWinner proves delete-lease acquisition is single-winner: a
+// second concurrent orphan-delete decision for the same key (e.g. two failed
+// same-content creates both running the BlobOrphaned rollback) does NOT also win
+// the lease, so only one deleter physically deletes and only its token releases
+// the lease. This closes Finding 1 (two deleters both deleting, one releasing by
+// key while the other is mid-delete).
+func TestDeleteLeaseSingleWinner(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	// Nothing references "k": the first decision acquires the lease and owns the
+	// delete.
+	orphaned1, tok1, err := s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.True(t, orphaned1)
+
+	// A second decision while the lease is held must lose: not orphaned, no token.
+	orphaned2, tok2, err := s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.False(t, orphaned2, "second deleter must not win while the lease is held")
+	require.Zero(t, tok2)
+
+	// Only after the owner releases its exact lease can the key be decided again.
+	require.NoError(t, s.ReleaseDeleteLease(ctx, tok1))
+	orphaned3, tok3, err := s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.True(t, orphaned3)
+	require.NoError(t, s.ReleaseDeleteLease(ctx, tok3))
+}
+
+// TestReleaseBlobByToken proves ReleaseBlob drops exactly the caller's reservation
+// (identified by its token), never an arbitrary row — so releasing upload A does
+// not drop a concurrent upload B's reservation for the same key.
+func TestReleaseBlobByToken(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	tokenA, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	tokenB, err := s.ReserveBlob(ctx, "k", now)
+	require.NoError(t, err)
+	require.NotEqual(t, tokenA, tokenB)
+
+	// Releasing A must leave B's reservation intact, so the key is still protected.
+	require.NoError(t, s.ReleaseBlob(ctx, tokenA))
+	got, _, err := s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.False(t, got, "B's reservation must still protect the key")
+
+	// After B releases too, nothing references the key.
+	require.NoError(t, s.ReleaseBlob(ctx, tokenB))
+	got, dtok, err := s.BlobOrphaned(ctx, "k", now)
+	require.NoError(t, err)
+	require.True(t, got)
+	require.NoError(t, s.ReleaseDeleteLease(ctx, dtok))
 }
 
 func TestReorderEpisodes(t *testing.T) {

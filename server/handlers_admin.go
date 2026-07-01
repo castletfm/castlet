@@ -333,8 +333,53 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mediaKey := hex.EncodeToString(hasher.Sum(nil))
-	n, err := s.blobs.Put(r.Context(), mediaKey, file)
+
+	// Bound the whole reserve->Put->CreateEpisode section to a hard deadline
+	// (store.UploadProtectWindow) that is strictly less than store.BlobReservationTTL.
+	// This makes it PROVABLE that a live upload commits its episode row while its
+	// reservation is still fresh: either CreateEpisode finishes within the window
+	// (so the reservation's age is < UploadProtectWindow < BlobReservationTTL and it
+	// is still counted by any concurrent orphan check) or the context deadline
+	// aborts the upload before the reservation could be treated as stale.
+	protectCtx, cancelProtect := context.WithTimeout(r.Context(), store.UploadProtectWindow)
+	defer cancelProtect()
+
+	// Reserve the media key BEFORE writing the blob. The blob is stored (Put)
+	// before its episode row exists, so without a reservation a concurrent episode
+	// delete's orphan check — which only sees committed rows — cannot observe this
+	// in-flight upload and could delete the blob out from under the about-to-be-
+	// created episode (the CST-013 sibling window). The reservation is held across
+	// Put+CreateEpisode and released (by token) only after the row (which then
+	// carries the reference) is committed, so there is no instant in which neither
+	// the reservation nor the episode row is visible to a concurrent delete.
+	// reserveMediaKey retries briefly if a physical delete of the same key is in
+	// progress (a delete lease is held) — the delete is quick, and Put below then
+	// restores the immutable bytes.
+	token, err := s.reserveMediaKey(protectCtx, mediaKey)
 	if err != nil {
+		if errors.Is(err, store.ErrBlobDeleting) {
+			s.renderError(w, r, http.StatusServiceUnavailable,
+				"The media is briefly being cleaned up. Please retry the upload.")
+			return
+		}
+		s.serverError(w, r, err)
+		return
+	}
+	reserved := true
+	// Release is done with a context detached from the request (and from the
+	// protect deadline) so a client disconnect or a hit protect deadline after a
+	// successful create cannot skip it (a skipped release only lingers until the
+	// reservation TTL anyway).
+	defer func() {
+		if reserved {
+			s.releaseBlob(context.WithoutCancel(r.Context()), token)
+		}
+	}()
+
+	n, err := s.blobs.Put(protectCtx, mediaKey, file)
+	if err != nil {
+		// Put failed, so no blob was written; the deferred release drops the
+		// reservation and there is nothing to clean up.
 		s.serverError(w, r, err)
 		return
 	}
@@ -356,9 +401,17 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	// Create the episode first: it owns the content-addressed media key. Its
 	// transcript status starts at 'none' (not yet queued), and only the atomic
-	// enqueue below flips it to 'pending' together with the job insert.
-	if err := s.store.CreateEpisode(r.Context(), ep); err != nil {
-		s.deleteOrphanBlob(r.Context(), mediaKey) // only if no other episode shares it
+	// enqueue below flips it to 'pending' together with the job insert. Bound by
+	// protectCtx so the row commits within store.UploadProtectWindow of the reserve.
+	if err := s.store.CreateEpisode(protectCtx, ep); err != nil {
+		// Release our own reservation FIRST (detached from the request context so a
+		// concurrent client cancel cannot skip it), so the orphan check below does
+		// not count it, then best-effort delete the just-uploaded blob if nothing
+		// else references it.
+		cleanupCtx := context.WithoutCancel(r.Context())
+		s.releaseBlob(cleanupCtx, token)
+		reserved = false
+		s.deleteOrphanBlob(cleanupCtx, mediaKey) // only if no other episode/reservation shares it
 		s.serverError(w, r, err)
 		return
 	}
@@ -562,40 +615,112 @@ func (s *Server) handleEpisodeDelete(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := s.store.DeleteEpisode(r.Context(), ep.ID); err != nil {
+	// Delete the row and learn, atomically, whether its blob is now orphaned. When
+	// it is, DeleteEpisode has already acquired a per-key delete lease (returning
+	// its owner token) in the same transaction, so a concurrent same-content upload
+	// cannot reserve (and depend on) the key while we physically delete it
+	// (CST-013). The physical delete + lease release run on a request-detached
+	// context so a client disconnect cannot leave the lease held (which would block
+	// that key's uploads until its TTL).
+	mediaKey, orphaned, deleteToken, err := s.store.DeleteEpisode(r.Context(), ep.ID, s.now())
+	if err != nil {
 		s.serverError(w, r, err)
 		return
 	}
-	s.deleteOrphanBlob(r.Context(), ep.MediaKey)
+	if orphaned {
+		s.deleteLeasedBlob(context.WithoutCancel(r.Context()), mediaKey, deleteToken)
+	}
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
 
-// deleteOrphanBlob removes a media blob, but only if no other row still
-// references it. Media is content-addressed, so identical uploads share a key;
-// this keeps a delete from yanking a blob another owner depends on. Both
-// episodes and channel cover art can own a key, so both must be checked before a
-// blob is removed.
+// deleteLeasedBlob performs the physical delete of a blob whose orphan-hood was
+// decided under a delete lease this caller OWNS (deleteToken, acquired
+// in-transaction by DeleteEpisode or BlobOrphaned) and then releases that exact
+// lease. The lease is held across the physical delete so a concurrent ReserveBlob
+// for the same key is rejected (ErrBlobDeleting) and retried rather than racing
+// the delete; releasing only afterwards is what makes the whole delete atomic
+// against reservations.
+//
+// Two lifetime guarantees:
+//   - The lease release is DEFERRED, so it runs even if blobs.Delete panics —
+//     the lease is never leaked (Finding 4).
+//   - The physical delete is bounded to store.BlobDeleteTimeout, which is strictly
+//     less than store.BlobDeleteLeaseTTL, so a live delete can never outlive its
+//     lease and let a reserve slip in before it finishes (Finding 2). The release
+//     uses a context detached from any deadline so it always runs.
+func (s *Server) deleteLeasedBlob(ctx context.Context, key string, deleteToken int64) {
+	if key == "" {
+		return
+	}
+	defer func() {
+		if err := s.store.ReleaseDeleteLease(context.WithoutCancel(ctx), deleteToken); err != nil {
+			s.logger.Error("release blob delete lease", "token", deleteToken, "error", err)
+		}
+	}()
+	delCtx, cancel := context.WithTimeout(ctx, store.BlobDeleteTimeout)
+	defer cancel()
+	if err := s.blobs.Delete(delCtx, key); err != nil {
+		s.logger.Error("delete media blob", "key", key, "error", err)
+	}
+}
+
+// reserveMediaKey reserves the media key for an in-flight upload, returning the
+// release token. While a physical delete of the same key is in progress the store
+// returns ErrBlobDeleting; the physical delete is quick (bounded by
+// store.BlobDeleteTimeout), so this retries with a short bounded backoff until the
+// delete's lease clears. If the budget is exhausted it returns ErrBlobDeleting for
+// the caller to surface.
+func (s *Server) reserveMediaKey(ctx context.Context, key string) (int64, error) {
+	const (
+		budget = 500 * time.Millisecond
+		step   = 20 * time.Millisecond
+	)
+	deadline := time.Now().Add(budget)
+	for {
+		token, err := s.store.ReserveBlob(ctx, key, s.now())
+		if err == nil {
+			return token, nil
+		}
+		if !errors.Is(err, store.ErrBlobDeleting) || !time.Now().Before(deadline) {
+			return 0, err
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(step):
+		}
+	}
+}
+
+// releaseBlob drops the in-flight upload reservation identified by token, logging
+// (but not surfacing) a failure. A leaked reservation only lingers until its TTL.
+func (s *Server) releaseBlob(ctx context.Context, token int64) {
+	if err := s.store.ReleaseBlob(ctx, token); err != nil {
+		s.logger.Error("release blob reservation", "token", token, "error", err)
+	}
+}
+
+// deleteOrphanBlob removes a just-uploaded media blob on a failed episode
+// create, but only if nothing else references it. Unlike the episode DELETE path
+// there is no row to remove here (the insert failed), so this is a best-effort
+// cleanup of an orphaned upload, run only on a rare create error AFTER this
+// upload's own reservation has been released. BlobOrphaned checks referencing
+// episodes, channel cover art (content-addressed media is shared, so an identical
+// image upload can collide — deleting would 404 the cover art), and any active
+// reservation held by a concurrent same-content upload; when it reports orphaned
+// it has taken the delete lease, so the physical delete runs under the same lease
+// protocol as the episode-delete path.
 func (s *Server) deleteOrphanBlob(ctx context.Context, key string) {
 	if key == "" {
 		return
 	}
-	if _, err := s.store.EpisodeByMediaKey(ctx, key); err == nil {
-		return // still referenced by another episode
-	} else if !errors.Is(err, store.ErrNotFound) {
-		s.logger.Error("check media references", "key", key, "error", err)
+	orphaned, deleteToken, err := s.store.BlobOrphaned(ctx, key, s.now())
+	if err != nil {
+		s.logger.Error("check blob references", "key", key, "error", err)
 		return
 	}
-	// No episode owns the key, but a channel's cover art may: content-addressed
-	// media is shared, so an identical image and audio upload can collide. Don't
-	// delete a blob a channel image still references (would 404 the cover art).
-	if cover, err := s.store.ChannelImageKeyExists(ctx, key); err != nil {
-		s.logger.Error("check channel image references", "key", key, "error", err)
-		return
-	} else if cover {
-		return // still referenced by a channel image
-	}
-	if err := s.blobs.Delete(ctx, key); err != nil {
-		s.logger.Error("delete media blob", "key", key, "error", err)
+	if orphaned {
+		s.deleteLeasedBlob(ctx, key, deleteToken)
 	}
 }
 
