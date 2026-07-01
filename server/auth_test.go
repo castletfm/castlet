@@ -5,12 +5,18 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/castletfm/castlet/auth"
+	"github.com/castletfm/castlet/blob/localfs"
+	"github.com/castletfm/castlet/internal/session"
 	"github.com/castletfm/castlet/model"
+	"github.com/castletfm/castlet/queue/dbqueue"
 	"github.com/castletfm/castlet/server"
 	"github.com/castletfm/castlet/store"
+	"github.com/castletfm/castlet/store/sqlite"
 	"github.com/stretchr/testify/require"
 )
 
@@ -119,6 +125,56 @@ func TestLogoutRevokesExistingSessions(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 	require.Equal(t, "/login", resp.Header.Get("Location"))
+}
+
+// failBumpStore wraps a store.Store but forces BumpSessionEpoch to fail, so a
+// logout cannot revoke sessions — used to assert logout reports the failure with
+// an error response instead of silently redirecting as a successful "log out
+// everywhere".
+type failBumpStore struct {
+	store.Store
+}
+
+func (failBumpStore) BumpSessionEpoch(context.Context, string) error {
+	return errors.New("bump failed")
+}
+
+// When the epoch bump (revocation) fails, logout must NOT report success: a
+// failed "log out everywhere" that redirected as if it worked would leave the
+// user's other sessions live while telling them they were logged out. It must
+// return a 500 instead.
+func TestLogoutRevocationFailureReturnsError(t *testing.T) {
+	ctx := t.Context()
+
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	require.NoError(t, st.Migrate(ctx))
+	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: mustHash(t, "secret"), CreatedAt: time.Now()}))
+
+	blobs, err := localfs.New(t.TempDir())
+	require.NoError(t, err)
+	sess := session.NewManager([]byte("0123456789abcdef0123456789abcdef"))
+	srv, err := server.New(failBumpStore{st}, blobs, dbqueue.New(st), sess,
+		server.WithAddr("127.0.0.1:0"), server.WithBaseURL("http://example.test"))
+	require.NoError(t, err)
+	ctrl, err := srv.Run(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { <-ctrl.Done() })
+	base := "http://" + ctrl.Addr()
+
+	client := newClient()
+	resp, err := client.PostForm(base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	// Logout fails to bump the epoch: it must surface a 500, not a success redirect.
+	resp, err = client.PostForm(base+"/logout", nil)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,
+		"logout must fail loudly when revocation fails, not redirect as success")
 }
 
 // fakeAuthn is a stand-in OIDC authenticator for tests.

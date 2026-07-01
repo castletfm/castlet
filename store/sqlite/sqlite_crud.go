@@ -27,11 +27,16 @@ func (s *Store) CreateUser(ctx context.Context, u *model.User) error {
 	return nil
 }
 
+// UpdateUser writes the mutable user fields but deliberately does NOT touch
+// session_epoch: BumpSessionEpoch is the sole mutator of that column. Writing it
+// here would let a stale in-memory model.User (holding an older epoch) silently
+// overwrite a newer, already-bumped epoch and thereby re-validate cookies that a
+// "log out everywhere" had revoked.
 func (s *Store) UpdateUser(ctx context.Context, u *model.User) error {
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET email = ?, display_name = ?, password_hash = ?, oidc_issuer = ?, oidc_subject = ?, session_epoch = ?
+		`UPDATE users SET email = ?, display_name = ?, password_hash = ?, oidc_issuer = ?, oidc_subject = ?
 		 WHERE id = ?`,
-		u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, u.SessionEpoch, u.ID)
+		u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, u.ID)
 	if err != nil {
 		return fmt.Errorf("sqlite: update user: %w", mapErr(err))
 	}

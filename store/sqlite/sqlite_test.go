@@ -67,6 +67,26 @@ func TestBumpSessionEpoch(t *testing.T) {
 	require.ErrorIs(t, s.BumpSessionEpoch(ctx, "nope"), store.ErrNotFound)
 }
 
+// A generic UpdateUser must never write session_epoch: a stale user struct
+// (holding an older epoch) must not clobber an epoch a prior BumpSessionEpoch
+// already advanced, which would re-validate cookies a "log out everywhere"
+// revoked.
+func TestUpdateUserDoesNotClobberSessionEpoch(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	u := seedUser(t, s) // epoch 0
+	require.NoError(t, s.BumpSessionEpoch(ctx, u.ID))
+
+	// u still carries the stale epoch 0; write it back via a normal update.
+	u.DisplayName = "Renamed"
+	require.NoError(t, s.UpdateUser(ctx, u))
+
+	got, err := s.UserByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Renamed", got.DisplayName, "UpdateUser still persists other fields")
+	require.Equal(t, 1, got.SessionEpoch, "UpdateUser must not reset a bumped epoch")
+}
+
 // Migrate must be safe to run repeatedly (it runs on every startup), including
 // its ALTER TABLE backfills, and must preserve existing data.
 func TestMigrateIdempotent(t *testing.T) {

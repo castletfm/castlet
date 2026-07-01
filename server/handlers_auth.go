@@ -51,7 +51,12 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// affects the current client.
 	if u := userFrom(r.Context()); u != nil {
 		if err := s.store.BumpSessionEpoch(r.Context(), u.ID); err != nil {
-			s.logger.Warn("failed to bump session epoch on logout", "user", u.ID, "error", err)
+			// Revocation failed: other sessions for this user may still be live, so
+			// we must not report a successful "log out everywhere". Best-effort clear
+			// this browser's cookie, then return a 500 rather than a success redirect.
+			s.sessions.Clear(w)
+			s.serverError(w, r, err)
+			return
 		}
 	}
 	s.sessions.Clear(w)

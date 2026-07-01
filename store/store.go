@@ -63,6 +63,12 @@ type Store interface {
 	Close() error
 
 	CreateUser(ctx context.Context, u *model.User) error
+	// UpdateUser persists the mutable user fields. It deliberately does NOT
+	// write session_epoch — BumpSessionEpoch is the only mutator of that column
+	// — so a stale user struct can never overwrite a newer epoch and re-validate
+	// cookies a "log out everywhere" already revoked. A caller that needs the
+	// current epoch after an update (e.g. before issuing a session) must reload
+	// the user rather than trust the struct it passed in.
 	UpdateUser(ctx context.Context, u *model.User) error
 	// BumpSessionEpoch increments the user's session epoch, invalidating every
 	// session issued before the bump (a "log out everywhere", used on logout and

@@ -133,6 +133,9 @@ func (s *Server) resolveOIDCUser(r *http.Request, id *auth.Identity) (*model.Use
 		if err := s.store.UpdateUser(ctx, existing); err != nil {
 			return nil, err
 		}
+		// existing was just loaded via UserByEmail and UpdateUser does not touch
+		// session_epoch, so existing.SessionEpoch is still the authoritative epoch
+		// the caller issues the session with.
 		return existing, nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
