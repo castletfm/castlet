@@ -248,6 +248,10 @@ fields: `Addr`, `DataDir` (sqlite file + blob root live under it by default),
 `BlobBackend`, `Transcriber` (+ `TranscribeCommand`). Unset secrets in dev are
 generated and a warning logged; production must set `CASTLET_SESSION_KEY`.
 
+For running Castlet in production — secrets, TLS/reverse proxy, backup &
+restore, upgrades, scaling limits, and process supervision — see
+[operations.md](operations.md).
+
 ## Testing strategy
 
 - Store/blob/queue each ship a focused unit test against their default impl

@@ -34,6 +34,13 @@ options.
 For a self-contained demo with single sign-on and automatic whisper.cpp
 transcription, see [`examples/standalone/`](examples/standalone/).
 
+## Running in production
+
+For configuration and secrets (`CASTLET_SESSION_KEY`, base URL / cookie
+security, OIDC, blob store), running behind a TLS reverse proxy, backup &
+restore, upgrades, scaling limits, and process supervision, see the
+[operations guide](docs/operations.md).
+
 ## Transcription
 
 Transcripts are produced by **shelling out to an external tool per episode** —
