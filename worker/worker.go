@@ -217,8 +217,8 @@ func (w *Worker) loop(ctx context.Context) error {
 }
 
 // settlement is the durable terminal outcome a job produced. It is applied by
-// settle() under the shutdown-surviving context after the (cancellable) work
-// has finished, so the episode's final state is recorded even on SIGTERM.
+// settleAndComplete under the shutdown-surviving context after the (cancellable)
+// work has finished, so the episode's final state is recorded even on SIGTERM.
 type settlement struct {
 	ep         *model.Episode         // episode to update
 	transcript *model.Transcript      // saved before the status write when non-nil
@@ -403,11 +403,11 @@ func (w *Worker) transcribe(ctx context.Context, job *model.Job) (*settlement, e
 		return nil, fmt.Errorf("worker: transcribe: %w", err)
 	}
 
-	// The result is settled atomically under the claim fence in settle(): a
-	// transcription can outlive its lease and be reclaimed by another worker, and
-	// SettleEpisodeTranscript drops this attempt's transcript/status writes
-	// (ErrStaleClaim) when that has happened, so they cannot clobber the reclaiming
-	// attempt.
+	// The result is settled atomically under the claim fence in settleAndComplete:
+	// a transcription can outlive its lease and be reclaimed by another worker, and
+	// Store.SettleEpisodeTranscriptAndCompleteJob drops this attempt's
+	// transcript/status writes (ErrStaleClaim) when that has happened, so they
+	// cannot clobber the reclaiming attempt.
 	tr := &model.Transcript{EpisodeID: ep.ID, Language: res.Language, CreatedAt: time.Now()}
 	for _, s := range res.Segments {
 		tr.Segments = append(tr.Segments, model.Segment{StartSecs: s.StartSecs, EndSecs: s.EndSecs, Text: s.Text})
