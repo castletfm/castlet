@@ -209,9 +209,26 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	// multipart/form-data Content-Type before touching the body: for any other
 	// type ParseMultipartForm falls back to ParseForm, which reads the whole
 	// request up to the (large) upload cap into memory. Guarding here avoids
-	// that allocation for non-multipart requests.
-	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mediaType != "multipart/form-data" {
+	// that allocation for non-multipart requests. The boundary param is required
+	// too: without it ParseMultipartForm fails only after the body is read, so a
+	// boundary-less multipart/form-data would otherwise be granted the long
+	// upload deadline before failing.
+	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "multipart/form-data" {
 		s.renderError(w, r, http.StatusUnsupportedMediaType, "The upload must be sent as multipart/form-data.")
+		return
+	}
+	if params["boundary"] == "" {
+		s.renderError(w, r, http.StatusBadRequest, "The multipart/form-data upload is missing its boundary.")
+		return
+	}
+
+	// Reject a known over-cap upload up front. When the client declares a
+	// Content-Length larger than the cap the request is doomed, so return 413
+	// before wrapping the body or extending the deadline — a bad request must
+	// stay bounded by the global ReadTimeout instead of the long upload window.
+	if r.ContentLength > 0 && r.ContentLength > s.maxUploadBytes {
+		s.renderError(w, r, http.StatusRequestEntityTooLarge, "The uploaded file is too large.")
 		return
 	}
 

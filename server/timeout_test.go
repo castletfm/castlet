@@ -89,6 +89,77 @@ func TestEpisodeCreateNonMultipartSkipsDeadline(t *testing.T) {
 		"read deadline must not be extended before the multipart Content-Type check passes")
 }
 
+// TestEpisodeCreateMissingBoundarySkipsDeadline guards FINDING 1: a
+// multipart/form-data request without a boundary param passes the media-type
+// check but can only fail once ParseMultipartForm reads the body. It must be
+// rejected up front (4xx) under the global ReadTimeout, i.e. without the long
+// upload deadline ever being extended.
+func TestEpisodeCreateMissingBoundarySkipsDeadline(t *testing.T) {
+	ctx := t.Context()
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	require.NoError(t, st.Migrate(ctx))
+	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", CreatedAt: time.Now()}))
+	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	renderer, err := newTemplateRenderer()
+	require.NoError(t, err)
+	s := &Server{store: st, renderer: renderer, logger: slog.Default(),
+		siteName: "Castlet", maxUploadBytes: 64, now: time.Now}
+
+	rec := httptest.NewRecorder()
+	fake := &deadlineWriter{ResponseWriter: rec}
+	req := httptest.NewRequest(http.MethodPost, "/admin/channels/c1/episodes",
+		strings.NewReader("body"))
+	req.Header.Set("Content-Type", "multipart/form-data") // no boundary param
+	req.SetPathValue("id", "c1")
+	req = req.WithContext(context.WithValue(req.Context(), userCtxKey, &model.User{ID: "u1"}))
+
+	s.handleEpisodeCreate(fake, req)
+
+	require.GreaterOrEqual(t, rec.Code, http.StatusBadRequest)
+	require.Less(t, rec.Code, http.StatusInternalServerError)
+	require.False(t, fake.called,
+		"read deadline must not be extended before the boundary param check passes")
+}
+
+// TestEpisodeCreateOverCapContentLengthSkipsDeadline guards FINDING 2: a request
+// declaring a Content-Length above the upload cap is doomed, so it must return
+// 413 before the body is wrapped or the long upload deadline extended — a bad
+// request stays bounded by the global ReadTimeout.
+func TestEpisodeCreateOverCapContentLengthSkipsDeadline(t *testing.T) {
+	ctx := t.Context()
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	require.NoError(t, st.Migrate(ctx))
+	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", CreatedAt: time.Now()}))
+	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	renderer, err := newTemplateRenderer()
+	require.NoError(t, err)
+	s := &Server{store: st, renderer: renderer, logger: slog.Default(),
+		siteName: "Castlet", maxUploadBytes: 64, now: time.Now}
+
+	rec := httptest.NewRecorder()
+	fake := &deadlineWriter{ResponseWriter: rec}
+	req := httptest.NewRequest(http.MethodPost, "/admin/channels/c1/episodes",
+		strings.NewReader("body"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=xyz")
+	req.ContentLength = s.maxUploadBytes + 1 // declared over the cap
+	req.SetPathValue("id", "c1")
+	req = req.WithContext(context.WithValue(req.Context(), userCtxKey, &model.User{ID: "u1"}))
+
+	s.handleEpisodeCreate(fake, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	require.False(t, fake.called,
+		"read deadline must not be extended for a known over-cap upload")
+}
+
 // deadlineWriter is a fake deadline-capable ResponseWriter recording the last
 // read deadline it was asked to set.
 type deadlineWriter struct {
