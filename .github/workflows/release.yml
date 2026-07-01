@@ -1,0 +1,154 @@
+name: Release
+
+# Tag-triggered release automation. Pushing a semver tag (e.g. v1.2.3) builds
+# the castlet CLI for a small cross-platform matrix, stamps the version from the
+# tag via -ldflags "-X main.version=...", and uploads the tarballs to the
+# GitHub Release for that tag.
+on:
+  push:
+    tags:
+      - "v*"
+
+# Least privilege by default: grant no permissions at the top level and scope
+# each token per job — contents: read for the jobs that check out code (verify,
+# build) and contents: write only for the release job that creates/uploads the
+# GitHub Release.
+permissions: {}
+
+jobs:
+  # Tier 0: fail fast unless the tag is a valid semver (the trigger accepts any
+  # v* tag, but only semver is documented/supported). Everything gates on this.
+  validate:
+    name: validate tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate semver tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${TAG}" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'; then
+            echo "Tag '${TAG}' is not a valid semver tag (expected vMAJOR.MINOR.PATCH[-prerelease])."
+            exit 1
+          fi
+          echo "Tag '${TAG}' is a valid semver tag."
+
+  # Tier 1: run vet + tests before anything is built or published, so a tag whose
+  # tests fail can never create or upload a release.
+  verify:
+    name: verify
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test ./...
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build and package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          DIST="castlet_${TAG}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/${DIST}"
+          go build -trimpath -ldflags "-X main.version=${TAG}" \
+            -o "dist/${DIST}/castlet" ./cmd/castlet
+          cp README.md LICENSE "dist/${DIST}/" 2>/dev/null || true
+          tar -czf "dist/${DIST}.tar.gz" -C dist "${DIST}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: castlet_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Determine prerelease status per SemVer 2.0.0. A tag is a prerelease
+          # iff its version core -- everything BEFORE any '+build' metadata --
+          # contains a '-' (e.g. v1.2.3-rc.1, v1.2.3-beta.2, v1.2.3-rc.1+build.5).
+          # Build metadata is stripped first with ${TAG%%+*} so that a stable tag
+          # carrying build metadata that happens to contain a '-' (e.g.
+          # v1.2.3+build-5) is NOT misclassified as a prerelease.
+          PRERELEASE=false
+          case "${TAG%%+*}" in
+            *-*) PRERELEASE=true ;;
+          esac
+          if gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
+            # Release already exists (rerun): set the prerelease state explicitly
+            # so a stable rerun clears any stale prerelease flag and a prerelease
+            # rerun (re)asserts it.
+            gh release edit "${TAG}" \
+              --repo "${REPO}" \
+              --prerelease="${PRERELEASE}"
+          else
+            gh release create "${TAG}" \
+              --repo "${REPO}" \
+              --title "${TAG}" \
+              --generate-notes \
+              --prerelease="${PRERELEASE}"
+          fi
+          gh release upload "${TAG}" dist/*.tar.gz \
+            --repo "${REPO}" \
+            --clobber
