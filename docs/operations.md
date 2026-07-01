@@ -40,10 +40,12 @@ drop the cookie or send it over cleartext.
 
 ### Local sign-up
 
-`--allow-signup` (`CASTLET_ALLOW_SIGNUP`, default **true**) enables the
-self-service local sign-up path. Set it to `false` on shared/closed
-deployments where accounts should be provisioned only via `castlet user-create`
-or OIDC.
+`--allow-signup` (`CASTLET_ALLOW_SIGNUP`, default **false**) enables the
+self-service local sign-up path. It is **disabled by default** because Castlet
+targets closed environments where anyone who can reach the server should not be
+able to create an account. Provision accounts via `castlet user-create` or OIDC,
+or set `--allow-signup` (`CASTLET_ALLOW_SIGNUP=true`) to open self-service
+sign-up. While disabled, both `GET` and `POST /signup` return 404.
 
 ### OIDC single sign-on
 
