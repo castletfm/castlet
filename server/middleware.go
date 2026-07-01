@@ -82,6 +82,27 @@ func (s *Server) recoverPanic(next http.Handler) http.Handler {
 	})
 }
 
+// securityHeaders sets baseline security response headers on every route. It
+// runs before the handler, so per-route headers set later (e.g. the media
+// endpoint's Content-Disposition) are untouched; setting nosniff again there is
+// idempotent.
+//
+// No Content-Security-Policy is set on purpose: the app is server-rendered and
+// relies on small inline <script> blocks for progressive enhancement (see
+// web/templates/episode.html and admin_episodes.html), and /media 302-redirects
+// to presigned URLs on arbitrary object-store origins. A meaningful CSP would
+// have to allow 'unsafe-inline' for scripts and whitelist those origins, which
+// buys little; omitting it keeps the existing pages working.
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
 // logRequests logs one line per request after it completes.
 func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
