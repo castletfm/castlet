@@ -432,12 +432,15 @@ func (s *Store) TranscriptByEpisode(ctx context.Context, episodeID string) (*mod
 // The fence is the claim token (jobs.attempts), which ClaimJob bumps on every
 // (re)claim: a stale attempt whose job was reclaimed no longer matches and
 // affects zero rows, so it gets ErrStaleClaim and touches neither the episode nor
-// the transcript. The status set (processing, failed) recognizes the two states a
-// job holds while its current claim settles the episode: 'processing' for the
-// success/none/progress writes made before the queue Ack, and 'failed' for the
-// terminal failed marking made right after the same claim's Nack/dead-letter has
-// failed the job. Doing the claim check and the mutations in one transaction (on
-// the single-writer pool) makes the check-and-write indivisible.
+// the transcript. On top of the token, the accepted job status follows the real
+// state machine so a same-token call cannot settle an already-terminal job: every
+// progress/none/done settlement and every transcript save requires the job to
+// still be 'processing' (the state a live claim holds before its Ack), while
+// jobs.status = 'failed' is accepted ONLY for the transcript-less TranscriptFailed
+// mark — the dead-letter / Nack-exhaustion write that legitimately runs right
+// after the same claim flipped the job to 'failed'. Doing the claim check and the
+// mutations in one transaction (on the single-writer pool) makes the
+// check-and-write indivisible.
 func (s *Store) SettleEpisodeTranscript(ctx context.Context, jobID string, token int, episodeID string, transcript *model.Transcript, status model.TranscriptStatus, updatedAt time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -445,10 +448,21 @@ func (s *Store) SettleEpisodeTranscript(ctx context.Context, jobID string, token
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
+	// The default state machine transition is FROM processing; only the
+	// transcript-less failed-episode mark may additionally run against an
+	// already-'failed' job (the dead-letter/Nack-exhaustion settlement).
+	statusCond := "status = ?"
+	statusArgs := []any{string(model.JobProcessing)}
+	if status == model.TranscriptFailed && transcript == nil {
+		statusCond = "status IN (?, ?)"
+		statusArgs = []any{string(model.JobProcessing), string(model.JobFailed)}
+	}
+
 	var claimed int
+	args := append([]any{jobID, token}, statusArgs...)
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(1) FROM jobs WHERE id = ? AND attempts = ? AND status IN (?, ?)`,
-		jobID, token, string(model.JobProcessing), string(model.JobFailed)).Scan(&claimed); err != nil {
+		`SELECT COUNT(1) FROM jobs WHERE id = ? AND attempts = ? AND `+statusCond,
+		args...).Scan(&claimed); err != nil {
 		return fmt.Errorf("sqlite: verify job claim: %w", mapErr(err))
 	}
 	if claimed == 0 {

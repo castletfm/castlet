@@ -370,6 +370,75 @@ func TestSettleEpisodeTranscriptFencedByClaimToken(t *testing.T) {
 	require.Equal(t, model.TranscriptDone, ep.TranscriptStatus)
 }
 
+// TestTerminalJobStatusIsFinal proves the state-machine guard: once a job is
+// settled to a terminal status, the SAME claim token can no longer move it. A
+// Complete followed by a stray Reschedule (same token, attempts still matching)
+// must be a no-op returning ErrStaleClaim, leaving the job done.
+func TestTerminalJobStatusIsFinal(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: "{}",
+		Status: model.JobPending, RunAfter: now, CreatedAt: now, UpdatedAt: now}))
+
+	claimed, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.NoError(t, err)
+
+	// Settle to done, then try to move the already-terminal job back with the
+	// SAME (still-matching) token: rejected, the job stays done.
+	require.NoError(t, s.CompleteJob(ctx, "j1", claimed.Attempts))
+	later := now.Add(time.Minute)
+	require.ErrorIs(t, s.RescheduleJob(ctx, "j1", claimed.Attempts, later, "stray"), store.ErrStaleClaim)
+	require.ErrorIs(t, s.FailJob(ctx, "j1", claimed.Attempts, "stray"), store.ErrStaleClaim)
+	require.ErrorIs(t, s.CompleteJob(ctx, "j1", claimed.Attempts), store.ErrStaleClaim)
+
+	got, err := s.JobByID(ctx, "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobDone, got.Status, "terminal state must be final")
+}
+
+// TestSettleEpisodeTranscriptRejectsPostFailure proves the settlement state
+// machine: after a job is dead-lettered (FailJob) and its episode marked failed,
+// a same-token done-settlement must NOT resurrect the episode. The job is already
+// 'failed', so a done write (or any transcript save) is rejected as ErrStaleClaim.
+func TestSettleEpisodeTranscriptRejectsPostFailure(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	seedUser(t, s)
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
+		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptPending, CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "j1", Kind: model.JobTranscribe,
+		Payload: `{"episode_id":"e1"}`, Status: model.JobPending, RunAfter: now, CreatedAt: now, UpdatedAt: now}))
+
+	claimed, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.NoError(t, err)
+
+	// Dead-letter the job, then record the failed episode with the same token: the
+	// transcript-less TranscriptFailed mark legitimately runs against the failed job.
+	require.NoError(t, s.FailJob(ctx, "j1", claimed.Attempts, "dead"))
+	require.NoError(t, s.SettleEpisodeTranscript(ctx, "j1", claimed.Attempts, "e1", nil, model.TranscriptFailed, now))
+	ep, err := s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptFailed, ep.TranscriptStatus)
+
+	// A same-token done-settlement after failure must NOT save a transcript nor set
+	// the episode done: the job is 'failed', not 'processing'.
+	tr := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: now,
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 1, Text: "late"}}}
+	require.ErrorIs(t, s.SettleEpisodeTranscript(ctx, "j1", claimed.Attempts, "e1", tr, model.TranscriptDone, now),
+		store.ErrStaleClaim)
+	_, err = s.TranscriptByEpisode(ctx, "e1")
+	require.ErrorIs(t, err, store.ErrNotFound, "no transcript may be saved after dead-lettering")
+	ep, err = s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptFailed, ep.TranscriptStatus, "episode must not be resurrected to done")
+}
+
 func TestJobClaimReclaimsExpiredLease(t *testing.T) {
 	s := newStore(t)
 	ctx := t.Context()

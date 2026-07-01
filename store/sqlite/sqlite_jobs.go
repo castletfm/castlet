@@ -98,23 +98,27 @@ func (s *Store) FailJob(ctx context.Context, id string, token int, cause string)
 	return s.setJobStatus(ctx, id, token, model.JobFailed, cause, nil)
 }
 
-// setJobStatus applies a terminal status transition, fenced by the claim token.
-// The WHERE clause matches attempts = token so only the current claim can settle
-// the job: a stale attempt whose lease expired and was reclaimed (which bumped
-// attempts) affects zero rows and gets ErrStaleClaim, so it cannot clobber the
-// reclaiming attempt's status.
+// setJobStatus applies a status transition, fenced by the claim token AND the
+// job being currently processing. The WHERE clause matches attempts = token so
+// only the current claim can settle the job: a stale attempt whose lease expired
+// and was reclaimed (which bumped attempts) affects zero rows and gets
+// ErrStaleClaim, so it cannot clobber the reclaiming attempt's status. The
+// additional status = 'processing' guard makes terminal states final: a job only
+// transitions FROM processing TO a terminal/next state, so once it is done or
+// failed the same token can no longer move it (e.g. a Complete followed by a
+// stray Reschedule affects zero rows and gets ErrStaleClaim).
 func (s *Store) setJobStatus(ctx context.Context, id string, token int, status model.JobStatus, cause string, runAfter *time.Time) error {
 	now := time.Now()
 	var res sql.Result
 	var err error
 	if runAfter != nil {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE jobs SET status = ?, last_error = ?, run_after = ?, updated_at = ? WHERE id = ? AND attempts = ?`,
-			string(status), cause, toUnix(*runAfter), toUnix(now), id, token)
+			`UPDATE jobs SET status = ?, last_error = ?, run_after = ?, updated_at = ? WHERE id = ? AND attempts = ? AND status = ?`,
+			string(status), cause, toUnix(*runAfter), toUnix(now), id, token, string(model.JobProcessing))
 	} else {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND attempts = ?`,
-			string(status), cause, toUnix(now), id, token)
+			`UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND attempts = ? AND status = ?`,
+			string(status), cause, toUnix(now), id, token, string(model.JobProcessing))
 	}
 	if err != nil {
 		return fmt.Errorf("sqlite: update job status: %w", mapErr(err))
