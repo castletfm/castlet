@@ -139,14 +139,14 @@ func TestLoginRateLimit(t *testing.T) {
 	// The first loginRateLimitMax (5) attempts are processed and rejected as
 	// invalid credentials (401).
 	for i := range 5 {
-		resp, err := h.client.PostForm(h.base+"/login", wrong)
+		resp, err := h.postForm(t, "/login", wrong)
 		require.NoError(t, err)
 		resp.Body.Close()
 		require.Equal(t, http.StatusUnauthorized, resp.StatusCode, "attempt %d", i)
 	}
 
 	// The next attempt is throttled with 429 and a Retry-After header.
-	resp, err := h.client.PostForm(h.base+"/login", wrong)
+	resp, err := h.postForm(t, "/login", wrong)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
@@ -154,7 +154,7 @@ func TestLoginRateLimit(t *testing.T) {
 
 	// A correct password would also be throttled now, proving the block is on
 	// the IP, not credential correctness.
-	resp, err = h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err = h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusTooManyRequests, resp.StatusCode)
@@ -178,14 +178,14 @@ func TestLoginRateLimitResetOnSuccess(t *testing.T) {
 
 	// Four failures — one under the budget of five.
 	for range 4 {
-		resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
+		resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
 		require.NoError(t, err)
 		resp.Body.Close()
 		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	}
 
 	// A success clears the counter.
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -193,7 +193,7 @@ func TestLoginRateLimitResetOnSuccess(t *testing.T) {
 	// The budget is full again: five more failures are all processed (401), none
 	// throttled, which would be impossible if the counter had not reset.
 	for i := range 5 {
-		resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
+		resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
 		require.NoError(t, err)
 		resp.Body.Close()
 		require.Equal(t, http.StatusUnauthorized, resp.StatusCode, "post-reset attempt %d", i)
