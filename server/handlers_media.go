@@ -242,6 +242,10 @@ func (s *Server) handleFeed(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(xml)
 }
 
+// defaultUploadMIME is the fallback content type when neither the declared
+// Content-Type nor the filename extension yields a usable media type.
+const defaultUploadMIME = "audio/mpeg"
+
 // detectUploadMIME picks a content type for an uploaded file: the browser's
 // declared type when specific, otherwise a guess from the file extension,
 // falling back to a generic audio type. contentType is the upload part's
@@ -259,5 +263,5 @@ func detectUploadMIME(contentType, filename string) string {
 			}
 		}
 	}
-	return "audio/mpeg"
+	return defaultUploadMIME
 }

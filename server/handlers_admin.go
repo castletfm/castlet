@@ -48,13 +48,38 @@ func (s *Server) uploadReadTimeout() time.Duration {
 	return d
 }
 
-// maxUploadFieldBytes bounds each non-file multipart field (title, description,
-// language). These are small; the cap stops a hostile client from spending the
-// whole (large) upload budget on an enormous text field buffered in memory.
-const maxUploadFieldBytes = 1 << 20 // 1 MiB
+const (
+	// maxUploadFieldBytes bounds a single non-file multipart field. The known
+	// fields (title, description, language) are short; this cap stops a hostile
+	// client from pinning the handler on one enormous text field.
+	maxUploadFieldBytes = 64 << 10 // 64 KiB
+
+	// maxUploadFieldsBytes bounds the total bytes read across ALL non-file fields
+	// (known and unknown), so a body full of medium fields can't accumulate work
+	// beyond this even under the large upload cap.
+	maxUploadFieldsBytes = 256 << 10 // 256 KiB
+
+	// maxUploadParts bounds how many multipart parts we will iterate before
+	// rejecting, so a body made of many tiny parts can't pin the handler.
+	maxUploadParts = 100
+)
+
+// Form field names shared by the admin channel and episode form handlers.
+const (
+	fieldTitle       = "title"
+	fieldDescription = "description"
+	fieldLanguage    = "language"
+	fieldMedia       = "media"
+)
+
+// knownUploadFields are the non-file form fields the upload form actually posts
+// (see web/templates/admin_episode_form.html: "language" is the spoken language).
+// Any other field name is read (bounded) to advance the stream but not retained,
+// so unknown fields cannot accumulate in memory.
+var knownUploadFields = map[string]bool{fieldTitle: true, fieldDescription: true, fieldLanguage: true}
 
 // stagedUpload is a streamed multipart upload: the "media" file part written to a
-// temp file (seekable, positioned at start) plus the small non-file form fields.
+// temp file (seekable, positioned at start) plus the small known non-file fields.
 type stagedUpload struct {
 	file     *os.File // media part; nil when the upload carried no media file
 	mediaKey string   // sha256 hex of the media bytes
@@ -64,14 +89,26 @@ type stagedUpload struct {
 
 func (u *stagedUpload) field(name string) string { return u.fields[name] }
 
+// errUploadFields is returned when the non-file fields violate a bound (a single
+// field or the aggregate is too large, too many parts, or an unexpected file
+// part). The caller treats it as a client error and aborts the connection
+// promptly rather than draining the offending part.
+var errUploadFields = errors.New("server: upload form fields exceed limits")
+
 // stageMultipartUpload streams the multipart request without buffering the media
-// into memory or the system /tmp: non-file fields are read (bounded) into memory
-// and the "media" file part is streamed into a temp file under s.uploadTempDir
-// while its sha256 is computed. The returned file is seekable and positioned at
-// start; the caller owns closing and removing it. Total bytes read are already
-// bounded by the MaxBytesReader the caller wrapped around r.Body, so an over-cap
-// body surfaces here as *http.MaxBytesError. On any error the partially staged
-// temp file is removed before returning, so a failed upload never leaks one.
+// into memory or the system /tmp: the "media" file part is streamed into a temp
+// file under s.uploadTempDir while its sha256 is computed, and the known non-file
+// fields are read (bounded) into memory. The returned file is seekable and
+// positioned at start; the caller owns closing and removing it. Total bytes read
+// are already bounded by the MaxBytesReader the caller wrapped around r.Body, so
+// an over-cap body surfaces here as *http.MaxBytesError.
+//
+// On ANY error it returns without draining the offending part (a multipart.Part's
+// Close drains its unread remainder, which under the long, size-derived upload
+// deadline would let a slow/oversized field or a bad file part pin the handler).
+// The caller's abortUpload + the MaxBytesReader on r.Body tear the connection
+// down instead. The partially staged temp file is removed before returning, so a
+// failed upload never leaks one.
 func (s *Server) stageMultipartUpload(r *http.Request) (_ *stagedUpload, err error) {
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -86,6 +123,8 @@ func (s *Server) stageMultipartUpload(r *http.Request) (_ *stagedUpload, err err
 			u.file = nil
 		}
 	}()
+	var parts int
+	var fieldsTotal int
 	for {
 		part, perr := mr.NextPart()
 		if perr == io.EOF {
@@ -94,35 +133,51 @@ func (s *Server) stageMultipartUpload(r *http.Request) (_ *stagedUpload, err err
 		if perr != nil {
 			return nil, perr
 		}
+		parts++
+		if parts > maxUploadParts {
+			return nil, errUploadFields // do not Close/drain
+		}
 		name := part.FormName()
-		if name == "media" && part.FileName() != "" {
-			if u.file != nil { // only one media file is accepted
-				part.Close()
-				return nil, errors.New("server: multiple media parts in upload")
+
+		// File parts: only a single "media" part is accepted. Any other file part
+		// (or a duplicate media part) is rejected without draining it.
+		if part.FileName() != "" {
+			if name != fieldMedia || u.file != nil {
+				return nil, errUploadFields // do not Close/drain
 			}
 			u.mime = detectUploadMIME(part.Header.Get("Content-Type"), part.FileName())
 			f, ferr := os.CreateTemp(s.uploadTempDir, "castlet-upload-*")
 			if ferr != nil {
-				part.Close()
-				return nil, ferr
+				return nil, ferr // do not Close/drain the part
 			}
 			u.file = f
 			hasher := sha256.New()
-			_, cerr := io.Copy(io.MultiWriter(f, hasher), part)
-			part.Close()
-			if cerr != nil {
-				return nil, cerr
+			if _, cerr := io.Copy(io.MultiWriter(f, hasher), part); cerr != nil {
+				return nil, cerr // do not Close/drain
 			}
+			part.Close() // fully consumed to EOF above; no drain
 			u.mediaKey = hex.EncodeToString(hasher.Sum(nil))
 			continue
 		}
-		// A non-file form field: read it bounded into memory.
-		v, rerr := io.ReadAll(io.LimitReader(part, maxUploadFieldBytes))
-		part.Close()
+
+		// Non-file field: read bounded (limit+1 so an over-limit field is caught
+		// without draining it). A field or aggregate over its cap is a client error.
+		v, rerr := io.ReadAll(io.LimitReader(part, maxUploadFieldBytes+1))
 		if rerr != nil {
-			return nil, rerr
+			return nil, rerr // do not Close/drain
 		}
-		u.fields[name] = string(v)
+		if len(v) > maxUploadFieldBytes {
+			return nil, errUploadFields // over-limit field: do not Close/drain
+		}
+		fieldsTotal += len(v)
+		if fieldsTotal > maxUploadFieldsBytes {
+			return nil, errUploadFields // aggregate over budget: do not Close/drain
+		}
+		part.Close() // fully consumed (read < limit+1 -> reached part EOF); no drain
+		if knownUploadFields[name] {
+			u.fields[name] = string(v)
+		}
+		// Unknown field: consumed to advance the stream, but not retained.
 	}
 	if u.file != nil {
 		if _, serr := u.file.Seek(0, io.SeekStart); serr != nil {
@@ -179,9 +234,9 @@ func (s *Server) handleChannelCreate(w http.ResponseWriter, r *http.Request) {
 	ch := &model.Channel{
 		ID:          idgen.New(),
 		UserID:      user.ID,
-		Title:       r.FormValue("title"),
-		Description: r.FormValue("description"),
-		Language:    orDefault(r.FormValue("language"), "en"),
+		Title:       r.FormValue(fieldTitle),
+		Description: r.FormValue(fieldDescription),
+		Language:    orDefault(r.FormValue(fieldLanguage), "en"),
 		CreatedAt:   s.now(),
 		UpdatedAt:   s.now(),
 	}
@@ -215,9 +270,9 @@ func (s *Server) handleChannelUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	ch.Title = r.FormValue("title")
-	ch.Description = r.FormValue("description")
-	ch.Language = orDefault(r.FormValue("language"), "en")
+	ch.Title = r.FormValue(fieldTitle)
+	ch.Description = r.FormValue(fieldDescription)
+	ch.Language = orDefault(r.FormValue(fieldLanguage), "en")
 	ch.UpdatedAt = s.now()
 
 	action := "/admin/channels/" + ch.ID
@@ -396,8 +451,8 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	form := episodeForm{Channel: ch, Title: staged.field("title"),
-		Description: staged.field("description"), Language: staged.field("language")}
+	form := episodeForm{Channel: ch, Title: staged.field(fieldTitle),
+		Description: staged.field(fieldDescription), Language: staged.field(fieldLanguage)}
 	reRender := func(status int, msg string) {
 		form.Error = msg
 		s.render(w, r, status, "admin_episode_form", "New episode", form)
@@ -549,8 +604,8 @@ func (s *Server) handleEpisodeUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	form := episodeEditForm{Episode: ep, Channel: ch, Title: r.FormValue("title"),
-		Description: r.FormValue("description"), Language: r.FormValue("language")}
+	form := episodeEditForm{Episode: ep, Channel: ch, Title: r.FormValue(fieldTitle),
+		Description: r.FormValue(fieldDescription), Language: r.FormValue(fieldLanguage)}
 	if form.Title == "" {
 		form.Error = "Title is required."
 		s.render(w, r, http.StatusBadRequest, "admin_episode_edit", "Edit episode", form)
