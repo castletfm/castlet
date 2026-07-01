@@ -258,6 +258,8 @@ type nackRecordingQueue struct {
 
 func (q *nackRecordingQueue) Enqueue(context.Context, model.JobKind, any) error { return nil }
 
+func (q *nackRecordingQueue) EnqueueTranscription(context.Context, string) error { return nil }
+
 func (q *nackRecordingQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, bool, error) {
 	if q.dequeued {
 		return nil, false, nil
@@ -329,6 +331,8 @@ type ackRecordingQueue struct {
 }
 
 func (q *ackRecordingQueue) Enqueue(context.Context, model.JobKind, any) error { return nil }
+
+func (q *ackRecordingQueue) EnqueueTranscription(context.Context, string) error { return nil }
 
 func (q *ackRecordingQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, bool, error) {
 	if q.dequeued {
@@ -457,6 +461,8 @@ type deadNackQueue struct {
 }
 
 func (q *deadNackQueue) Enqueue(context.Context, model.JobKind, any) error { return nil }
+
+func (q *deadNackQueue) EnqueueTranscription(context.Context, string) error { return nil }
 
 func (q *deadNackQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, bool, error) {
 	if q.dequeued {

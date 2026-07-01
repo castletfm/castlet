@@ -24,6 +24,18 @@ import (
 type JobQueue interface {
 	// Enqueue persists a new job. payload is marshaled to JSON.
 	Enqueue(ctx context.Context, kind model.JobKind, payload any) error
+	// EnqueueTranscription enqueues a JobTranscribe for episodeID AND marks that
+	// episode's transcript_status = pending as ONE atomic unit: a caller either
+	// gets both (a queued job and an episode that shows pending) or neither (on
+	// failure no job is queued and the episode keeps its prior, non-pending
+	// status). This is the only way callers should start transcription, so a
+	// queued job and its episode's pending state never diverge — there is never a
+	// pending episode with no job to run it, nor a queued job whose episode status
+	// was left stale. The store-backed default (dbqueue over sqlite) provides this
+	// by inserting the job and marking the episode in a single store transaction;
+	// like the worker's fenced settlement (see the package note), a JobQueue built
+	// on an external broker must supply the equivalent atomicity.
+	EnqueueTranscription(ctx context.Context, episodeID string) error
 	// Dequeue claims the next runnable job whose Kind is in kinds (all kinds
 	// when none are given), marking it in-flight. It returns (nil, false, nil)
 	// when no job is currently runnable.

@@ -161,6 +161,17 @@ type Store interface {
 	// (Redis, SQS) that does not use these methods can only be paired with a worker
 	// whose settlement does not couple to the store job row.
 	EnqueueJob(ctx context.Context, j *model.Job) error
+	// EnqueueTranscriptionJob atomically inserts a transcription job AND marks the
+	// referenced episode's transcript_status = pending in ONE transaction, so the
+	// job and the episode's pending state can never diverge. Either both are
+	// committed (a job to run plus an episode that shows pending) or neither is
+	// (on any error the transaction rolls back, leaving no job and the episode's
+	// prior, non-pending status intact). This closes both windows a two-step
+	// enqueue-then-mark leaves open: an episode stuck pending with no job to run
+	// it, and a queued job whose episode status was never advanced. j.Payload must
+	// already identify episodeID. Returns ErrNotFound (and writes nothing) when no
+	// episode has that id.
+	EnqueueTranscriptionJob(ctx context.Context, j *model.Job, episodeID string, updatedAt time.Time) error
 	// JobByID returns a single job, or ErrNotFound.
 	JobByID(ctx context.Context, id string) (*model.Job, error)
 	// ClaimJob atomically selects the oldest runnable job whose Kind is in

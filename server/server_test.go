@@ -629,14 +629,15 @@ func TestAdminUploadFlow(t *testing.T) {
 	require.Contains(t, page, "Hello")
 }
 
-// enqueueFailQueue wraps a real JobQueue but always fails to Enqueue, so tests
-// can exercise the handlers' behaviour when a transcription job cannot be
-// queued.
+// enqueueFailQueue wraps a real JobQueue but always fails EnqueueTranscription,
+// so tests can exercise the handlers' behaviour when a transcription job cannot
+// be queued (the atomic enqueue+mark-pending step the upload and re-transcribe
+// handlers both go through).
 type enqueueFailQueue struct {
 	queue.JobQueue
 }
 
-func (enqueueFailQueue) Enqueue(context.Context, model.JobKind, any) error {
+func (enqueueFailQueue) EnqueueTranscription(context.Context, string) error {
 	return errors.New("enqueue boom")
 }
 
@@ -668,8 +669,10 @@ func newHarnessQueue(t *testing.T, mkQueue func(store queue.JobQueue) queue.JobQ
 
 // TestUploadEnqueueFailureNotStuckPending verifies that when the transcription
 // job cannot be enqueued during upload, the episode is not left stuck 'pending'
-// (which the UI would refuse to re-queue): it is marked 'failed' and the handler
-// surfaces an error to the user.
+// (which the UI would refuse to re-queue): because enqueue and marking the
+// episode pending are one atomic step, a failure leaves the episode at its
+// initial non-pending 'none' status with no job, and the handler surfaces an
+// error to the user.
 func TestUploadEnqueueFailureNotStuckPending(t *testing.T) {
 	h := newHarnessQueue(t, func(q queue.JobQueue) queue.JobQueue { return enqueueFailQueue{q} })
 	ctx := t.Context()
@@ -691,12 +694,13 @@ func TestUploadEnqueueFailureNotStuckPending(t *testing.T) {
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,
 		"a failed enqueue must surface an error, not silently succeed")
 
-	// The episode exists (it owns the media key) but must not be stuck pending.
+	// The episode exists (it owns the media key) but must not be stuck pending:
+	// the atomic enqueue rolled back, so it keeps its initial non-pending status.
 	eps, err := h.store.ListEpisodes(ctx, store.EpisodeFilter{ChannelID: "c1"})
 	require.NoError(t, err)
 	require.Len(t, eps, 1)
-	require.Equal(t, model.TranscriptFailed, eps[0].TranscriptStatus,
-		"an episode whose job never queued must be failed, not stuck pending")
+	require.Equal(t, model.TranscriptNone, eps[0].TranscriptStatus,
+		"an episode whose job never queued must not be stuck pending")
 }
 
 // TestReTranscribeEnqueueFailureNotStuckPending verifies that when re-enqueuing

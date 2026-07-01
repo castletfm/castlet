@@ -350,26 +350,26 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		MediaBytes:       n,
 		Language:         form.Language,
 		Status:           model.EpisodeDraft,
-		TranscriptStatus: model.TranscriptPending,
+		TranscriptStatus: model.TranscriptNone,
 		CreatedAt:        s.now(),
 		UpdatedAt:        s.now(),
 	}
+	// Create the episode first: it owns the content-addressed media key. Its
+	// transcript status starts at 'none' (not yet queued), and only the atomic
+	// enqueue below flips it to 'pending' together with the job insert.
 	if err := s.store.CreateEpisode(r.Context(), ep); err != nil {
 		s.deleteOrphanBlob(r.Context(), mediaKey) // only if no other episode shares it
 		s.serverError(w, r, err)
 		return
 	}
 
-	// Queue transcription. The episode is already persisted as pending (it owns
-	// the media key), so an enqueue failure must not leave it stuck pending with
-	// no job in the queue — the UI only offers a re-transcribe on a non-pending
-	// episode. Roll the status back to failed and surface the error to the user.
-	if err := s.queue.Enqueue(r.Context(), model.JobTranscribe, model.TranscribePayload{EpisodeID: ep.ID}); err != nil {
-		ep.TranscriptStatus = model.TranscriptFailed
-		ep.UpdatedAt = s.now()
-		if uerr := s.store.UpdateEpisode(r.Context(), ep); uerr != nil {
-			s.logger.Error("mark transcription failed after enqueue error", "episode", ep.ID, "error", uerr)
-		}
+	// Queue transcription atomically with marking the episode pending: either both
+	// happen or neither, so the episode is never left pending with no job to run it
+	// (the CST-011 stuck case) and no job is ever queued with a stale episode
+	// status. On failure the episode simply keeps its 'none' status with no job —
+	// safe: the UI still offers a re-transcribe (only pending/processing block it),
+	// so the user can retry. Surface the error.
+	if err := s.queue.EnqueueTranscription(r.Context(), ep.ID); err != nil {
 		s.serverError(w, r, err)
 		return
 	}
@@ -515,16 +515,11 @@ func (s *Server) handleEpisodeTranscribe(w http.ResponseWriter, r *http.Request)
 		s.renderError(w, r, http.StatusConflict, "Transcription is already in progress for this episode.")
 		return
 	}
-	// Enqueue before persisting the pending status: if the enqueue fails, the
-	// episode keeps its current (non-pending) status so the UI still offers a
-	// re-transcribe, rather than being stuck pending with no job in the queue.
-	if err := s.queue.Enqueue(r.Context(), model.JobTranscribe, model.TranscribePayload{EpisodeID: ep.ID}); err != nil {
-		s.serverError(w, r, err)
-		return
-	}
-	ep.TranscriptStatus = model.TranscriptPending
-	ep.UpdatedAt = s.now()
-	if err := s.store.UpdateEpisode(r.Context(), ep); err != nil {
+	// Enqueue the job and mark the episode pending atomically: either both commit
+	// or neither. A failure leaves the episode with its current (non-pending)
+	// status and no job, so the UI still offers a re-transcribe; success can never
+	// leave the episode pending with no job, nor a queued job with a stale status.
+	if err := s.queue.EnqueueTranscription(r.Context(), ep.ID); err != nil {
 		s.serverError(w, r, err)
 		return
 	}

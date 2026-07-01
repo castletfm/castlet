@@ -11,14 +11,59 @@ import (
 	"github.com/castletfm/castlet/store"
 )
 
-func (s *Store) EnqueueJob(ctx context.Context, j *model.Job) error {
-	_, err := s.db.ExecContext(ctx,
+// rowExecer is the subset of *sql.DB / *sql.Tx used to insert a job, so the same
+// INSERT can run standalone (EnqueueJob) or inside a larger transaction
+// (EnqueueTranscriptionJob).
+type rowExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// insertJob writes a job row using the given executor (the pool for a standalone
+// enqueue, or an open transaction when the insert must commit atomically with
+// other writes).
+func insertJob(ctx context.Context, ex rowExecer, j *model.Job) error {
+	_, err := ex.ExecContext(ctx,
 		`INSERT INTO jobs (id, kind, payload, status, attempts, last_error, run_after, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		j.ID, string(j.Kind), j.Payload, string(j.Status), j.Attempts, j.LastError,
 		toUnix(j.RunAfter), toUnix(j.CreatedAt), toUnix(j.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("sqlite: enqueue job: %w", mapErr(err))
+	}
+	return nil
+}
+
+func (s *Store) EnqueueJob(ctx context.Context, j *model.Job) error {
+	return insertJob(ctx, s.db, j)
+}
+
+// EnqueueTranscriptionJob inserts the job and marks the episode pending in one
+// transaction so the two are indivisible: on the single-writer pool either both
+// land or, on any failure, the whole thing rolls back and nothing is written.
+// The episode UPDATE is required to touch a row — a missing episode yields
+// ErrNotFound and rolls back the job insert too, so a job is never queued for an
+// episode that does not exist. See store.Store for the contract.
+func (s *Store) EnqueueTranscriptionJob(ctx context.Context, j *model.Job, episodeID string, updatedAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: enqueue transcription job: %w", mapErr(err))
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	if err := insertJob(ctx, tx, j); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE episodes SET transcript_status = ?, updated_at = ? WHERE id = ?`,
+		string(model.TranscriptPending), toUnix(updatedAt), episodeID)
+	if err != nil {
+		return fmt.Errorf("sqlite: mark episode pending: %w", mapErr(err))
+	}
+	if err := requireAffected(res); err != nil {
+		return err // ErrNotFound: no such episode; rolls back the job insert
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: enqueue transcription job: %w", mapErr(err))
 	}
 	return nil
 }
