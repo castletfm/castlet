@@ -82,7 +82,7 @@ blob/                   BlobStore interface (opaque binary objects: audio, image
 queue/                  JobQueue interface (enqueue/claim/ack/retry)
   queue/dbqueue/        default: backed by Store (no extra service)
 transcribe/             Transcriber interface + Result/Segment types
-  transcribe/null/      default: no-op (leaves transcript "pending")
+  transcribe/null/      default: no-op (transcript settles to "none")
   transcribe/command/   opt-in: shells out to a whisper.cpp-style binary
 
 worker/                 transcription worker (Run/Controller lifecycle)
@@ -152,25 +152,43 @@ Constructors take options via `github.com/lestrrat-go/option/v3` (ident structs
 + `option.MustGet`), folded into the receiver in the constructor.
 
 The `queue.JobQueue` contract keeps callers ignorant of retry policy. A caller
-`Dequeue(ctx) (*Job, deadLettered bool, error)`s the next runnable job, then
-settles it with `Ack(ctx, *Job)` on success or `Nack(ctx, *Job, cause)` on
-failure; the queue decides whether to reschedule with backoff or mark the job
-permanently dead (`Nack` returns a `dead bool`). The `*Job` carries its
-`Attempts` count, which doubles as the claim's **fencing token**, so both `Ack`
-and `Nack` are fenced by it (see below) rather than taking a bare job id.
+`Dequeue(ctx, kinds…) (*Job, deadLettered bool, error)`s the next runnable job,
+then settles it with `Ack(ctx, *Job)` on success or `Nack(ctx, *Job, cause)` on
+failure. `Ack` is the success path and `Nack` is the transient-failure path; on
+`Nack` the queue decides whether to reschedule with backoff or, once attempts are
+exhausted, mark the job permanently dead (`Nack` returns a `dead bool`). The
+`*Job` carries its `Attempts` count, which doubles as the claim's **fencing
+token**, so both `Ack` and `Nack` are fenced by it (see below) rather than taking
+a bare job id.
 
 The default `dbqueue` implements this over the metadata `Store`, which is why
 `Store` carries the job methods (`EnqueueJob`, `JobByID`, `ClaimJob`,
 `CompleteJob`, `RescheduleJob`, `FailJob`). `ClaimJob` leases a job (marks it
 `processing`, pushes `run_after` out, and increments `Attempts`) so a crashed
-worker's job becomes reclaimable once its lease expires. The lease governs
+worker's job becomes reclaimable once its lease expires; it claims with a guarded
+conditional `UPDATE` that commits only when it affects exactly one row, so two
+workers racing on the same row can never both claim it. The lease governs
 *reclaim* only — it does not kill a running job — so a live-but-slow attempt can
 have its lease expire and the job reclaimed by another worker. That overlap is
 made safe by the fencing token: every settlement (`CompleteJob`/`RescheduleJob`/
-`FailJob`, and the episode-side `SettleEpisodeTranscript`) applies **only while
-the token still matches the current claim and the job is still `processing`**,
-returning `store.ErrStaleClaim` otherwise. A stale attempt's `Ack`/`Nack` thus
-no-op instead of clobbering the reclaiming attempt.
+`FailJob`, the episode-side `SettleEpisodeTranscript`, and the combined
+success-path `SettleEpisodeTranscriptAndCompleteJob`) applies **only while the
+token still matches the current claim and the job is still `processing`**,
+returning `store.ErrStaleClaim` otherwise. The single deliberate exception to
+the "only while `processing`" rule: the transcript-less `TranscriptFailed` mark
+(a `SettleEpisodeTranscript` with a nil transcript) is also accepted while the
+job is already `failed`, because it is the dead-letter/Nack-exhaustion write that
+legitimately runs right after the same claim's `FailJob` flipped the job to
+`failed`. A stale attempt's `Ack`/`Nack` thus no-ops instead of clobbering the
+reclaiming attempt.
+
+The fencing token *is* the store job row's `Attempts`, so this queue and store
+are coupled: a `JobQueue` paired with the default worker must mirror its claims
+into that row (as `dbqueue` does through `ClaimJob`), because the worker's success
+path settles the episode and completes the job in ONE fenced store transaction
+(`SettleEpisodeTranscriptAndCompleteJob`). A fully external queue (Redis, SQS)
+that never touches the store's job methods must instead be paired with a worker
+whose settlement does not couple to the store job row.
 
 `Dequeue` also handles **poison jobs**: a job reclaimed after its `Attempts`
 already exceeded the max-attempts limit is never handed back to run; the queue
