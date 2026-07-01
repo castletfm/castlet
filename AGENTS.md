@@ -47,7 +47,7 @@ ffmpeg, jq) and is the best way to exercise the whole system end to end.
 - `server` — HTTP handlers, routing, `html/template` rendering (`server.Renderer`).
 - `web` — embedded templates (`web/templates`) and static assets (`web/static`).
 - `worker` — background transcription worker.
-- `internal` — small helpers (`idgen`, `session`).
+- `internal` — small helpers (`idgen`, `session`, `email`, `metrics`).
 - `docs/architecture.md` — deeper design notes.
 
 ## Architecture & conventions
