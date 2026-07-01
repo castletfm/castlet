@@ -190,7 +190,11 @@ type Store interface {
 	// 'processing'. It returns ErrStaleClaim when the job was reclaimed or is
 	// already in a terminal state (already settled).
 	FailJob(ctx context.Context, id string, token int, cause string) error
-	// CountPendingJobs returns the number of jobs still waiting to run (status
-	// 'pending'). It backs the queue-depth metric and should stay cheap.
-	CountPendingJobs(ctx context.Context) (int, error)
+	// CountPendingJobs returns the size of the runnable job backlog: jobs that
+	// are pending plus processing jobs whose lease has expired and are therefore
+	// reclaimable (as of now). This mirrors ClaimJob's runnable predicate so the
+	// backing queue-depth metric cannot report 0 while a crashed/expired job is
+	// immediately reclaimable. now is supplied by the caller so it shares the
+	// caller's clock; it should stay cheap.
+	CountPendingJobs(ctx context.Context, now time.Time) (int, error)
 }

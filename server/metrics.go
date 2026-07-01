@@ -26,10 +26,10 @@ func (s *Server) registerMetrics() {
 	s.metrics.Register(metricHTTPRequests, metrics.Counter, "Total HTTP requests by route pattern and status.")
 	s.metrics.Register(metricHTTPDurationSum, metrics.Counter, "Sum of HTTP request durations in seconds by route pattern.")
 	s.metrics.Register(metricHTTPDurationCnt, metrics.Counter, "Count of HTTP requests observed for the duration sum, by route pattern.")
-	s.metrics.GaugeFunc(metricQueuePending, "Jobs currently pending in the queue.", func() float64 {
+	s.metrics.GaugeFunc(metricQueuePending, "Runnable job backlog: pending jobs plus reclaimable (lease-expired) processing jobs.", func() float64 {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		n, err := s.store.CountPendingJobs(ctx)
+		n, err := s.store.CountPendingJobs(ctx, time.Now())
 		if err != nil {
 			s.logger.Warn("metrics: count pending jobs", "error", err)
 			return 0

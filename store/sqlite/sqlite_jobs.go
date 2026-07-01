@@ -154,12 +154,18 @@ func (s *Store) setJobStatus(ctx context.Context, id string, token int, status m
 	return nil
 }
 
-// CountPendingJobs counts jobs still queued to run. It is a cheap COUNT over the
-// pending status, backing the queue-depth gauge exposed at /metrics.
-func (s *Store) CountPendingJobs(ctx context.Context) (int, error) {
+// CountPendingJobs counts the runnable job backlog: pending jobs plus
+// processing jobs whose lease has expired and are therefore reclaimable. This
+// mirrors ClaimJob's runnable predicate — status = 'pending' OR (status =
+// 'processing' AND run_after <= now) — using the same whole-second time
+// precision (toUnix), so the queue-depth gauge cannot report 0 while a
+// crashed/expired job is immediately reclaimable. now is injected (rather than
+// read via time.Now deep in the store) so the gauge and tests share one clock.
+func (s *Store) CountPendingJobs(ctx context.Context, now time.Time) (int, error) {
 	var n int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM jobs WHERE status = ?`, string(model.JobPending)).Scan(&n)
+		`SELECT COUNT(*) FROM jobs WHERE status = ? OR (status = ? AND run_after <= ?)`,
+		string(model.JobPending), string(model.JobProcessing), toUnix(now)).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("sqlite: count pending jobs: %w", mapErr(err))
 	}
