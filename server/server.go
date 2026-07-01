@@ -42,6 +42,16 @@ const readTimeout = 30 * time.Second
 // return after Shutdown/Close before giving up on it, so Run always returns.
 const shutdownDrainGrace = 2 * time.Second
 
+// mediaWriteIdle is the default idle window applied to a streamed /media
+// response: each successful write refreshes the connection's write deadline by
+// this much, so a large-but-progressing download is never cut off while a
+// reader that stalls for longer than the window is dropped. This bounds a
+// slow-read DoS on the streaming (localfs / non-DirectURL) media path, which
+// would otherwise pin a goroutine, connection, and open blob reader
+// indefinitely because http.Server.WriteTimeout is deliberately left unset. The
+// DirectURL path 302-redirects and streams no bytes, so it needs no deadline.
+const mediaWriteIdle = 60 * time.Second
+
 // Server serves the Castlet web application. The receiver holds only validated
 // configuration and is safe to Run more than once.
 type Server struct {
@@ -67,8 +77,12 @@ type Server struct {
 	allowedDomains  []string // email domains permitted to sign in via OIDC; empty allows any
 	maxUploadBytes  int64
 	shutdownTimeout time.Duration
-	logger          *slog.Logger
-	now             func() time.Time
+	// mediaWriteIdle is the idle window that bounds each streamed /media write;
+	// defaulted to the mediaWriteIdle constant in New. Kept as a field so tests
+	// can shrink it without waiting on the production window.
+	mediaWriteIdle time.Duration
+	logger         *slog.Logger
+	now            func() time.Time
 }
 
 // Option configures New.
@@ -146,6 +160,7 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *sessi
 		siteName:        "Castlet",
 		maxUploadBytes:  512 << 20,
 		shutdownTimeout: 10 * time.Second,
+		mediaWriteIdle:  mediaWriteIdle,
 		logger:          slog.Default(),
 		now:             time.Now,
 		loginLimiter:    newLoginLimiter(loginRateLimitMax, loginRateLimitWindow, loginLimiterMaxEntries),

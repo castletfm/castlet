@@ -115,9 +115,62 @@ func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "attachment")
 	w.Header().Set("Content-Type", ct)
 	_ = size // ServeContent derives length from the seeker; size is informational
+
+	// Bound the stream by a refreshed idle write deadline so an unauthenticated
+	// slow/stalled reader cannot pin this goroutine, connection, and open blob
+	// reader forever (a slow-read DoS). Each successful write pushes the deadline
+	// out, so a large but progressing download is never cut off; only a reader
+	// that stalls longer than the window is dropped.
+	w = s.streamWithIdleDeadline(w)
+
 	// Zero modtime omits Last-Modified but still supports range requests.
 	http.ServeContent(w, r, key, time.Time{}, rc)
 }
+
+// streamWithIdleDeadline arms an idle write deadline on w's underlying
+// connection and returns a wrapper that refreshes it on every write. When the
+// connection does not support write deadlines (e.g. an httptest recorder —
+// http.ErrNotSupported), it returns w unwrapped so the download still streams
+// without a deadline.
+//
+// The deadline is deliberately never cleared afterward: once a stalled write
+// trips it, net/http's post-handler flush of any buffered response must also
+// fail fast so the (already write-errored) connection is torn down instead of
+// re-blocking on the same stalled reader forever. On a normal download the
+// deadline is left at (last write + idle) in the future, which is harmless — a
+// subsequent media stream on a kept-alive connection re-arms it, other responses
+// complete well within the window, and IdleTimeout bounds connection reuse.
+func (s *Server) streamWithIdleDeadline(w http.ResponseWriter) http.ResponseWriter {
+	ctrl := http.NewResponseController(w)
+	if err := ctrl.SetWriteDeadline(s.now().Add(s.mediaWriteIdle)); err != nil {
+		return w
+	}
+	return &idleDeadlineWriter{ResponseWriter: w, ctrl: ctrl, idle: s.mediaWriteIdle, now: s.now}
+}
+
+// idleDeadlineWriter refreshes the underlying connection's write deadline by a
+// fixed idle window before every write, turning a single fixed WriteTimeout
+// (which would truncate long legitimate downloads and is intentionally unset on
+// the http.Server) into a per-write stall bound. It relies on
+// http.ResponseController reaching the real connection via the Unwrap chain (see
+// underlying / statusWriter.Unwrap). A SetWriteDeadline error is ignored per
+// write: the deadline was already armed once by streamWithIdleDeadline, and a
+// failure to refresh must not abort a legitimate write.
+type idleDeadlineWriter struct {
+	http.ResponseWriter
+	ctrl *http.ResponseController
+	idle time.Duration
+	now  func() time.Time
+}
+
+func (w *idleDeadlineWriter) Write(p []byte) (int, error) {
+	_ = w.ctrl.SetWriteDeadline(w.now().Add(w.idle))
+	return w.ResponseWriter.Write(p)
+}
+
+// Unwrap keeps the wrapped ResponseWriter reachable so http.ResponseController
+// and status logging traverse past this wrapper.
+func (w *idleDeadlineWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // effectiveContentType resolves the sanitized Content-Type for a blob without
 // streaming it: episode media uses its stored MIME, other blobs are sniffed
