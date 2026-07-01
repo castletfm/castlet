@@ -161,6 +161,14 @@ exhausted, mark the job permanently dead (`Nack` returns a `dead bool`). The
 token**, so both `Ack` and `Nack` are fenced by it (see below) rather than taking
 a bare job id.
 
+`Ack` is the *generic* queue-level success operation. The default transcription
+worker does not use it on the normal success path: it completes a successful job
+through the store's combined `SettleEpisodeTranscriptAndCompleteJob`, which writes
+the transcript, the episode status, and the job completion in one fenced
+transaction (so a reclaim can't interleave between settling the episode and
+completing the job). `Ack` is reserved for completions with no episode side
+effects; `Nack` remains the failure/dead-letter path.
+
 The default `dbqueue` implements this over the metadata `Store`, which is why
 `Store` carries the job methods (`EnqueueJob`, `JobByID`, `ClaimJob`,
 `CompleteJob`, `RescheduleJob`, `FailJob`). `ClaimJob` leases a job (marks it
