@@ -13,8 +13,8 @@
     {{range $i, $e := .Data.Episodes}}
     <tr>
       <td class="reorder">
-        {{if $i}}<form method="post" action="/admin/episodes/{{.ID}}/move" class="inline"><input type="hidden" name="dir" value="up"><button class="linklike" type="submit" title="Move up" aria-label="Move up">↑</button></form>{{end}}
-        {{if lt (add $i 1) $n}}<form method="post" action="/admin/episodes/{{.ID}}/move" class="inline"><input type="hidden" name="dir" value="down"><button class="linklike" type="submit" title="Move down" aria-label="Move down">↓</button></form>{{end}}
+        {{if $i}}<form method="post" action="/admin/episodes/{{.ID}}/move" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="dir" value="up"><button class="linklike" type="submit" title="Move up" aria-label="Move up">↑</button></form>{{end}}
+        {{if lt (add $i 1) $n}}<form method="post" action="/admin/episodes/{{.ID}}/move" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="dir" value="down"><button class="linklike" type="submit" title="Move down" aria-label="Move down">↓</button></form>{{end}}
       </td>
       <td><a href="/admin/episodes/{{.ID}}/edit">{{.Title}}</a></td>
       <td><span class="badge {{.Status}}">{{.Status}}</span></td>
@@ -27,16 +27,19 @@
         {{if eq (printf "%s" .Status) "published"}}
         <a href="/e/{{.ID}}/" target="_blank" rel="noopener">View</a>
         <form method="post" action="/admin/episodes/{{.ID}}/unpublish" class="inline">
+          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
           <button class="linklike" type="submit">Unpublish</button>
         </form>
         {{else}}
         <form method="post" action="/admin/episodes/{{.ID}}/publish" class="inline">
+          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
           <button class="linklike" type="submit">Publish</button>
         </form>
         {{end}}
         <a href="/admin/episodes/{{.ID}}/edit">Edit</a>
         <form method="post" action="/admin/episodes/{{.ID}}/delete" class="inline"
               onsubmit="return confirm('Delete this episode?')">
+          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
           <button class="linklike danger" type="submit">Delete</button>
         </form>
       </td>

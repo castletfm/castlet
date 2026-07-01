@@ -15,6 +15,7 @@
         <a class="btn nav-upload" href="/admin/upload">Upload</a>
         <a href="/admin/">My Page</a>
         <form method="post" action="/logout" class="inline">
+          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
           <button type="submit" class="linklike">Log out</button>
         </form>
       {{else}}

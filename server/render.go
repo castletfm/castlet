@@ -24,8 +24,9 @@ type ViewData struct {
 	Site        string
 	User        *model.User
 	Title       string
-	AllowSignup bool // show local sign-up affordances
-	OIDCEnabled bool // show the single sign-on button
+	AllowSignup bool   // show local sign-up affordances
+	OIDCEnabled bool   // show the single sign-on button
+	CSRFToken   string // per-request token embedded in state-changing forms
 	Data        any
 }
 

@@ -6,7 +6,10 @@
 
 {{with .Data.Error}}<p class="error">{{.}}</p>{{end}}
 
-<form method="post" action="/admin/channels/{{$ch.ID}}/episodes" enctype="multipart/form-data" class="stack">
+<!-- Multipart upload: the CSRF token rides in the query string, not a hidden
+     field, because the server reads it without parsing the (large, streamed)
+     multipart body. See server/csrf.go requestCSRFToken. -->
+<form method="post" action="/admin/channels/{{$ch.ID}}/episodes?csrf_token={{$.CSRFToken}}" enctype="multipart/form-data" class="stack">
   <label>Title
     <input type="text" name="title" value="{{.Data.Title}}" required autofocus>
   </label>

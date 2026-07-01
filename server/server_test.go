@@ -93,6 +93,53 @@ func (h *harness) get(t *testing.T, path string) (*http.Response, string) {
 	return resp, string(body)
 }
 
+// csrfToken issues (or reuses) the client's CSRF cookie via a GET and returns
+// its value, so state-changing POSTs can echo it back like a real browser form.
+func csrfToken(t *testing.T, client *http.Client, base string) string {
+	t.Helper()
+	resp, err := client.Get(base + "/login")
+	require.NoError(t, err)
+	resp.Body.Close()
+	u, err := url.Parse(base)
+	require.NoError(t, err)
+	for _, c := range client.Jar.Cookies(u) {
+		if c.Name == "castlet_csrf" {
+			return c.Value
+		}
+	}
+	t.Fatal("no CSRF cookie was issued")
+	return ""
+}
+
+// postFormCSRF submits a urlencoded form with a valid CSRF token attached, the
+// way the rendered forms do.
+func postFormCSRF(t *testing.T, client *http.Client, base, path string, values url.Values) (*http.Response, error) {
+	t.Helper()
+	if values == nil {
+		values = url.Values{}
+	}
+	values.Set("csrf_token", csrfToken(t, client, base))
+	return client.PostForm(base+path, values)
+}
+
+func (h *harness) postForm(t *testing.T, path string, values url.Values) (*http.Response, error) {
+	t.Helper()
+	return postFormCSRF(t, h.client, h.base, path, values)
+}
+
+// postMultipart submits a multipart upload with the CSRF token in the query
+// string (the multipart body is streamed by the handler, so the token cannot
+// ride in a body field).
+func (h *harness) postMultipart(t *testing.T, path, contentType string, body io.Reader) (*http.Response, error) {
+	t.Helper()
+	token := csrfToken(t, h.client, h.base)
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return h.client.Post(h.base+path+sep+"csrf_token="+token, contentType, body)
+}
+
 // seed creates a user (password "secret"), a channel, and one published audio
 // episode with a done transcript.
 func (h *harness) seed(t *testing.T) {
@@ -519,11 +566,11 @@ func TestEpisodeDeleteRetainsSharedCoverBlob(t *testing.T) {
 		MediaBytes: int64(len(body)), Status: model.EpisodePublished, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 
 	// log in and delete the episode
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
-	resp, err = h.client.PostForm(h.base+"/admin/episodes/e1/delete", nil)
+	resp, err = h.postForm(t, "/admin/episodes/e1/delete", nil)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -546,13 +593,13 @@ func TestAuthAndAdmin(t *testing.T) {
 	require.Equal(t, "/login", resp.Header.Get("Location"))
 
 	// wrong password
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"nope"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 
 	// correct password -> redirect + session cookie stored in jar
-	resp, err = h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err = h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -572,13 +619,13 @@ func TestAdminUploadFlow(t *testing.T) {
 		DisplayName: "A", PasswordHash: string(hash), CreatedAt: time.Now()}))
 
 	// log in
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 
 	// create a channel
-	resp, err = h.client.PostForm(h.base+"/admin/channels", url.Values{"title": {"My Show"}})
+	resp, err = h.postForm(t, "/admin/channels", url.Values{"title": {"My Show"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -590,7 +637,7 @@ func TestAdminUploadFlow(t *testing.T) {
 	// upload an episode (multipart)
 	audio := []byte("ID3 fake mp3 payload")
 	body, contentType := multipartUpload(t, map[string]string{"title": "Hello"}, "media", "clip.mp3", "audio/mpeg", audio)
-	resp, err = h.client.Post(h.base+"/admin/channels/"+chID+"/episodes", contentType, body)
+	resp, err = h.postMultipart(t, "/admin/channels/"+chID+"/episodes", contentType, body)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -613,7 +660,7 @@ func TestAdminUploadFlow(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
 	// publish, then it appears on the public channel page
-	resp, err = h.client.PostForm(h.base+"/admin/episodes/"+ep.ID+"/publish", nil)
+	resp, err = h.postForm(t, "/admin/episodes/"+ep.ID+"/publish", nil)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -681,14 +728,14 @@ func TestUploadEnqueueFailureNotStuckPending(t *testing.T) {
 	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
 		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 
 	audio := []byte("ID3 fake mp3 payload")
 	body, contentType := multipartUpload(t, map[string]string{"title": "Hello"}, "media", "clip.mp3", "audio/mpeg", audio)
-	resp, err = h.client.Post(h.base+"/admin/channels/c1/episodes", contentType, body)
+	resp, err = h.postMultipart(t, "/admin/channels/c1/episodes", contentType, body)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,
@@ -719,12 +766,12 @@ func TestReTranscribeEnqueueFailureNotStuckPending(t *testing.T) {
 		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptFailed,
 		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 
-	resp, err = h.client.PostForm(h.base+"/admin/episodes/e1/transcribe", nil)
+	resp, err = h.postForm(t, "/admin/episodes/e1/transcribe", nil)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusInternalServerError, resp.StatusCode,
@@ -747,7 +794,7 @@ func TestUploadExceedsCap(t *testing.T) {
 	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
 		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -755,7 +802,7 @@ func TestUploadExceedsCap(t *testing.T) {
 	// A payload well over the 64-byte cap.
 	audio := bytes.Repeat([]byte("x"), 4096)
 	body, contentType := multipartUpload(t, map[string]string{"title": "Hello"}, "media", "clip.mp3", "audio/mpeg", audio)
-	resp, err = h.client.Post(h.base+"/admin/channels/c1/episodes", contentType, body)
+	resp, err = h.postMultipart(t, "/admin/channels/c1/episodes", contentType, body)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
@@ -779,13 +826,13 @@ func TestUploadRejectsNonMultipart(t *testing.T) {
 	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
 		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
 
 	// application/x-www-form-urlencoded is not a multipart upload.
-	resp, err = h.client.PostForm(h.base+"/admin/channels/c1/episodes",
+	resp, err = h.postForm(t, "/admin/channels/c1/episodes",
 		url.Values{"title": {"Hello"}})
 	require.NoError(t, err)
 	resp.Body.Close()
@@ -817,7 +864,7 @@ func TestUploadOverCapChunkedStallReturnsPromptly(t *testing.T) {
 	// then replay on a raw connection (the raw request is needed to send an
 	// over-cap chunk and then deliberately stall without the client-side
 	// write/response race a normal http.Client hits here).
-	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	resp, err := h.postForm(t, "/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
@@ -825,13 +872,18 @@ func TestUploadOverCapChunkedStallReturnsPromptly(t *testing.T) {
 	u, err := url.Parse(h.base)
 	require.NoError(t, err)
 	var cookie strings.Builder
+	var csrf string
 	for i, c := range h.client.Jar.Cookies(u) {
 		if i > 0 {
 			cookie.WriteString("; ")
 		}
 		cookie.WriteString(c.Name + "=" + c.Value)
+		if c.Name == "castlet_csrf" {
+			csrf = c.Value
+		}
 	}
 	require.NotEmpty(t, cookie.String(), "expected a session cookie after login")
+	require.NotEmpty(t, csrf, "expected a CSRF cookie after login")
 
 	conn, err := net.Dial("tcp", u.Host)
 	require.NoError(t, err)
@@ -839,8 +891,10 @@ func TestUploadOverCapChunkedStallReturnsPromptly(t *testing.T) {
 
 	// Send a complete request head, then one chunk well over the 64-byte cap, and
 	// then nothing more (no terminating chunk) — a body that stalls after crossing
-	// the cap. Content need not be valid multipart: the cap is hit first.
-	head := "POST /admin/channels/c1/episodes HTTP/1.1\r\n" +
+	// the cap. Content need not be valid multipart: the cap is hit first. The CSRF
+	// token rides in the query string so the middleware accepts the POST without
+	// having to read the (stalled) multipart body.
+	head := "POST /admin/channels/c1/episodes?csrf_token=" + csrf + " HTTP/1.1\r\n" +
 		"Host: " + u.Host + "\r\n" +
 		"Cookie: " + cookie.String() + "\r\n" +
 		"Content-Type: multipart/form-data; boundary=xyz\r\n" +
