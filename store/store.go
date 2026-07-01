@@ -21,8 +21,8 @@ var (
 	// (e.g. a duplicate email or id).
 	ErrConflict = errors.New("store: conflict")
 	// ErrStaleClaim is returned by the job settlement methods (CompleteJob,
-	// RescheduleJob, FailJob, and the combined SettleEpisodeTranscriptAndCompleteJob)
-	// when the settlement is no longer valid. Settlement requires BOTH a matching
+	// RescheduleJob, FailJob, SettleEpisodeTranscript, and the combined
+	// SettleEpisodeTranscriptAndCompleteJob) when the settlement is no longer valid. Settlement requires BOTH a matching
 	// claim token AND the job still being in 'processing'.
 	// It therefore covers two cases:
 	//   - The supplied claim token no longer matches the job's current claim: the
