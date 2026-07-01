@@ -12,8 +12,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/castletfm/castlet/internal/idgen"
 	"github.com/castletfm/castlet/model"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/term"
 )
 
 // version is overridable at build time with -ldflags "-X main.version=...".
@@ -103,12 +106,21 @@ func cmdUserCreate(args []string) error {
 	dataDir := fs.String("data-dir", envOr("CASTLET_DATA_DIR", "./data"), "data directory")
 	email := fs.String("email", "", "user email (required)")
 	name := fs.String("name", "", "display name (defaults to the email)")
-	password := fs.String("password", "", "password (required)")
+	passwordFile := fs.String("password-file", "", "read the password from this file (trailing newline trimmed); preferred over --password")
+	password := fs.String("password", "", "password (INSECURE: visible in shell history and the process list; prefer --password-file or the interactive prompt)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *email == "" || *password == "" {
-		return fmt.Errorf("--email and --password are required")
+	if *email == "" {
+		return fmt.Errorf("--email is required")
+	}
+
+	plaintext, err := resolvePassword(*passwordFile, *password, os.Stdin, os.Stderr)
+	if err != nil {
+		return err
+	}
+	if plaintext == "" {
+		return fmt.Errorf("a password is required (use --password-file, the interactive prompt, or --password)")
 	}
 
 	// Build a minimal config just for store access.
@@ -124,7 +136,7 @@ func cmdUserCreate(args []string) error {
 		return err
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
@@ -146,6 +158,43 @@ func cmdUserCreate(args []string) error {
 	return nil
 }
 
+// resolvePassword returns the plaintext password using the following
+// precedence: --password-file, then an interactive prompt when stdin is a
+// terminal, and finally the --password flag (kept for backward compatibility
+// but insecure). in is the file used to detect and read from a terminal, out
+// is where the prompt is written.
+func resolvePassword(passwordFile, passwordFlag string, in *os.File, out io.Writer) (string, error) {
+	if passwordFile != "" {
+		return readPasswordFile(passwordFile)
+	}
+	if in != nil && term.IsTerminal(int(in.Fd())) {
+		return promptPassword(int(in.Fd()), out)
+	}
+	return passwordFlag, nil
+}
+
+// readPasswordFile reads a password from path, trimming any trailing newline
+// (and carriage return) left by editors.
+func readPasswordFile(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read password file: %w", err)
+	}
+	return strings.TrimRight(string(b), "\r\n"), nil
+}
+
+// promptPassword reads a password from the terminal identified by fd without
+// echoing it, writing the prompt to out.
+func promptPassword(fd int, out io.Writer) (string, error) {
+	fmt.Fprint(out, "Password: ")
+	b, err := term.ReadPassword(fd)
+	fmt.Fprintln(out)
+	if err != nil {
+		return "", fmt.Errorf("read password: %w", err)
+	}
+	return string(b), nil
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -159,7 +208,7 @@ func usage() {
 Usage:
   castlet serve         run the web server and transcription worker
   castlet migrate       create or upgrade the database schema
-  castlet user-create   create an admin user (--email, --password, [--name])
+  castlet user-create   create an admin user (--email, --password-file, [--name])
   castlet version       print the version
 
 Run "castlet serve -h" for serve flags. Configuration also reads CASTLET_*
