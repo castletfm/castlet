@@ -61,6 +61,12 @@ fails the boot.
 | `--oidc-client-secret` | `CASTLET_OIDC_CLIENT_SECRET` | **Required** when OIDC is enabled |
 | `--oidc-redirect-url` | `CASTLET_OIDC_REDIRECT_URL` | Defaults to `<base-url>/auth/oidc/callback` |
 | `--oidc-scopes` | `CASTLET_OIDC_SCOPES` | Space-separated; defaults to `openid profile email` |
+| `--oidc-allowed-domains` | `CASTLET_OIDC_ALLOWED_DOMAINS` | Comma-separated email domains allowed to sign in; empty allows any |
+
+Just-in-time provisioning only creates an account when the provider reports the
+email as **verified** (`email_verified`), and, when `--oidc-allowed-domains` is
+set, only for emails in those domains — so a broad or multi-tenant issuer (e.g.
+Google) cannot let arbitrary accounts self-provision.
 
 ### Media blob store (`fs` | `s3`)
 

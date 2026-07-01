@@ -41,6 +41,10 @@ type Config struct {
 	OIDCRedirectURL  string   // defaults to BaseURL + /auth/oidc/callback
 	OIDCScopes       []string // defaults to openid, profile, email
 
+	// OIDCAllowedDomains restricts which email domains may sign in via OIDC
+	// (linking or just-in-time provisioning). Empty means no domain restriction.
+	OIDCAllowedDomains []string
+
 	Transcriber       string   // "null" (default) or "command"
 	TranscribeCommand string   // executable for the command transcriber
 	TranscribeArgs    []string // argument template; "{{audio}}" is the audio path
@@ -78,12 +82,14 @@ func Load(args []string) (*Config, error) {
 	fs.StringVar(&cfg.OIDCRedirectURL, "oidc-redirect-url", env("CASTLET_OIDC_REDIRECT_URL", ""), "OIDC redirect URL (default base-url + /auth/oidc/callback)")
 	args0 := fs.String("transcribe-args", env("CASTLET_TRANSCRIBE_ARGS", "{{audio}}"), "space-separated argument template for the command transcriber")
 	scopes := fs.String("oidc-scopes", env("CASTLET_OIDC_SCOPES", "openid profile email"), "space-separated OIDC scopes")
+	domains := fs.String("oidc-allowed-domains", env("CASTLET_OIDC_ALLOWED_DOMAINS", ""), "comma-separated email domains allowed to sign in via OIDC (empty allows any)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
 	cfg.TranscribeArgs = strings.Fields(*args0)
 	cfg.OIDCScopes = strings.Fields(*scopes)
+	cfg.OIDCAllowedDomains = parseDomains(*domains)
 	if cfg.OIDCRedirectURL == "" {
 		cfg.OIDCRedirectURL = strings.TrimRight(cfg.BaseURL, "/") + "/auth/oidc/callback"
 	}
@@ -98,6 +104,18 @@ func Load(args []string) (*Config, error) {
 		cfg.GeneratedKey = true
 	}
 	return cfg, nil
+}
+
+// parseDomains splits a comma-separated domain list, trimming spaces and
+// lower-casing each entry so matching is case-insensitive. Empty entries drop.
+func parseDomains(s string) []string {
+	var out []string
+	for d := range strings.SplitSeq(s, ",") {
+		if d = strings.ToLower(strings.TrimSpace(d)); d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 func env(key, def string) string {
