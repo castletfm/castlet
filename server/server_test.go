@@ -221,6 +221,45 @@ func TestMediaMissingKey(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
+// TestMediaStreamNormalDownload verifies the idle write deadline added to the
+// streaming path does not disturb ordinary downloads: a full GET returns 200
+// with the exact bytes and the hardening headers, and a Range request still
+// yields 206 with the correct partial content. Served over the harness's real
+// listener, so the deadline wrapper is actually exercised.
+func TestMediaStreamNormalDownload(t *testing.T) {
+	h := newHarness(t)
+	ctx := t.Context()
+	body := bytes.Repeat([]byte("podcast-bytes"), 4096) // ~52 KiB
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", CreatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "S", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	_, err := h.blobs.Put(ctx, "clip", bytes.NewReader(body))
+	require.NoError(t, err)
+	require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1",
+		Title: "T", MediaKey: "clip", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		MediaBytes: int64(len(body)), Status: model.EpisodePublished,
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	resp, got := h.get(t, "/media/clip")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "audio/mpeg", resp.Header.Get("Content-Type"))
+	require.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
+	require.Equal(t, "attachment", resp.Header.Get("Content-Disposition"))
+	require.Equal(t, string(body), got, "full download must return the exact bytes")
+
+	req, err := http.NewRequest(http.MethodGet, h.base+"/media/clip", nil)
+	require.NoError(t, err)
+	req.Header.Set("Range", "bytes=0-9")
+	rangeResp, err := h.client.Do(req)
+	require.NoError(t, err)
+	defer rangeResp.Body.Close()
+	require.Equal(t, http.StatusPartialContent, rangeResp.StatusCode)
+	partial, err := io.ReadAll(rangeResp.Body)
+	require.NoError(t, err)
+	require.Equal(t, body[:10], partial, "range request must return the requested slice")
+}
+
 // TestMediaServingHardening verifies the streamed media path defends against a
 // stored-XSS upload: a blob whose episode declares text/html must be served
 // with nosniff, as an attachment, and with a coerced non-HTML Content-Type,
