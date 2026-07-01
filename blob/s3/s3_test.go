@@ -1,9 +1,14 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
+	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -99,6 +104,202 @@ func TestSigningKeyDerivation(t *testing.T) {
 	// The derived key must reproduce the AWS-published signature.
 	assert.Equal(t, awsSignature, hex.EncodeToString(hmacSHA256(key, []byte(stringToSign))),
 		"signature from independently derived key must match AWS vector")
+}
+
+// TestClientStallTimeouts asserts New wires an http.Transport with
+// stall-oriented timeouts, and crucially leaves http.Client.Timeout at zero so
+// large media bodies can stream for arbitrarily long. This bounds a hung object
+// store (which would otherwise block Get/Put/Delete and starve the worker)
+// without truncating legitimate transfers.
+func TestClientStallTimeouts(t *testing.T) {
+	s, err := New(Config{
+		Endpoint:  "http://127.0.0.1:9000",
+		Bucket:    "media",
+		AccessKey: "AK",
+		SecretKey: "SK",
+	})
+	require.NoError(t, err)
+
+	// A flat client deadline would abort big uploads/downloads; it must be unset.
+	assert.Zero(t, s.client.Timeout, "http.Client.Timeout must stay 0 to allow long body streaming")
+
+	tr, ok := s.client.Transport.(*http.Transport)
+	require.True(t, ok, "transport must be *http.Transport")
+	assert.Equal(t, 30*time.Second, tr.ResponseHeaderTimeout, "ResponseHeaderTimeout bounds a hung endpoint")
+	assert.Equal(t, 10*time.Second, tr.TLSHandshakeTimeout)
+	assert.NotZero(t, tr.IdleConnTimeout)
+	assert.NotZero(t, tr.ExpectContinueTimeout)
+	assert.NotNil(t, tr.DialContext, "DialContext must be set with a dial timeout")
+
+	// HTTP/2 must be disabled: under h2 many streams multiplex over one
+	// connection, so another active stream can keep the idleTimeoutConn deadline
+	// refreshed while a single stream's body stalls forever. Over HTTP/1.1 each
+	// in-flight request owns its connection, so the per-conn idle deadline
+	// reliably bounds one stalled transfer. A non-nil empty TLSNextProto is the
+	// idiomatic way to prevent h2 negotiation.
+	assert.False(t, tr.ForceAttemptHTTP2, "HTTP/2 must not be force-attempted")
+	require.NotNil(t, tr.TLSNextProto, "TLSNextProto must be non-nil to disable h2")
+	assert.Empty(t, tr.TLSNextProto, "TLSNextProto must be empty so h2 is never negotiated")
+}
+
+// TestIdleTimeoutConn checks the wrapper in isolation: a Read/Write with no
+// peer activity trips the idle deadline (bounding a stall), while activity
+// within the window refreshes the deadline so progress is never truncated.
+func TestIdleTimeoutConn(t *testing.T) {
+	t.Run("read_stalls", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		conn := &idleTimeoutConn{Conn: c1, idle: 50 * time.Millisecond}
+
+		start := time.Now()
+		_, err := conn.Read(make([]byte, 1))
+		require.Error(t, err)
+		var nerr net.Error
+		require.True(t, errors.As(err, &nerr) && nerr.Timeout(), "want timeout, got %v", err)
+		assert.Less(t, time.Since(start), 2*time.Second, "must trip near the idle window")
+	})
+
+	t.Run("write_stalls", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		conn := &idleTimeoutConn{Conn: c1, idle: 50 * time.Millisecond}
+
+		start := time.Now()
+		// Nothing reads from c2, so an unbuffered pipe Write blocks until the
+		// refreshed write deadline fires.
+		_, err := conn.Write([]byte("x"))
+		require.Error(t, err)
+		var nerr net.Error
+		require.True(t, errors.As(err, &nerr) && nerr.Timeout(), "want timeout, got %v", err)
+		assert.Less(t, time.Since(start), 2*time.Second)
+	})
+
+	t.Run("activity_refreshes_deadline", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		conn := &idleTimeoutConn{Conn: c1, idle: 200 * time.Millisecond}
+
+		// Peer writes a byte every 50ms (< idle) for longer than a single idle
+		// window; each Read must refresh the deadline so no read times out.
+		go func() {
+			for range 8 {
+				time.Sleep(50 * time.Millisecond)
+				if _, err := c2.Write([]byte{'x'}); err != nil {
+					return
+				}
+			}
+		}()
+		buf := make([]byte, 1)
+		for range 8 {
+			n, err := conn.Read(buf)
+			require.NoError(t, err, "progressing read must not time out")
+			require.Equal(t, 1, n)
+		}
+	})
+
+	// Regression: HTTP/1.1 streams the request body (Write) while a concurrent
+	// read waits for the response. During a large Put the write can be active
+	// for far longer than the idle window before S3 sends any response byte.
+	// With independent per-direction deadlines the pending read deadline fires
+	// and aborts a healthy upload; a single connection-wide deadline refreshed
+	// on any activity must let write progress keep the blocked read alive.
+	t.Run("write_refreshes_pending_read", func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		defer c1.Close()
+		defer c2.Close()
+		conn := &idleTimeoutConn{Conn: c1, idle: 100 * time.Millisecond}
+
+		// Peer drains writes (so each Write makes progress) but never sends any
+		// bytes, so the concurrent read only survives if writes keep refreshing
+		// the shared deadline it depends on.
+		go func() {
+			buf := make([]byte, 64)
+			for {
+				if _, err := c2.Read(buf); err != nil {
+					return
+				}
+			}
+		}()
+
+		readErr := make(chan error, 1)
+		go func() {
+			_, err := conn.Read(make([]byte, 1)) // blocks: peer never writes
+			readErr <- err
+		}()
+
+		// Write every 40ms (< idle) across more than two idle windows.
+		for range 6 {
+			time.Sleep(40 * time.Millisecond)
+			if _, err := conn.Write([]byte{'x'}); err != nil {
+				t.Fatalf("progressing write must not time out: %v", err)
+			}
+			select {
+			case err := <-readErr:
+				t.Fatalf("blocked read aborted despite concurrent write progress: %v", err)
+			default:
+			}
+		}
+	})
+}
+
+// TestGetStalledBodyFails is a hermetic end-to-end check: a server that sends
+// headers then stalls the body must cause Get to fail promptly (bounded by the
+// idle timeout), rather than hang forever.
+func TestGetStalledBodyFails(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release // stall mid-body
+	}))
+	defer srv.Close()
+	defer close(release) // runs first (LIFO): unblock the handler before Close waits on it
+
+	s, err := New(Config{Endpoint: srv.URL, Bucket: "b", AccessKey: "AK", SecretKey: "SK"})
+	require.NoError(t, err)
+	s.client = newClientWithIdle(100 * time.Millisecond)
+
+	start := time.Now()
+	_, _, err = s.Get(context.Background(), "key")
+	require.Error(t, err, "a stalled body must not hang Get")
+	assert.Less(t, time.Since(start), 5*time.Second, "must be bounded by the idle timeout")
+}
+
+// TestGetProgressingTransferSucceeds proves the idle deadline does not truncate
+// a transfer that keeps moving: chunks arrive with gaps below the idle window,
+// summing to more than one idle window, yet Get completes with the full body.
+func TestGetProgressingTransferSucceeds(t *testing.T) {
+	const chunks = 6
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f, _ := w.(http.Flusher)
+		for range chunks {
+			_, _ = w.Write([]byte("chunk"))
+			if f != nil {
+				f.Flush()
+			}
+			time.Sleep(60 * time.Millisecond) // < idle below
+		}
+	}))
+	defer srv.Close()
+
+	s, err := New(Config{Endpoint: srv.URL, Bucket: "b", AccessKey: "AK", SecretKey: "SK"})
+	require.NoError(t, err)
+	s.client = newClientWithIdle(300 * time.Millisecond)
+
+	rc, n, err := s.Get(context.Background(), "key")
+	require.NoError(t, err, "a progressing transfer must not be aborted")
+	defer rc.Close()
+	assert.Equal(t, int64(len("chunk")*chunks), n)
+	body, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	assert.Equal(t, bytes.Repeat([]byte("chunk"), chunks), body)
 }
 
 func TestURIEncode(t *testing.T) {
