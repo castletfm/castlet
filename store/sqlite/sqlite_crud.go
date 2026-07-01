@@ -62,7 +62,11 @@ func (s *Store) UserByID(ctx context.Context, id string) (*model.User, error) {
 }
 
 func (s *Store) UserByEmail(ctx context.Context, email string) (*model.User, error) {
-	return s.userWhere(ctx, "email = ?", email)
+	// Match the case-INSENSITIVE unique index (idx_users_email COLLATE NOCASE):
+	// callers pass an already-canonical (lower-cased) value, but comparing NOCASE
+	// makes the lookup find a row regardless of the casing it was stored under, so
+	// the read is consistent with what the uniqueness constraint enforces.
+	return s.userWhere(ctx, "email = ? COLLATE NOCASE", email)
 }
 
 func (s *Store) UserByOIDCSubject(ctx context.Context, issuer, subject string) (*model.User, error) {

@@ -105,6 +105,17 @@ func (s *Store) Migrate(ctx context.Context) error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc ON users(oidc_issuer, oidc_subject) WHERE oidc_subject <> ''`); err != nil {
 		return fmt.Errorf("sqlite: migrate index: %w", err)
 	}
+	// Enforce case-insensitive email uniqueness (one mailbox = one account). On a
+	// database created before this index existed the original column-level UNIQUE
+	// constraint stays in place (a case-SENSITIVE index that cannot be dropped via
+	// ALTER); this NOCASE index is added alongside it so case-only duplicates are
+	// rejected too. Breaking the on-disk format is acceptable (WIP), so no attempt
+	// is made to fold any pre-existing case-variant duplicate rows — such a
+	// database must be recreated.
+	if _, err := s.db.ExecContext(ctx,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email COLLATE NOCASE)`); err != nil {
+		return fmt.Errorf("sqlite: migrate email index: %w", err)
+	}
 	// Blob-lifecycle tables. These are also in schema.sql (executed above), so on a
 	// fresh database the statements here are no-ops; they are repeated
 	// imperatively so an in-place upgrade of a database created before these tables

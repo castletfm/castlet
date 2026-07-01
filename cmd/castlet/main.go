@@ -21,6 +21,7 @@ import (
 
 	"github.com/castletfm/castlet/app"
 	"github.com/castletfm/castlet/config"
+	emailpkg "github.com/castletfm/castlet/internal/email"
 	"github.com/castletfm/castlet/internal/idgen"
 	"github.com/castletfm/castlet/model"
 	"golang.org/x/crypto/bcrypt"
@@ -118,6 +119,13 @@ func cmdUserCreate(args []string) error {
 	if *email == "" {
 		return fmt.Errorf("--email is required")
 	}
+	// Canonicalize so the CLI creates accounts keyed on the same mailbox form as
+	// signup and OIDC: a malformed address is rejected, and the stored value is
+	// the bare, lower-cased address.
+	canonicalEmail, err := emailpkg.Canonical(*email)
+	if err != nil {
+		return fmt.Errorf("invalid --email: %w", err)
+	}
 
 	// Determine which password source flags were actually supplied on the
 	// command line, so precedence keys on whether a flag was provided rather
@@ -160,11 +168,11 @@ func cmdUserCreate(args []string) error {
 	}
 	display := *name
 	if display == "" {
-		display = *email
+		display = canonicalEmail
 	}
 	user := &model.User{
 		ID:           idgen.New(),
-		Email:        *email,
+		Email:        canonicalEmail,
 		DisplayName:  display,
 		PasswordHash: string(hash),
 		CreatedAt:    time.Now(),

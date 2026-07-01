@@ -4,11 +4,11 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
-	"net/mail"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/castletfm/castlet/internal/email"
 	"github.com/castletfm/castlet/internal/idgen"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/store"
@@ -53,7 +53,7 @@ func (s *Server) handleLoginForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	email := r.FormValue("email")
+	rawEmail := r.FormValue("email")
 	password := r.FormValue("password")
 
 	// Brute-force speed bump: refuse further attempts from an IP that has
@@ -63,21 +63,35 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if retryAfter, blocked := s.loginLimiter.blocked(key, s.now()); blocked {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
 		s.render(w, r, http.StatusTooManyRequests, "login", "Log in",
-			loginPage{Email: email, Error: "Too many failed login attempts. Please wait and try again."})
+			loginPage{Email: rawEmail, Error: "Too many failed login attempts. Please wait and try again."})
 		return
 	}
 
-	user, err := s.store.UserByEmail(r.Context(), email)
+	// Look up by the canonical form so a login with different casing than at
+	// signup ("Alice@Example.com" vs "alice@example.com") still finds the account.
+	// A malformed address must never authenticate: only a successfully canonicalized
+	// email is eligible to be a real login (canonOK). We still run the lookup and a
+	// bcrypt compare below so the response time never reveals whether the address is
+	// well-formed or exists — but a malformed address (which could otherwise match a
+	// legacy/direct-write row stored verbatim) can never satisfy realAccount.
+	lookup := rawEmail
+	canonOK := false
+	if canonical, cerr := email.Canonical(rawEmail); cerr == nil {
+		lookup = canonical
+		canonOK = true
+	}
 
-	// Pick the hash to verify against. For an unknown email or an OIDC-only
-	// account (no local password), fall back to the constant dummy hash so the
-	// bcrypt comparison below always runs; otherwise the response time would
+	user, err := s.store.UserByEmail(r.Context(), lookup)
+
+	// Pick the hash to verify against. For a malformed/unknown email or an
+	// OIDC-only account (no local password), fall back to the constant dummy hash
+	// so the bcrypt comparison below always runs; otherwise the response time would
 	// reveal whether the account exists. realAccount records whether this is a
-	// genuine local login, so a chance match against the dummy hash can never
-	// authenticate.
+	// genuine local login (requires a well-formed email), so neither a chance match
+	// against the dummy hash nor a malformed-email row can authenticate.
 	hash := dummyPasswordHash
 	realAccount := 0
-	if err == nil && user.PasswordHash != "" {
+	if canonOK && err == nil && user.PasswordHash != "" {
 		hash = []byte(user.PasswordHash)
 		realAccount = 1
 	}
@@ -109,7 +123,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// so the form does not reveal which accounts exist.
 		s.loginLimiter.fail(key, s.now())
 		s.render(w, r, http.StatusUnauthorized, "login", "Log in",
-			loginPage{Email: email, Error: "Invalid email or password."})
+			loginPage{Email: rawEmail, Error: "Invalid email or password."})
 		return
 	}
 
@@ -212,18 +226,23 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email := strings.TrimSpace(r.FormValue("email"))
+	rawEmail := strings.TrimSpace(r.FormValue("email"))
 	name := strings.TrimSpace(r.FormValue("name"))
 	password := r.FormValue("password")
 	confirm := r.FormValue("password_confirm")
 
-	form := signupPage{Email: email, Name: name}
+	form := signupPage{Email: rawEmail, Name: name}
 	fail := func(msg string) {
 		form.Error = msg
 		s.render(w, r, http.StatusBadRequest, "signup", "Sign up", form)
 	}
 
-	if _, err := mail.ParseAddress(email); err != nil {
+	// Canonicalize before any store write so accounts are keyed on the mailbox:
+	// a malformed address is rejected here, and the stored value is the bare,
+	// lower-cased address so the case-insensitive unique index rejects a later
+	// duplicate signup under a different case with ErrConflict.
+	canonicalEmail, err := email.Canonical(rawEmail)
+	if err != nil {
 		fail("Enter a valid email address.")
 		return
 	}
@@ -242,11 +261,11 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if name == "" {
-		name = email
+		name = canonicalEmail
 	}
 	user := &model.User{
 		ID:           idgen.New(),
-		Email:        email,
+		Email:        canonicalEmail,
 		DisplayName:  name,
 		PasswordHash: string(hash),
 		CreatedAt:    s.now(),

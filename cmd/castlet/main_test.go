@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/castletfm/castlet/store"
+	"github.com/castletfm/castlet/store/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -91,4 +94,46 @@ func TestResolvePassword(t *testing.T) {
 	// No password source (no file, no flag, non-terminal stdin) is an error.
 	_, err = resolvePassword("", false, "", false, nil, os.Stderr)
 	assert.Error(t, err)
+}
+
+// user-create canonicalizes the --email before persisting: a display-name /
+// mixed-case address is stored as its bare, lower-cased form, so the CLI keys
+// accounts on the same mailbox as signup and OIDC.
+func TestUserCreateCanonicalizesEmail(t *testing.T) {
+	dir := t.TempDir()
+	err := cmdUserCreate([]string{
+		"--data-dir", dir,
+		"--email", "Alice <Alice@Example.COM>",
+		"--password", "longenough",
+	})
+	require.NoError(t, err)
+
+	st, err := sqlite.Open(filepath.Join(dir, "castlet.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+
+	u, err := st.UserByEmail(context.Background(), "alice@example.com")
+	require.NoError(t, err)
+	require.Equal(t, "alice@example.com", u.Email)
+	require.Equal(t, "alice@example.com", u.DisplayName,
+		"the default display name is the canonical email")
+}
+
+// A malformed --email is rejected BEFORE any user row is created.
+func TestUserCreateRejectsMalformedEmail(t *testing.T) {
+	dir := t.TempDir()
+	err := cmdUserCreate([]string{
+		"--data-dir", dir,
+		"--email", "not-an-email",
+		"--password", "longenough",
+	})
+	require.Error(t, err)
+
+	// No account was written: open (and migrate) the store and confirm it is empty.
+	st, err := sqlite.Open(filepath.Join(dir, "castlet.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	require.NoError(t, st.Migrate(context.Background()))
+	_, err = st.UserByEmail(context.Background(), "not-an-email")
+	require.ErrorIs(t, err, store.ErrNotFound)
 }

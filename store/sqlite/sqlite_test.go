@@ -48,6 +48,40 @@ func TestUsers(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrConflict)
 }
 
+// The email unique index is case-INSENSITIVE (COLLATE NOCASE): a case-only
+// variant of an existing address must collide, backstopping the app-level
+// canonicalization so one mailbox maps to one account even for a direct writer.
+func TestUsersEmailUniqueCaseInsensitive(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s) // a@example.com
+
+	err := s.CreateUser(t.Context(), &model.User{ID: "u2", Email: "A@Example.com", DisplayName: "B"})
+	require.ErrorIs(t, err, store.ErrConflict)
+}
+
+// UserByEmail must be case-INSENSITIVE, consistent with the NOCASE unique index:
+// a row stored under one casing is found by a query in a different casing, so the
+// read never misses a row the uniqueness constraint would treat as the same.
+func TestUserByEmailCaseInsensitive(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+
+	// Stored with mixed casing (e.g. a direct writer that skipped canonicalization).
+	require.NoError(t, s.CreateUser(ctx, &model.User{
+		ID: "u1", Email: "A@Example.com", DisplayName: "A", PasswordHash: "x", CreatedAt: time.Now()}))
+
+	// Found regardless of the casing used in the lookup.
+	for _, q := range []string{"a@example.com", "A@Example.com", "A@EXAMPLE.COM"} {
+		got, err := s.UserByEmail(ctx, q)
+		require.NoError(t, err, "lookup %q must find the user", q)
+		require.Equal(t, "u1", got.ID)
+	}
+
+	// A genuinely different mailbox still returns ErrNotFound.
+	_, err := s.UserByEmail(ctx, "other@example.com")
+	require.ErrorIs(t, err, store.ErrNotFound)
+}
+
 func TestBumpSessionEpoch(t *testing.T) {
 	s := newStore(t)
 	ctx := t.Context()
