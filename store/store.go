@@ -22,8 +22,11 @@ var (
 	ErrConflict = errors.New("store: conflict")
 	// ErrStaleClaim is returned by the job settlement methods (CompleteJob,
 	// RescheduleJob, FailJob, SettleEpisodeTranscript, and the combined
-	// SettleEpisodeTranscriptAndCompleteJob) when the settlement is no longer valid. Settlement requires BOTH a matching
-	// claim token AND the job still being in 'processing'.
+	// SettleEpisodeTranscriptAndCompleteJob) when the settlement is no longer valid.
+	// Settlement requires a matching claim token plus the method's allowed source
+	// state — normally the job still being in 'processing', with one exception:
+	// SettleEpisodeTranscript's transcript-less TranscriptFailed mark is also accepted
+	// just after the job has moved to 'failed' (the dead-letter / attempts-exhausted path).
 	// It therefore covers two cases:
 	//   - The supplied claim token no longer matches the job's current claim: the
 	//     job was reclaimed by another worker after its lease expired. The stale
