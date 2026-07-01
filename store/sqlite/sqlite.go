@@ -117,9 +117,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_blob_reservations_key ON blob_reservations(media_key)`,
 		`CREATE TABLE IF NOT EXISTS blob_delete_leases (
-			media_key  TEXT    PRIMARY KEY,
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			media_key  TEXT    NOT NULL,
 			created_at INTEGER NOT NULL
 		)`,
+		`CREATE INDEX IF NOT EXISTS idx_blob_delete_leases_key ON blob_delete_leases(media_key)`,
 	} {
 		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
 			return fmt.Errorf("sqlite: migrate blob tables: %w", err)

@@ -73,17 +73,22 @@ CREATE TABLE IF NOT EXISTS blob_reservations (
 CREATE INDEX IF NOT EXISTS idx_blob_reservations_key ON blob_reservations(media_key);
 
 -- blob_delete_leases records an in-progress PHYSICAL blob delete (a tombstone).
--- The orphan decision and the lease insert happen in one transaction; the lease is
--- held across the out-of-transaction blobs.Delete and released only after it. A
--- concurrent ReserveBlob for the same key serializes against the lease and is
--- rejected (store.ErrBlobDeleting) until the delete finishes, closing the window
--- where a reservation created between the delete tx commit and the physical delete
--- would be invisible. At most one lease per key (PRIMARY KEY); a lease from a
--- crashed delete handler is ignored once older than blobDeleteLeaseTTL.
+-- The orphan decision and the lease acquisition happen in one transaction; the
+-- lease is held across the out-of-transaction blobs.Delete and released only
+-- after. A concurrent ReserveBlob for the same key serializes against the lease
+-- and is rejected (store.ErrBlobDeleting) until the delete finishes, closing the
+-- window where a reservation created between the delete tx commit and the physical
+-- delete would be invisible. Acquisition is single-winner (only the first deleter
+-- takes the lease while it is active), and the autoincrement id is the owner
+-- token: ReleaseDeleteLease drops exactly that row, so one deleter can never clear
+-- another deleter's still-active lease. A lease from a crashed delete handler is
+-- ignored once older than store.BlobDeleteLeaseTTL.
 CREATE TABLE IF NOT EXISTS blob_delete_leases (
-    media_key  TEXT    PRIMARY KEY,
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_key  TEXT    NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_blob_delete_leases_key ON blob_delete_leases(media_key);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id         TEXT    PRIMARY KEY,
