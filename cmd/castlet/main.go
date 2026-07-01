@@ -12,8 +12,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +24,7 @@ import (
 	"github.com/castletfm/castlet/internal/idgen"
 	"github.com/castletfm/castlet/model"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/term"
 )
 
 // version is overridable at build time with -ldflags "-X main.version=...".
@@ -103,12 +106,35 @@ func cmdUserCreate(args []string) error {
 	dataDir := fs.String("data-dir", envOr("CASTLET_DATA_DIR", "./data"), "data directory")
 	email := fs.String("email", "", "user email (required)")
 	name := fs.String("name", "", "display name (defaults to the email)")
-	password := fs.String("password", "", "password (required)")
+	passwordFile := fs.String("password-file", "", "read the password from this file (trailing newline trimmed); preferred over --password")
+	password := fs.String("password", "", "password (INSECURE: visible in shell history and the process list; prefer --password-file or the interactive prompt)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *email == "" || *password == "" {
-		return fmt.Errorf("--email and --password are required")
+	if *email == "" {
+		return fmt.Errorf("--email is required")
+	}
+
+	// Determine which password source flags were actually supplied on the
+	// command line, so precedence keys on whether a flag was provided rather
+	// than on whether its value happens to be non-empty. This makes an explicit
+	// --password "" or --password-file "" behave as the user selected them.
+	var passwordFileSet, passwordSet bool
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "password-file":
+			passwordFileSet = true
+		case "password":
+			passwordSet = true
+		}
+	})
+
+	plaintext, err := resolvePassword(*passwordFile, passwordFileSet, *password, passwordSet, os.Stdin, os.Stderr)
+	if err != nil {
+		return err
+	}
+	if plaintext == "" {
+		return fmt.Errorf("a password is required (use --password-file, the interactive prompt, or --password)")
 	}
 
 	// Build a minimal config just for store access.
@@ -124,7 +150,7 @@ func cmdUserCreate(args []string) error {
 		return err
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(*password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(plaintext), bcrypt.DefaultCost)
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
@@ -146,6 +172,53 @@ func cmdUserCreate(args []string) error {
 	return nil
 }
 
+// resolvePassword returns the plaintext password using the following
+// precedence, keyed on which flags were SUPPLIED (fileSet/flagSet) rather than
+// on whether their values are non-empty: (1) --password-file if supplied (this
+// source wins even when --password is also given; an empty or unreadable path
+// is a clear error); (2) the --password flag if supplied (returned verbatim,
+// even when empty, so the caller's empty-password validation can reject it);
+// (3) an interactive prompt when stdin is a terminal; (4) otherwise an error,
+// since no password source is available. in is the file used to detect and read
+// from a terminal, out is where the prompt is written.
+func resolvePassword(passwordFile string, fileSet bool, passwordFlag string, flagSet bool, in *os.File, out io.Writer) (string, error) {
+	if fileSet {
+		if passwordFile == "" {
+			return "", fmt.Errorf("--password-file requires a path")
+		}
+		return readPasswordFile(passwordFile)
+	}
+	if flagSet {
+		return passwordFlag, nil
+	}
+	if in != nil && term.IsTerminal(int(in.Fd())) {
+		return promptPassword(int(in.Fd()), out)
+	}
+	return "", fmt.Errorf("no password source: use --password-file, --password, or run interactively for a prompt")
+}
+
+// readPasswordFile reads a password from path, trimming any trailing newline
+// (and carriage return) left by editors.
+func readPasswordFile(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read password file: %w", err)
+	}
+	return strings.TrimRight(string(b), "\r\n"), nil
+}
+
+// promptPassword reads a password from the terminal identified by fd without
+// echoing it, writing the prompt to out.
+func promptPassword(fd int, out io.Writer) (string, error) {
+	fmt.Fprint(out, "Password: ")
+	b, err := term.ReadPassword(fd)
+	fmt.Fprintln(out)
+	if err != nil {
+		return "", fmt.Errorf("read password: %w", err)
+	}
+	return string(b), nil
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -159,7 +232,7 @@ func usage() {
 Usage:
   castlet serve         run the web server and transcription worker
   castlet migrate       create or upgrade the database schema
-  castlet user-create   create an admin user (--email, --password, [--name])
+  castlet user-create   create an admin user (--email, --password-file, [--name])
   castlet version       print the version
 
 Run "castlet serve -h" for serve flags. Configuration also reads CASTLET_*
