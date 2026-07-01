@@ -106,16 +106,26 @@ type Store interface {
 	TranscriptByEpisode(ctx context.Context, episodeID string) (*model.Transcript, error)
 	// SettleEpisodeTranscript atomically records a transcription job's episode
 	// side effects, fenced by the job's claim so a stale worker cannot clobber a
-	// reclaiming attempt. In one transaction it verifies job (id, token) is still
-	// this attempt's claim — the row exists with attempts == token (the fencing
-	// token bumped on every reclaim) and a status of processing or failed (the
-	// two states a live or just-failed claim holds) — and only then, in the same
-	// transaction, saves transcript when non-nil and applies a targeted write of
-	// the episode's transcript_status (leaving the rest of the row untouched, so a
-	// concurrent admin edit is not reverted). It returns ErrStaleClaim and changes
-	// nothing when the job is no longer this attempt's claim (its lease expired and
-	// another worker reclaimed it, bumping attempts), so episode/transcript writes
-	// are as fenced as the queue's own Ack/Nack.
+	// reclaiming attempt. It settles the episode/transcript ONLY if the job
+	// identified by jobID is still the active claim: the row must exist with
+	// attempts == token, the fencing token that ClaimJob bumps on every reclaim.
+	// On top of that token match, the accepted job status follows the real state
+	// machine so a same-token call cannot settle an already-terminal job:
+	//   - Any transcript save (transcript != nil) and every done/none/processing
+	//     transcript_status settlement require the job to still be in
+	//     'processing' (the state a live claim holds before its Ack).
+	//   - A 'failed' job permits ONLY the transcript-less TranscriptFailed mark
+	//     (status == TranscriptFailed with a nil transcript) — the dead-letter /
+	//     Nack-exhaustion write that legitimately runs right after the same claim
+	//     flipped the job to 'failed'.
+	// When the claim holds, in the same transaction it saves transcript when
+	// non-nil and applies a targeted write of the episode's transcript_status
+	// (leaving the rest of the row untouched, so a concurrent admin edit is not
+	// reverted). Otherwise — the job is no longer this attempt's claim (its lease
+	// expired and another worker reclaimed it, bumping attempts) or its status
+	// does not satisfy the rule above — it returns ErrStaleClaim and changes
+	// nothing, so episode/transcript writes are as fenced as the queue's own
+	// Ack/Nack.
 	SettleEpisodeTranscript(ctx context.Context, jobID string, token int, episodeID string, transcript *model.Transcript, status model.TranscriptStatus, updatedAt time.Time) error
 
 	// Job persistence backs queue/dbqueue. A queue backed by an external
