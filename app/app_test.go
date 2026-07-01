@@ -17,7 +17,7 @@ import (
 // zero max-upload rejects every upload, etc.). For the five scalar knobs, a zero
 // field must forward NO option, so each component falls back to its own default.
 // (The sixth, TranscribeTimeoutMin, is defaulted inside the worker instead — see
-// TestJobTimeoutPolicyZeroConfigDefaultsInWorker.)
+// TestJobTimeoutPolicyMinDefaulting.)
 func TestTuningOptionsZeroConfigUsesComponentDefaults(t *testing.T) {
 	zero := &config.Config{}
 	require.Empty(t, queueOptions(zero), "zero config must forward no queue options")
