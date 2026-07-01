@@ -159,18 +159,23 @@ func cmdUserCreate(args []string) error {
 }
 
 // resolvePassword returns the plaintext password using the following
-// precedence: --password-file, then an interactive prompt when stdin is a
-// terminal, and finally the --password flag (kept for backward compatibility
-// but insecure). in is the file used to detect and read from a terminal, out
-// is where the prompt is written.
+// precedence: (1) --password-file if set; (2) the --password flag if non-empty
+// (kept for backward compatibility but insecure); (3) an interactive prompt
+// when stdin is a terminal; (4) otherwise an error, since no password source is
+// available. An explicitly supplied --password is always honored, so the prompt
+// only appears when neither a file nor a flag is provided. in is the file used
+// to detect and read from a terminal, out is where the prompt is written.
 func resolvePassword(passwordFile, passwordFlag string, in *os.File, out io.Writer) (string, error) {
 	if passwordFile != "" {
 		return readPasswordFile(passwordFile)
 	}
+	if passwordFlag != "" {
+		return passwordFlag, nil
+	}
 	if in != nil && term.IsTerminal(int(in.Fd())) {
 		return promptPassword(int(in.Fd()), out)
 	}
-	return passwordFlag, nil
+	return "", fmt.Errorf("no password source: use --password-file, --password, or run interactively for a prompt")
 }
 
 // readPasswordFile reads a password from path, trimming any trailing newline

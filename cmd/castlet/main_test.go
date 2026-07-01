@@ -59,7 +59,22 @@ func TestResolvePassword(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "from-flag", got)
 
+	// A non-empty --password is honored WITHOUT prompting, even when stdin is a
+	// real (non-terminal) file. promptPassword would fail on a non-terminal fd,
+	// so a successful flag result proves the prompt branch was not taken. This
+	// guards the precedence: --password is always used before any TTY prompt.
+	in, err := os.Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = in.Close() })
+	got, err = resolvePassword("", "from-flag", in, os.Stderr)
+	require.NoError(t, err)
+	assert.Equal(t, "from-flag", got)
+
 	// A missing password file surfaces an error.
 	_, err = resolvePassword(filepath.Join(t.TempDir(), "nope"), "from-flag", nil, os.Stderr)
+	assert.Error(t, err)
+
+	// No password source (no file, no flag, non-terminal stdin) is an error.
+	_, err = resolvePassword("", "", nil, os.Stderr)
 	assert.Error(t, err)
 }
