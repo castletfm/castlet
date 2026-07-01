@@ -368,8 +368,14 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	// (the CST-011 stuck case) and no job is ever queued with a stale episode
 	// status. On failure the episode simply keeps its 'none' status with no job —
 	// safe: the UI still offers a re-transcribe (only pending/processing block it),
-	// so the user can retry. Surface the error.
+	// so the user can retry. Surface the error. The episode was just created with a
+	// fresh id in status 'none', so the atomic transition proceeds; ErrConflict is
+	// not expected here, but map it to a conflict rather than a 500 if it ever races.
 	if err := s.queue.EnqueueTranscription(r.Context(), ep.ID); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			s.renderError(w, r, http.StatusConflict, "Transcription is already in progress for this episode.")
+			return
+		}
 		s.serverError(w, r, err)
 		return
 	}
@@ -510,7 +516,10 @@ func (s *Server) handleEpisodeTranscribe(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	// Reject overlapping requests: transcription is already queued or running.
+	// Fast-path rejection of overlapping requests from a stale view: transcription
+	// is already queued or running. This is only a UX shortcut — the authoritative
+	// guard is the atomic transition in EnqueueTranscription below, which rejects a
+	// concurrent request that raced past this check with store.ErrConflict.
 	if ep.TranscriptStatus == model.TranscriptPending || ep.TranscriptStatus == model.TranscriptProcessing {
 		s.renderError(w, r, http.StatusConflict, "Transcription is already in progress for this episode.")
 		return
@@ -519,7 +528,13 @@ func (s *Server) handleEpisodeTranscribe(w http.ResponseWriter, r *http.Request)
 	// or neither. A failure leaves the episode with its current (non-pending)
 	// status and no job, so the UI still offers a re-transcribe; success can never
 	// leave the episode pending with no job, nor a queued job with a stale status.
+	// A concurrent request that already started transcription makes this one lose
+	// the atomic transition: surface that as a conflict, not a server error.
 	if err := s.queue.EnqueueTranscription(r.Context(), ep.ID); err != nil {
+		if errors.Is(err, store.ErrConflict) {
+			s.renderError(w, r, http.StatusConflict, "Transcription is already in progress for this episode.")
+			return
+		}
 		s.serverError(w, r, err)
 		return
 	}

@@ -35,6 +35,10 @@ type JobQueue interface {
 	// by inserting the job and marking the episode in a single store transaction;
 	// like the worker's fenced settlement (see the package note), a JobQueue built
 	// on an external broker must supply the equivalent atomicity.
+	//
+	// The pending mark is also the guard against overlapping requests: if the
+	// episode is already pending or processing no job is queued and store.ErrConflict
+	// is returned, so two concurrent starts for one episode cannot both queue a job.
 	EnqueueTranscription(ctx context.Context, episodeID string) error
 	// Dequeue claims the next runnable job whose Kind is in kinds (all kinds
 	// when none are given), marking it in-flight. It returns (nil, false, nil)

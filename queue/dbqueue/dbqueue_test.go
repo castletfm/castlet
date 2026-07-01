@@ -69,6 +69,50 @@ func TestEnqueueTranscriptionAtomicRollback(t *testing.T) {
 	require.Nil(t, job, "the job insert must roll back when the episode mark fails")
 }
 
+// TestEnqueueTranscriptionRejectsWhenAlreadyPending proves the concurrency guard:
+// once an episode is pending, a second enqueue for it must NOT queue another job
+// and must return store.ErrConflict. This is the gap two racing re-transcribe
+// requests exploit — both pass a stale handler pre-check, then both try to insert
+// a job; the transition is guarded inside the transaction so only the first wins.
+func TestEnqueueTranscriptionRejectsWhenAlreadyPending(t *testing.T) {
+	q, s := newQueue(t)
+	ctx := t.Context()
+	seedEpisode(t, s, "e1", model.TranscriptNone)
+
+	// First enqueue wins: episode flips to pending and a job is queued.
+	require.NoError(t, q.EnqueueTranscription(ctx, "e1"))
+
+	// Second enqueue for the now-pending episode is a conflict and queues nothing.
+	err := q.EnqueueTranscription(ctx, "e1")
+	require.ErrorIs(t, err, store.ErrConflict,
+		"a second enqueue for an already-pending episode must be a conflict")
+
+	// Exactly one job exists: claim it, then confirm nothing else is runnable.
+	first, _, err := q.Dequeue(ctx, model.JobTranscribe)
+	require.NoError(t, err)
+	require.NotNil(t, first, "the first enqueue must have queued exactly one job")
+	next, _, err := q.Dequeue(ctx, model.JobTranscribe)
+	require.NoError(t, err)
+	require.Nil(t, next, "the rejected second enqueue must not have queued a duplicate job")
+}
+
+// TestEnqueueTranscriptionRejectsWhenProcessing proves the guard also covers the
+// processing state, not just pending: an episode already being transcribed cannot
+// have a second job queued for it.
+func TestEnqueueTranscriptionRejectsWhenProcessing(t *testing.T) {
+	q, s := newQueue(t)
+	ctx := t.Context()
+	seedEpisode(t, s, "e1", model.TranscriptProcessing)
+
+	err := q.EnqueueTranscription(ctx, "e1")
+	require.ErrorIs(t, err, store.ErrConflict,
+		"an episode already processing must not accept a new transcription job")
+
+	job, _, err := q.Dequeue(ctx, model.JobTranscribe)
+	require.NoError(t, err)
+	require.Nil(t, job, "no job may be queued for an episode already processing")
+}
+
 func newQueue(t *testing.T, opts ...dbqueue.Option) (*dbqueue.Queue, *sqlite.Store) {
 	t.Helper()
 	s, err := sqlite.Open(filepath.Join(t.TempDir(), "q.db"))

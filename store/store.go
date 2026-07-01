@@ -169,8 +169,15 @@ type Store interface {
 	// prior, non-pending status intact). This closes both windows a two-step
 	// enqueue-then-mark leaves open: an episode stuck pending with no job to run
 	// it, and a queued job whose episode status was never advanced. j.Payload must
-	// already identify episodeID. Returns ErrNotFound (and writes nothing) when no
-	// episode has that id.
+	// already identify episodeID.
+	//
+	// The episode->pending transition is also the concurrency guard: the job is
+	// inserted ONLY when the episode was not already pending or processing, and
+	// that check happens inside the same transaction as the insert. So two
+	// concurrent enqueues for one episode cannot both queue a job — the loser sees
+	// the episode already pending/processing and returns ErrConflict, writing
+	// nothing. Returns ErrNotFound (and writes nothing) when no episode has that
+	// id.
 	EnqueueTranscriptionJob(ctx context.Context, j *model.Job, episodeID string, updatedAt time.Time) error
 	// JobByID returns a single job, or ErrNotFound.
 	JobByID(ctx context.Context, id string) (*model.Job, error)
