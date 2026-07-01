@@ -160,6 +160,15 @@ func (a *App) Migrate(ctx context.Context) error { return a.store.Migrate(ctx) }
 
 // Serve runs the worker and HTTP server until ctx is cancelled, then waits for
 // both to shut down. It returns the first terminal error, if any.
+//
+// Startup is ordered so a failed listener bind can never leak the worker: the
+// HTTP server is created and its listener bound BEFORE the worker goroutine is
+// started. That matters because the caller's `defer App.Close()` closes the
+// store as soon as Serve returns — if Serve returned on a bind failure while a
+// worker goroutine were still claiming/mutating jobs, it would race the store
+// close. By binding first and, on any post-worker-start failure, cancelling and
+// waiting for the worker's Done() before returning, no background activity ever
+// outlives Serve.
 func (a *App) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -168,18 +177,10 @@ func (a *App) Serve(ctx context.Context) error {
 	// covers HTTP, queue depth, and transcription outcomes.
 	reg := metrics.New()
 
-	wkOpts := []worker.Option{
-		worker.WithLogger(a.logger),
-		worker.WithMetrics(reg),
-		worker.WithJobTimeout(jobTimeoutPolicy(a.cfg)),
-	}
-	wkOpts = append(wkOpts, workerTuningOptions(a.cfg)...)
-	wk := worker.New(a.store, a.blobs, a.queue, a.transcriber, wkOpts...)
-	wkCtrl, err := wk.Run(ctx)
-	if err != nil {
-		return fmt.Errorf("app: start worker: %w", err)
-	}
-
+	// Create and bind the HTTP server first. server.New validates wiring and
+	// srv.Run binds the listener; both can fail synchronously (e.g. the address
+	// is already in use). Doing this before the worker starts means such a
+	// failure returns with no background goroutine running to race App.Close.
 	opts := []server.Option{
 		server.WithAddr(a.cfg.Addr),
 		server.WithBaseURL(a.cfg.BaseURL),
@@ -201,7 +202,25 @@ func (a *App) Serve(ctx context.Context) error {
 	}
 	srvCtrl, err := srv.Run(ctx)
 	if err != nil {
-		return err // worker stops via the deferred cancel
+		return err
+	}
+
+	// The listener is bound; only now start the worker.
+	wkOpts := []worker.Option{
+		worker.WithLogger(a.logger),
+		worker.WithMetrics(reg),
+		worker.WithJobTimeout(jobTimeoutPolicy(a.cfg)),
+	}
+	wkOpts = append(wkOpts, workerTuningOptions(a.cfg)...)
+	wk := worker.New(a.store, a.blobs, a.queue, a.transcriber, wkOpts...)
+	wkCtrl, err := wk.Run(ctx)
+	if err != nil {
+		// The worker failed to start after the server was already running. Tear
+		// the server down and wait for it to fully exit before returning so
+		// nothing outlives Serve to race App.Close.
+		cancel()
+		<-srvCtrl.Done()
+		return errors.Join(fmt.Errorf("app: start worker: %w", err), srvCtrl.Err())
 	}
 
 	if a.cfg.GeneratedKey {
