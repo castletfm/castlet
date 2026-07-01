@@ -21,10 +21,16 @@ var (
 	// (e.g. a duplicate email or id).
 	ErrConflict = errors.New("store: conflict")
 	// ErrStaleClaim is returned by the job settlement methods (CompleteJob,
-	// RescheduleJob, FailJob) when the supplied claim token no longer matches the
-	// job's current claim: the job was reclaimed by another worker after its lease
-	// expired. The stale worker's settlement is a no-op and must not overwrite the
-	// reclaiming attempt's state.
+	// RescheduleJob, FailJob) when the settlement is no longer valid. Settlement
+	// requires BOTH a matching claim token AND the job still being in 'processing'.
+	// It therefore covers two cases:
+	//   - The supplied claim token no longer matches the job's current claim: the
+	//     job was reclaimed by another worker after its lease expired. The stale
+	//     worker's settlement is a no-op and must not overwrite the reclaiming
+	//     attempt's state.
+	//   - The token still matches but the job is already in a terminal state
+	//     (already settled): a transition out of a terminal state is rejected, so a
+	//     double settlement of the same claim cannot re-fire.
 	ErrStaleClaim = errors.New("store: stale job claim")
 	// ErrInvalidReorder is returned by ReorderEpisodes when orderedIDs is not an
 	// exact permutation of the channel's current episode ids (it contains
@@ -146,15 +152,19 @@ type Store interface {
 	// attempt whose job was reclaimed cannot clobber the reclaiming attempt.
 	ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Time, lease time.Duration) (*model.Job, error)
 	// CompleteJob marks a job done, but only while token still matches the job's
-	// current claim (its Attempts). It returns ErrStaleClaim when the job was
-	// reclaimed by another worker, leaving the job untouched.
+	// current claim (its Attempts) AND the job is still in 'processing'. It returns
+	// ErrStaleClaim when the job was reclaimed by another worker or is already in a
+	// terminal state (already settled), leaving the job untouched.
 	CompleteJob(ctx context.Context, id string, token int) error
 	// RescheduleJob returns a job to pending with a new RunAfter and records the
-	// cause, for a transient failure, but only while token still matches the
-	// job's current claim. It returns ErrStaleClaim when the job was reclaimed.
+	// cause, for a transient failure, but only while token still matches the job's
+	// current claim AND the job is still in 'processing'. It returns ErrStaleClaim
+	// when the job was reclaimed or is already in a terminal state (already
+	// settled).
 	RescheduleJob(ctx context.Context, id string, token int, runAfter time.Time, cause string) error
-	// FailJob marks a job permanently failed and records the cause, but only
-	// while token still matches the job's current claim. It returns ErrStaleClaim
-	// when the job was reclaimed.
+	// FailJob marks a job permanently failed and records the cause, but only while
+	// token still matches the job's current claim AND the job is still in
+	// 'processing'. It returns ErrStaleClaim when the job was reclaimed or is
+	// already in a terminal state (already settled).
 	FailJob(ctx context.Context, id string, token int, cause string) error
 }

@@ -151,16 +151,36 @@ are safe to `Run` repeatedly.
 Constructors take options via `github.com/lestrrat-go/option/v3` (ident structs
 + `option.MustGet`), folded into the receiver in the constructor.
 
-The `queue.JobQueue` contract keeps callers ignorant of retry policy: callers
-only `Ack` or `Nack(jobID, cause)`, and the queue decides whether to reschedule
-with backoff or mark the job permanently dead (`Nack` returns a `dead bool`).
+The `queue.JobQueue` contract keeps callers ignorant of retry policy. A caller
+`Dequeue(ctx) (*Job, deadLettered bool, error)`s the next runnable job, then
+settles it with `Ack(ctx, *Job)` on success or `Nack(ctx, *Job, cause)` on
+failure; the queue decides whether to reschedule with backoff or mark the job
+permanently dead (`Nack` returns a `dead bool`). The `*Job` carries its
+`Attempts` count, which doubles as the claim's **fencing token**, so both `Ack`
+and `Nack` are fenced by it (see below) rather than taking a bare job id.
+
 The default `dbqueue` implements this over the metadata `Store`, which is why
 `Store` carries the job methods (`EnqueueJob`, `JobByID`, `ClaimJob`,
 `CompleteJob`, `RescheduleJob`, `FailJob`). `ClaimJob` leases a job (marks it
-processing and pushes `run_after` out) so a crashed worker's job becomes
-reclaimable. `Store` also exposes `EpisodeByMediaKey` so the media endpoint can
-serve a blob with the correct content type without threading metadata through
-the blob layer, and `UpdateUser`/`UserByOIDCSubject` for account linking.
+`processing`, pushes `run_after` out, and increments `Attempts`) so a crashed
+worker's job becomes reclaimable once its lease expires. The lease governs
+*reclaim* only — it does not kill a running job — so a live-but-slow attempt can
+have its lease expire and the job reclaimed by another worker. That overlap is
+made safe by the fencing token: every settlement (`CompleteJob`/`RescheduleJob`/
+`FailJob`, and the episode-side `SettleEpisodeTranscript`) applies **only while
+the token still matches the current claim and the job is still `processing`**,
+returning `store.ErrStaleClaim` otherwise. A stale attempt's `Ack`/`Nack` thus
+no-op instead of clobbering the reclaiming attempt.
+
+`Dequeue` also handles **poison jobs**: a job reclaimed after its `Attempts`
+already exceeded the max-attempts limit is never handed back to run; the queue
+dead-letters it (marks it permanently failed) and returns it with
+`deadLettered=true` so the caller only settles its side effects to failed,
+mirroring the `Nack`-exhaustion path.
+
+`Store` also exposes `EpisodeByMediaKey` so the media endpoint can serve a blob
+with the correct content type without threading metadata through the blob layer,
+and `UpdateUser`/`UserByOIDCSubject` for account linking.
 
 `Migrate` is idempotent and upgrades existing databases in place: it runs the
 `CREATE TABLE IF NOT EXISTS` schema, then issues `ALTER TABLE … ADD COLUMN` for
@@ -180,15 +200,25 @@ build gains the OIDC columns/index on the next `castlet migrate` or `serve`.
 4. Admin publishes → `status=published`, `published_at=now`.
 
 **Transcription (worker):**
-1. `Worker` loop calls `JobQueue.Claim` (atomic; marks job `processing` with a
-   lease) → gets a `transcribe` job.
+1. `Worker` loop calls `JobQueue.Dequeue(ctx, JobTranscribe)` (atomic; marks job
+   `processing`, bumps `Attempts`, leases it) → gets a `transcribe` job. If the
+   job comes back `deadLettered=true` (a poison job past its attempt limit), the
+   worker does NOT run it: it only settles the episode to `transcript_status=failed`
+   via the fenced path, then moves on.
 2. Loads episode + opens audio via `BlobStore.Get`.
 3. Calls `Transcriber.Transcribe(ctx, audio) → Result{Segments}`.
-   - null transcriber returns `ErrUnsupported` → job is acked as "skipped",
-     episode `transcript_status=none`.
-4. `Store.SaveTranscript` writes segments; episode `transcript_status=done`.
-5. `JobQueue.Ack` (or `Retry` with backoff on transient error; `Fail` after max
-   attempts → `transcript_status=failed`).
+   - null transcriber returns `ErrUnsupported` → episode `transcript_status=none`.
+4. Settles the result via `Store.SettleEpisodeTranscript(ctx, jobID, token,
+   episodeID, transcript, status, …)`, which writes the transcript segments and
+   the episode `transcript_status` in one transaction — but ONLY for the active
+   claim (row's `attempts == token` and the job still `processing`), so a stale
+   attempt whose lease expired and job was reclaimed cannot clobber the reclaiming
+   attempt's episode/transcript state. A lost claim surfaces as `store.ErrStaleClaim`
+   and the result is discarded.
+5. On success `JobQueue.Ack(ctx, job)`; on a transient error `JobQueue.Nack(ctx,
+   job, cause)` reschedules with backoff, and after max attempts marks the job dead
+   (`dead=true`) → episode settled to `transcript_status=failed`. Both `Ack` and
+   `Nack` are fenced by `job.Attempts`, so a stale attempt's settlement no-ops.
 
 **View an episode (public):**
 - `GET /{channel-slug}/{episode-slug}` renders title/description, a player
