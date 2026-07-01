@@ -99,7 +99,13 @@ func (a *App) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	wk := worker.New(a.store, a.blobs, a.queue, a.transcriber, worker.WithLogger(a.logger))
+	wk := worker.New(a.store, a.blobs, a.queue, a.transcriber,
+		worker.WithLogger(a.logger),
+		worker.WithJobTimeout(worker.JobTimeoutPolicy{
+			Factor: a.cfg.TranscribeTimeoutFactor,
+			Max:    a.cfg.TranscribeTimeout,
+		}),
+	)
 	wkCtrl, err := wk.Run(ctx)
 	if err != nil {
 		return fmt.Errorf("app: start worker: %w", err)

@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/castletfm/castlet/transcribe"
 	"github.com/lestrrat-go/option/v3"
@@ -86,6 +87,15 @@ func (t *Transcriber) Transcribe(ctx context.Context, in transcribe.Input) (*tra
 	cmd := exec.CommandContext(ctx, t.name, args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// Run in its own process group and kill the whole group on context
+	// cancellation. exec.CommandContext otherwise signals only the direct child,
+	// so grandchildren spawned by a wrapper (e.g. `docker run` or a whisper
+	// subprocess) would keep consuming resources after a timed-out job is retried.
+	setProcessGroup(cmd)
+	// If a grandchild inherits and keeps the stdout/stderr pipes open past the
+	// kill, don't let cmd.Wait block forever waiting for EOF. Set on all platforms
+	// (the non-unix fallback relies on exec's default direct-child kill).
+	cmd.WaitDelay = 10 * time.Second
 	// Expose the episode's language to the command (e.g. to pick whisper's -l
 	// flag and a matching punctuation prompt). Empty means auto-detect.
 	if in.Language != "" {

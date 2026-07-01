@@ -29,6 +29,60 @@ import (
 // its context was cancelled, distinguishing a clean shutdown from a crash.
 var ErrWorkerClosed = errors.New("worker: closed")
 
+// Defaults for the per-job timeout policy. They are deliberately generous so
+// the out-of-the-box behavior does not kill legitimately slow whisper.cpp runs.
+const (
+	defaultTimeoutFactor = 1.5             // multiply audio length by this
+	defaultTimeoutMin    = 5 * time.Minute // floor: cover model spin-up on short clips
+	defaultTimeoutMax    = 2 * time.Hour   // cap; also the fallback when duration is unknown
+)
+
+// JobTimeoutPolicy derives the per-job transcription timeout from the episode's
+// audio length. A single fixed timeout permanently fails long episodes, so the
+// bound scales with the input: timeout = Factor * durationSecs, clamped to
+// [Min, Max]. Bounding the run matters because the queue lease only governs
+// *reclaim*; it does not kill a running command, so a hung transcriber would
+// otherwise block the serial worker loop forever.
+type JobTimeoutPolicy struct {
+	Factor float64       // multiplier applied to the audio length
+	Min    time.Duration // floor, to cover model spin-up on short clips
+	Max    time.Duration // cap, and the fallback when duration is unknown
+}
+
+// withDefaults fills any zero/negative field with its default so callers (and
+// the app wiring) can set only the fields they care about.
+func (p JobTimeoutPolicy) withDefaults() JobTimeoutPolicy {
+	if p.Factor <= 0 {
+		p.Factor = defaultTimeoutFactor
+	}
+	if p.Min <= 0 {
+		p.Min = defaultTimeoutMin
+	}
+	if p.Max <= 0 {
+		p.Max = defaultTimeoutMax
+	}
+	return p
+}
+
+// timeout returns the per-job timeout for an episode of durationSecs seconds.
+//
+// NOTE: this relies on Episode.DurationSecs being populated at upload time.
+// That is not always the case today (it is often 0), so when the duration is
+// unknown (<= 0) we fall back to Max — a generous cap — rather than a short
+// bound, so unknown-length jobs are not killed prematurely.
+func (p JobTimeoutPolicy) timeout(durationSecs int) time.Duration {
+	if durationSecs <= 0 {
+		return p.Max
+	}
+	d := time.Duration(p.Factor * float64(durationSecs) * float64(time.Second))
+	// Apply both clamps in order so Max is always the hard ceiling. When
+	// Min > Max the floor is raised first, then knocked back down to Max, so
+	// the configured cap still wins.
+	d = max(d, p.Min)
+	d = min(d, p.Max)
+	return d
+}
+
 // Worker transcribes episodes off the job queue. The receiver holds only
 // configuration and is safe to Run multiple times.
 type Worker struct {
@@ -37,6 +91,7 @@ type Worker struct {
 	queue        queue.JobQueue
 	transcriber  transcribe.Transcriber
 	pollInterval time.Duration
+	jobTimeout   JobTimeoutPolicy
 	logger       *slog.Logger
 }
 
@@ -45,6 +100,7 @@ type Option = option.Interface
 
 type (
 	identPollInterval struct{}
+	identJobTimeout   struct{}
 	identLogger       struct{}
 )
 
@@ -52,6 +108,10 @@ type (
 // (default 5s). When a job is found the worker drains the queue without
 // waiting for the next tick.
 func WithPollInterval(d time.Duration) Option { return option.New(identPollInterval{}, d) }
+
+// WithJobTimeout sets the per-job timeout policy (see JobTimeoutPolicy). Any
+// zero field falls back to its default (factor 1.5, min 5m, max 2h).
+func WithJobTimeout(p JobTimeoutPolicy) Option { return option.New(identJobTimeout{}, p) }
 
 // WithLogger sets the structured logger (default slog.Default()).
 func WithLogger(l *slog.Logger) Option { return option.New(identLogger{}, l) }
@@ -70,10 +130,13 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, tr transcribe.T
 		switch o.Ident().(type) {
 		case identPollInterval:
 			w.pollInterval = option.MustGet[time.Duration](o)
+		case identJobTimeout:
+			w.jobTimeout = option.MustGet[JobTimeoutPolicy](o)
 		case identLogger:
 			w.logger = option.MustGet[*slog.Logger](o)
 		}
 	}
+	w.jobTimeout = w.jobTimeout.withDefaults()
 	return w
 }
 
@@ -112,7 +175,9 @@ func (w *Worker) loop(ctx context.Context) error {
 	t := time.NewTicker(w.pollInterval)
 	defer t.Stop()
 	for {
-		// Drain everything currently runnable before sleeping.
+		// Drain everything currently runnable before sleeping. Jobs are handled
+		// strictly one-at-a-time (no concurrency): local shell-exec transcription
+		// is intentionally serialized to avoid overloading the host.
 		for {
 			if ctx.Err() != nil {
 				return ErrWorkerClosed
@@ -188,7 +253,14 @@ func (w *Worker) transcribe(ctx context.Context, job *model.Job) error {
 	}
 	defer rc.Close()
 
-	res, err := w.transcriber.Transcribe(ctx, transcribe.Input{
+	// Bound the transcriber run so a stuck command is actually killed rather
+	// than blocking the serial worker loop forever. The bound scales with the
+	// episode's audio length; an unknown length falls back to a generous cap
+	// (see JobTimeoutPolicy.timeout).
+	jobCtx, cancel := context.WithTimeout(ctx, w.jobTimeout.timeout(ep.DurationSecs))
+	defer cancel()
+
+	res, err := w.transcriber.Transcribe(jobCtx, transcribe.Input{
 		Audio:    rc,
 		MIME:     ep.MediaMIME,
 		Filename: ep.ID,
