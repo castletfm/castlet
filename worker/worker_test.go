@@ -303,8 +303,9 @@ func TestWorkerNackSurvivesShutdown(t *testing.T) {
 
 // cancelBeforeSettleTranscriber simulates shutdown (SIGTERM) arriving between
 // the transcription work and the terminal status persistence: it cancels the
-// worker's context and then returns a successful result, so the final status
-// write and Ack run with an already-cancelled request context.
+// worker's context and then returns a successful result, so the terminal
+// settle+complete (SettleEpisodeTranscriptAndCompleteJob) runs with an
+// already-cancelled request context.
 type cancelBeforeSettleTranscriber struct {
 	cancel context.CancelFunc
 }
@@ -418,9 +419,10 @@ func TestWorkerNackSurvivesSettlementBudgetExhaustion(t *testing.T) {
 		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
 		nacked: make(chan struct{}),
 	}
-	// A tiny settle budget plus a store that blocks SaveTranscript until that
-	// budget is spent means settlement always times out; the queue transition
-	// must not inherit the exhausted context.
+	// A tiny settle budget plus a store that blocks the combined settle+complete
+	// (SettleEpisodeTranscriptAndCompleteJob) until that budget is spent means
+	// settlement always times out; the queue transition must not inherit the
+	// exhausted context.
 	bstore := budgetExhaustingStore{Store: st}
 	_, err := worker.New(bstore, blobs, q, fakeTranscriber{},
 		worker.WithPollInterval(10*time.Millisecond),

@@ -280,9 +280,12 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// ack marks a job done under a fresh shutdown-surviving context, independent of
-// whatever the settlement step consumed, so a successful job is never left in
-// "processing" because the ack ran on an already-expired context.
+// ack is the no-side-effects completion path: it marks a job done under a fresh
+// shutdown-surviving context when there is nothing to settle (a nil settlement,
+// e.g. the episode was deleted mid-job). The successful transcription path does
+// NOT come here — it completes the job inside settleAndComplete's fenced
+// transaction. Deriving its own context keeps the completion durable even on
+// SIGTERM, so such a job is never left stuck in "processing".
 func (w *Worker) ack(job *model.Job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
 	defer cancel()
