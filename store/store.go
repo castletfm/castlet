@@ -51,6 +51,10 @@ type Store interface {
 	ChannelByID(ctx context.Context, id string) (*model.Channel, error)
 	ListChannels(ctx context.Context) ([]*model.Channel, error)
 	ListChannelsByUser(ctx context.Context, userID string) ([]*model.Channel, error)
+	// ChannelImageKeyExists reports whether any channel references the blob
+	// stored under key as its cover art. Channels are always public, so such a
+	// blob may be served even when no published episode references the key.
+	ChannelImageKeyExists(ctx context.Context, key string) (bool, error)
 
 	CreateEpisode(ctx context.Context, e *model.Episode) error
 	UpdateEpisode(ctx context.Context, e *model.Episode) error
@@ -60,10 +64,18 @@ type Store interface {
 	SetEpisodeTranscriptStatus(ctx context.Context, id string, status model.TranscriptStatus, updatedAt time.Time) error
 	DeleteEpisode(ctx context.Context, id string) error
 	EpisodeByID(ctx context.Context, id string) (*model.Episode, error)
-	// EpisodeByMediaKey finds the episode whose media is stored under key, so
-	// the media endpoint can serve it with the right content type. Returns
-	// ErrNotFound when no episode references the key.
+	// EpisodeByMediaKey finds an episode whose media is stored under key. Media
+	// is content-addressed, so a key may be shared by several episodes; this
+	// returns an arbitrary one and is used only to test whether any episode
+	// references the key. Returns ErrNotFound when none does.
 	EpisodeByMediaKey(ctx context.Context, key string) (*model.Episode, error)
+	// PublishedEpisodeByMediaKey finds a published episode whose media is stored
+	// under key, so the media endpoint can both gate on publication and serve the
+	// blob with that episode's content type. Media is content-addressed, so a key
+	// may be shared by a draft and a published episode; a draft's MIME must not be
+	// used when a different published episode is what makes the key public.
+	// Returns ErrNotFound when no published episode references the key.
+	PublishedEpisodeByMediaKey(ctx context.Context, key string) (*model.Episode, error)
 	ListEpisodes(ctx context.Context, f EpisodeFilter) ([]*model.Episode, error)
 
 	// SaveTranscript replaces any existing transcript for the episode.

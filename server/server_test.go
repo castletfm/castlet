@@ -181,17 +181,20 @@ func TestMediaServingHardening(t *testing.T) {
 			Title: "T", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 		require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "ep-" + key, ChannelID: "ch-" + key,
 			Title: "T", MediaKey: key, MediaMIME: mime, MediaKind: model.MediaAudio, MediaBytes: int64(len(body)),
-			Status: model.EpisodeDraft, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+			Status: model.EpisodePublished, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 	}
 
 	put("evil", "text/html", []byte("<script>alert(1)</script>"))
 	put("clip", "audio/mpeg", []byte("ID3 fake mp3 payload"))
 
-	// A channel cover image has no owning episode; the type is sniffed. Store
-	// the bytes only (no episode) under a fresh key.
+	// A channel cover image has no owning episode; the type is sniffed. Store the
+	// bytes and reference them from a channel's ImageKey (no episode) so the
+	// cover-art path is exercised.
 	pngBytes := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
 	_, err := h.blobs.Put(ctx, "cover", bytes.NewReader(pngBytes))
 	require.NoError(t, err)
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "cover-ch", UserID: "u1",
+		Title: "T", Language: "en", ImageKey: "cover", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 
 	// Attacker-labeled text/html is never rendered as HTML.
 	resp, _ := h.get(t, "/media/evil")
@@ -211,6 +214,121 @@ func TestMediaServingHardening(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
 	require.Equal(t, "image/png", resp.Header.Get("Content-Type"))
+
+	// A blob no row references (neither a published episode nor a channel cover)
+	// is never served, even to a caller who knows its key.
+	_, err = h.blobs.Put(ctx, "orphan", bytes.NewReader([]byte("unreferenced bytes")))
+	require.NoError(t, err)
+	resp, _ = h.get(t, "/media/orphan")
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+// TestMediaPublicationGating verifies /media/{key} only serves media referenced
+// by a published episode: a draft's media returns 404 (never 403) even to a
+// caller who knows the sha256 key, while a shared key becomes downloadable as
+// soon as any referencing episode is published.
+func TestMediaPublicationGating(t *testing.T) {
+	h := newHarness(t)
+	ctx := t.Context()
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: "x", CreatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "T", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	body := []byte("ID3 fake mp3 payload")
+	_, err := h.blobs.Put(ctx, "mk", bytes.NewReader(body))
+	require.NoError(t, err)
+	require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "draft", ChannelID: "c1",
+		Title: "Draft", MediaKey: "mk", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		MediaBytes: int64(len(body)), Status: model.EpisodeDraft, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	// Media referenced only by a draft is not downloadable, even with the key.
+	resp, _ := h.get(t, "/media/mk")
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	// Once another episode publishes the same content-addressed key, it serves.
+	require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "pub", ChannelID: "c1",
+		Title: "Pub", MediaKey: "mk", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		MediaBytes: int64(len(body)), Status: model.EpisodePublished, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	resp, served := h.get(t, "/media/mk")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, string(body), served)
+}
+
+// TestMediaSharedKeyUsesPublishedMIME verifies that when a draft and a published
+// episode share one content-addressed key, the blob is served with the PUBLISHED
+// episode's MIME, not the draft's — the draft never dictates the type of a key
+// that is public because of a different, published row.
+func TestMediaSharedKeyUsesPublishedMIME(t *testing.T) {
+	h := newHarness(t)
+	ctx := t.Context()
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: "x", CreatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "T", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	body := []byte("ID3 fake mp3 payload")
+	_, err := h.blobs.Put(ctx, "shared", bytes.NewReader(body))
+	require.NoError(t, err)
+	// Draft claims a different (video) MIME for the same bytes.
+	require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "draft", ChannelID: "c1",
+		Title: "Draft", MediaKey: "shared", MediaMIME: "video/mp4", MediaKind: model.MediaVideo,
+		MediaBytes: int64(len(body)), Status: model.EpisodeDraft, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "pub", ChannelID: "c1",
+		Title: "Pub", MediaKey: "shared", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		MediaBytes: int64(len(body)), Status: model.EpisodePublished, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	resp, _ := h.get(t, "/media/shared")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "audio/mpeg", resp.Header.Get("Content-Type"),
+		"a shared key must be served with the published episode's MIME, not the draft's")
+}
+
+// TestMediaCoverArtWithDraftReference verifies that a blob referenced as a
+// channel's cover art still serves even when a draft episode also references the
+// same content-addressed key — episode-publication gating must not hide a public
+// non-episode owner's blob.
+func TestMediaCoverArtWithDraftReference(t *testing.T) {
+	h := newHarness(t)
+	ctx := t.Context()
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: "x", CreatedAt: time.Now()}))
+
+	pngBytes := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+	_, err := h.blobs.Put(ctx, "img", bytes.NewReader(pngBytes))
+	require.NoError(t, err)
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "T", Language: "en", ImageKey: "img", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	// A draft episode also references the same key; it must not gate the cover art.
+	require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "draft", ChannelID: "c1",
+		Title: "Draft", MediaKey: "img", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		MediaBytes: int64(len(pngBytes)), Status: model.EpisodeDraft, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	resp, _ := h.get(t, "/media/img")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "image/png", resp.Header.Get("Content-Type"),
+		"channel cover art must serve even when a draft episode shares its key")
+}
+
+// TestMediaDraftOnlyNonImageNotFound verifies that a key referenced solely by a
+// draft episode, and not by any channel's cover art, returns a plain 404.
+func TestMediaDraftOnlyNonImageNotFound(t *testing.T) {
+	h := newHarness(t)
+	ctx := t.Context()
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: "x", CreatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "T", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	body := []byte("ID3 fake mp3 payload")
+	_, err := h.blobs.Put(ctx, "dk", bytes.NewReader(body))
+	require.NoError(t, err)
+	require.NoError(t, h.store.CreateEpisode(ctx, &model.Episode{ID: "draft", ChannelID: "c1",
+		Title: "Draft", MediaKey: "dk", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		MediaBytes: int64(len(body)), Status: model.EpisodeDraft, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	resp, _ := h.get(t, "/media/dk")
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
 // directBlobStore is a fake blob.BlobStore that also implements blob.DirectURL,
@@ -263,7 +381,7 @@ func TestMediaDirectServingHardening(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, st.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1",
 		Title: "T", MediaKey: "evil", MediaMIME: "text/html", MediaKind: model.MediaAudio,
-		MediaBytes: 1, Status: model.EpisodeDraft, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+		MediaBytes: 1, Status: model.EpisodePublished, CreatedAt: time.Now(), UpdatedAt: time.Now()}))
 
 	client := newClient()
 	resp, err := client.Get("http://" + ctrl.Addr() + "/media/evil")
@@ -350,17 +468,21 @@ func TestAdminUploadFlow(t *testing.T) {
 	require.NoError(t, err, "a transcription job should be queued")
 	require.Contains(t, job.Payload, ep.ID)
 
-	// media is served back with the right content type and bytes
-	resp, mediaBody := h.get(t, "/media/"+ep.MediaKey)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, "audio/mpeg", resp.Header.Get("Content-Type"))
-	require.Equal(t, string(audio), mediaBody)
+	// while still a draft, the media is not publicly downloadable by key
+	resp, _ = h.get(t, "/media/"+ep.MediaKey)
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
 
 	// publish, then it appears on the public channel page
 	resp, err = h.client.PostForm(h.base+"/admin/episodes/"+ep.ID+"/publish", nil)
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	// once published the media is served back with the right content type and bytes
+	resp, mediaBody := h.get(t, "/media/"+ep.MediaKey)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "audio/mpeg", resp.Header.Get("Content-Type"))
+	require.Equal(t, string(audio), mediaBody)
 
 	resp, page := h.get(t, "/c/"+chID+"/")
 	require.Equal(t, http.StatusOK, resp.StatusCode)

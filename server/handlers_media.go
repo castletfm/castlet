@@ -25,9 +25,33 @@ import (
 func (s *Server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 
+	// Resolve visibility and the Content-Type source together so a blob is served
+	// under the same MIME as the row that makes it public. Media is
+	// content-addressed, so one key may be shared by a draft episode, a published
+	// episode, and a channel's cover art.
 	mime := ""
-	if ep, eerr := s.store.EpisodeByMediaKey(r.Context(), key); eerr == nil {
+	if ep, eerr := s.store.PublishedEpisodeByMediaKey(r.Context(), key); eerr == nil {
+		// A published episode references the key: serve it with ITS MIME, never a
+		// draft's, even when a draft happens to share the same key.
 		mime = ep.MediaMIME
+	} else if !errors.Is(eerr, store.ErrNotFound) {
+		s.serverError(w, r, eerr)
+		return
+	} else {
+		// No published episode references the key. It is public only when a
+		// non-episode owner does — a channel's cover art; the MIME stays empty so
+		// the bytes are sniffed below. Otherwise the blob is private (referenced
+		// solely by draft episodes) or unowned entirely: report a plain 404 (not
+		// 403, matching the existence-non-disclosure convention in handleEpisode).
+		cover, cerr := s.store.ChannelImageKeyExists(r.Context(), key)
+		if cerr != nil {
+			s.serverError(w, r, cerr)
+			return
+		}
+		if !cover {
+			http.NotFound(w, r)
+			return
+		}
 	}
 
 	// Direct-serving backend: redirect to the object store. Decided once at
