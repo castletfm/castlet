@@ -160,6 +160,79 @@ func TestEpisodeCreateOverCapContentLengthSkipsDeadline(t *testing.T) {
 		"read deadline must not be extended for a known over-cap upload")
 }
 
+// uploadTestServer builds a minimal Server with a seeded owner (u1) and channel
+// (c1) for exercising handleEpisodeCreate directly. maxBytes sets the cap.
+func uploadTestServer(t *testing.T, maxBytes int64) *Server {
+	t.Helper()
+	ctx := t.Context()
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	require.NoError(t, st.Migrate(ctx))
+	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", CreatedAt: time.Now()}))
+	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	renderer, err := newTemplateRenderer()
+	require.NoError(t, err)
+	const siteName = "Castlet"
+	return &Server{store: st, renderer: renderer, logger: slog.Default(),
+		siteName: siteName, maxUploadBytes: maxBytes, now: time.Now}
+}
+
+func newCreateRequest(body string, contentType string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/admin/channels/c1/episodes",
+		strings.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+	req.SetPathValue("id", "c1")
+	return req.WithContext(context.WithValue(req.Context(), userCtxKey, &model.User{ID: "u1"}))
+}
+
+// TestEpisodeCreateMalformedBodyAborts guards cell 6 at the unit level: once the
+// long upload deadline has been granted, a multipart body that fails to parse
+// (here malformed, under the cap) must be rejected 4xx AND have its read
+// deadline revoked and the connection marked to close, so net/http cannot drain
+// the remaining hostile body under the long deadline.
+func TestEpisodeCreateMalformedBodyAborts(t *testing.T) {
+	s := uploadTestServer(t, 64)
+	rec := httptest.NewRecorder()
+	fake := &deadlineWriter{ResponseWriter: rec}
+	// Under the 64-byte cap but not a valid multipart body: ParseMultipartForm
+	// fails with a non-MaxBytes error.
+	req := newCreateRequest("garbage", "multipart/form-data; boundary=xyz")
+
+	s.handleEpisodeCreate(fake, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, "close", rec.Header().Get("Connection"),
+		"a post-deadline rejection must mark the connection to close")
+	require.True(t, fake.called, "the long read deadline must be revoked on the abort path")
+	require.True(t, fake.deadline.Before(time.Now().Add(time.Minute)),
+		"the read deadline must be expired, not left at the long upload window")
+}
+
+// TestEpisodeCreateOverCapAborts guards cell 6 for the over-cap case: a body
+// that crosses the cap during parsing surfaces as 413 (MaxBytesError) and is
+// likewise aborted (deadline revoked + Connection: close) so the rest of the
+// oversized body is not drained under the long deadline.
+func TestEpisodeCreateOverCapAborts(t *testing.T) {
+	s := uploadTestServer(t, 64)
+	rec := httptest.NewRecorder()
+	fake := &deadlineWriter{ResponseWriter: rec}
+	// Well over the 64-byte cap; content need not be valid multipart because the
+	// cap is hit first. ContentLength is forced unknown (-1, as for a chunked
+	// body) so the cap is not caught by the early Content-Length check but during
+	// parsing — the case abortUpload must cover.
+	req := newCreateRequest(strings.Repeat("x", 4096), "multipart/form-data; boundary=xyz")
+	req.ContentLength = -1
+
+	s.handleEpisodeCreate(fake, req)
+
+	require.Equal(t, http.StatusRequestEntityTooLarge, rec.Code)
+	require.Equal(t, "close", rec.Header().Get("Connection"))
+	require.True(t, fake.called)
+	require.True(t, fake.deadline.Before(time.Now().Add(time.Minute)))
+}
+
 // deadlineWriter is a fake deadline-capable ResponseWriter recording the last
 // read deadline it was asked to set.
 type deadlineWriter struct {

@@ -122,3 +122,20 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 func (w *statusWriter) Unwrap() http.ResponseWriter {
 	return w.ResponseWriter
 }
+
+// underlying follows the Unwrap chain to the innermost ResponseWriter, i.e.
+// net/http's real *response. It exists for http.MaxBytesReader, which — unlike
+// http.ResponseController — does NOT follow Unwrap: it only fires net/http's
+// internal oversized-body hook (which flags the connection to close and skip
+// draining the rest of the body) when handed the concrete *response. Passing it
+// a wrapping statusWriter would silently defeat that hook, so the upload handler
+// unwraps first.
+func underlying(w http.ResponseWriter) http.ResponseWriter {
+	for {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return w
+		}
+		w = u.Unwrap()
+	}
+}

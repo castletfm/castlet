@@ -47,6 +47,18 @@ func (s *Server) uploadReadTimeout() time.Duration {
 	return d
 }
 
+// abortUpload bounds a rejection that happens after the long upload deadline was
+// granted (i.e. the multipart parse failed with the body only partially read).
+// It (a) expires the read deadline so net/http will not sit on a stalled hostile
+// body under the long upload window, and (b) marks the connection to close so no
+// unread body is drained for keep-alive reuse. Both are best-effort: the caller
+// still writes the 4xx afterwards. SetReadDeadline errors (e.g. a conn with no
+// deadline support) are ignored — this is a hardening step, not the response.
+func (s *Server) abortUpload(w http.ResponseWriter) {
+	w.Header().Set("Connection", "close")
+	_ = http.NewResponseController(w).SetReadDeadline(s.now())
+}
+
 // --- dashboard --------------------------------------------------------------
 
 func (s *Server) handleAdminDashboard(w http.ResponseWriter, r *http.Request) {
@@ -195,17 +207,33 @@ func (s *Server) handleEpisodeNew(w http.ResponseWriter, r *http.Request) {
 		episodeForm{Channel: ch, Language: ch.Language})
 }
 
+// handleEpisodeCreate accepts a multipart media upload.
+//
+// INVARIANT: the long, size-derived upload read deadline (uploadReadTimeout) is
+// granted ONLY for a validated multipart upload that is actively being read.
+// Every other request shape is rejected here while still bounded by the global
+// ReadTimeout — the deadline is extended only after all cheap, no-body checks
+// pass — and no rejection path ever lets net/http read or drain a hostile,
+// unread body under the long deadline.
+//
+// The request shapes and how each is bounded:
+//  1. non-multipart Content-Type      -> 415, before the deadline is extended.
+//  2. missing/empty multipart boundary -> 400, before the deadline is extended.
+//  3. known over-cap Content-Length    -> 413, before the deadline is extended.
+//  4. auth / ownership failure          -> handled by ownedChannel, before it.
+//  5. valid multipart being parsed      -> long deadline applies; MaxBytesReader
+//     caps total bytes read.
+//  6. chunked/unknown-length body over the cap, or otherwise unparseable ->
+//     rejected promptly by abortUpload (expire deadline + Connection: close) so
+//     the remaining hostile body is not drained under the long deadline.
 func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
-	// Do the cheap, no-body checks first so they return under the global
-	// ReadTimeout: extending the read deadline before these run would let an
-	// early-return path (unauthorized, or a non-multipart Content-Type) drain
-	// its unread body under the long upload deadline instead.
+	// (4) Auth / ownership — cheap, reads no body.
 	ch, ok := s.ownedChannel(w, r, r.PathValue("id"))
 	if !ok {
 		return
 	}
 
-	// This endpoint only handles multipart file uploads. Require a
+	// (1)/(2) This endpoint only handles multipart file uploads. Require a
 	// multipart/form-data Content-Type before touching the body: for any other
 	// type ParseMultipartForm falls back to ParseForm, which reads the whole
 	// request up to the (large) upload cap into memory. Guarding here avoids
@@ -223,7 +251,7 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject a known over-cap upload up front. When the client declares a
+	// (3) Reject a known over-cap upload up front. When the client declares a
 	// Content-Length larger than the cap the request is doomed, so return 413
 	// before wrapping the body or extending the deadline — a bad request must
 	// stay bounded by the global ReadTimeout instead of the long upload window.
@@ -232,11 +260,15 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cap the request body before anything reads it. r.FormValue/r.FormFile
-	// trigger multipart parsing, which would otherwise spool the entire upload
-	// to memory (then disk) with no limit, so the cap must wrap r.Body first —
-	// after a FormValue call it is too late.
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+	// (5) The request is a validated multipart upload. Cap the request body
+	// before anything reads it. r.FormValue/r.FormFile trigger multipart
+	// parsing, which would otherwise spool the entire upload to memory (then
+	// disk) with no limit, so the cap must wrap r.Body first — after a FormValue
+	// call it is too late. Hand MaxBytesReader the UNWRAPPED ResponseWriter: it
+	// does not follow Unwrap, and only when given net/http's real *response can
+	// it fire the oversized-body hook that flags the connection to close instead
+	// of draining the remaining body.
+	r.Body = http.MaxBytesReader(underlying(w), r.Body, s.maxUploadBytes)
 
 	// Extend the read deadline immediately before parsing the body: the global
 	// ReadTimeout bounds body-drip on normal routes but is too short for a large
@@ -248,9 +280,15 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse the (capped) multipart body explicitly so an over-cap upload
+	// (6) Parse the (capped) multipart body explicitly so an over-cap upload
 	// surfaces as a clean 413 instead of being silently swallowed by FormValue.
+	// On ANY parse failure the body is only partially read, so abortUpload first
+	// revokes the long deadline and marks the connection to close — otherwise a
+	// hostile chunked/unknown-length body that stalls after crossing the cap (or
+	// any malformed body) could be held/drained under the long upload window
+	// before or after the 4xx is written.
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		s.abortUpload(w)
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			s.renderError(w, r, http.StatusRequestEntityTooLarge, "The uploaded file is too large.")

@@ -1,10 +1,13 @@
 package server_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -410,6 +413,76 @@ func TestUploadRejectsNonMultipart(t *testing.T) {
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, http.StatusUnsupportedMediaType, resp.StatusCode)
+
+	// Nothing was persisted.
+	eps, err := h.store.ListEpisodes(ctx, store.EpisodeFilter{ChannelID: "c1"})
+	require.NoError(t, err)
+	require.Empty(t, eps)
+}
+
+// TestUploadOverCapChunkedStallReturnsPromptly guards cell 6 end-to-end against
+// a live server: a chunked (unknown-length) multipart upload that crosses the
+// cap and then STALLS must be answered with 413 promptly — bounded by the global
+// read handling, not held open for the long, size-derived upload deadline. The
+// tiny cap makes the upload deadline the 5-minute floor, so if the server drained
+// or waited on the stalled body under that deadline this test would block far
+// past its own short read deadline and fail.
+func TestUploadOverCapChunkedStallReturnsPromptly(t *testing.T) {
+	h := newHarness(t, server.WithMaxUploadBytes(64))
+	ctx := t.Context()
+	hash, _ := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", PasswordHash: string(hash), CreatedAt: time.Now()}))
+	require.NoError(t, h.store.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	// Log in through the client so its jar holds a valid session cookie, which we
+	// then replay on a raw connection (the raw request is needed to send an
+	// over-cap chunk and then deliberately stall without the client-side
+	// write/response race a normal http.Client hits here).
+	resp, err := h.client.PostForm(h.base+"/login", url.Values{"email": {"a@b.c"}, "password": {"secret"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+
+	u, err := url.Parse(h.base)
+	require.NoError(t, err)
+	var cookie strings.Builder
+	for i, c := range h.client.Jar.Cookies(u) {
+		if i > 0 {
+			cookie.WriteString("; ")
+		}
+		cookie.WriteString(c.Name + "=" + c.Value)
+	}
+	require.NotEmpty(t, cookie.String(), "expected a session cookie after login")
+
+	conn, err := net.Dial("tcp", u.Host)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Send a complete request head, then one chunk well over the 64-byte cap, and
+	// then nothing more (no terminating chunk) — a body that stalls after crossing
+	// the cap. Content need not be valid multipart: the cap is hit first.
+	head := "POST /admin/channels/c1/episodes HTTP/1.1\r\n" +
+		"Host: " + u.Host + "\r\n" +
+		"Cookie: " + cookie.String() + "\r\n" +
+		"Content-Type: multipart/form-data; boundary=xyz\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"\r\n"
+	_, err = io.WriteString(conn, head)
+	require.NoError(t, err)
+	oversized := strings.Repeat("x", 4096)
+	_, err = fmt.Fprintf(conn, "%x\r\n%s\r\n", len(oversized), oversized)
+	require.NoError(t, err)
+
+	// Bound our own wait well under the 5-minute upload-deadline floor: a prompt
+	// 413 arrives in milliseconds; being held under the long deadline would blow
+	// past this.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(15*time.Second)))
+	statusLine, err := bufio.NewReader(conn).ReadString('\n')
+	require.NoError(t, err, "server must respond promptly, not hold the stalled body")
+	require.Contains(t, statusLine, "413",
+		"an over-cap chunked upload must be rejected with 413")
 
 	// Nothing was persisted.
 	eps, err := h.store.ListEpisodes(ctx, store.EpisodeFilter{ChannelID: "c1"})
