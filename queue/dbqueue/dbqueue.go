@@ -82,9 +82,21 @@ func New(s store.Store, options ...Option) *Queue {
 }
 
 func defaultBackoff(attempt int) time.Duration {
+	const maxBackoff = time.Hour
+	// Saturate before shifting so the shift can never overflow. max-attempts is
+	// operator-configurable and may be large, so attempt can grow big enough that
+	// time.Minute << attempt overflows int64 (time.Duration), collapsing the
+	// backoff to a zero/negative delay and causing a tight retry loop with rapid
+	// dead-lettering. Once the shift would reach the cap there is nothing more to
+	// gain, so return the cap directly: time.Minute<<6 (64m) is the first value
+	// that meets the 1h cap, so any attempt >= 6 caps out. The result is always in
+	// (0, maxBackoff].
+	if attempt >= 6 {
+		return maxBackoff
+	}
 	d := time.Minute << attempt // 2^attempt minutes
-	if limit := time.Hour; d > limit {
-		return limit
+	if d > maxBackoff {
+		return maxBackoff
 	}
 	return d
 }

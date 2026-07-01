@@ -91,12 +91,28 @@ func restrictDBFiles(path string) {
 // dsnFor builds a modernc.org/sqlite DSN with pragmas applied per connection:
 // WAL for concurrent readers, a busy timeout so brief write contention waits
 // rather than errors, and foreign-key enforcement for our ON DELETE CASCADEs.
+//
+// The filesystem path is percent-encoded into the DSN so it is treated
+// literally. The driver forwards a "file:" DSN to SQLite's URI parser, which
+// reads '?' as the query separator, '#' as a fragment marker, and '%' as a
+// percent-escape; the driver itself also splits pragmas off at the first '?'.
+// Raw-concatenating a path that contains any of those characters would let
+// them be reinterpreted as URI syntax, opening the wrong database (or dropping
+// the pragmas). EscapedPath encodes '?', '#', '%', spaces, etc. while leaving
+// '/' intact, and the opaque "file:" form (file:/abs or file:rel) sidesteps
+// the "file://host/path" parsing that url.URL would otherwise apply to a
+// relative path.
 func dsnFor(path string) string {
 	q := url.Values{}
 	q.Add("_pragma", "journal_mode(WAL)")
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "foreign_keys(1)")
-	return "file:" + path + "?" + q.Encode()
+	u := url.URL{
+		Scheme:   "file",
+		Opaque:   (&url.URL{Path: path}).EscapedPath(),
+		RawQuery: q.Encode(),
+	}
+	return u.String()
 }
 
 // Migrate applies the schema. It is idempotent and also upgrades databases

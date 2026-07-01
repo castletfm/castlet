@@ -188,6 +188,36 @@ func TestUserOIDC(t *testing.T) {
 	require.Equal(t, "p1", linked.ID)
 }
 
+func TestLinkOIDCIdentity(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+
+	// an unlinked (password-only) account and an already-linked account
+	require.NoError(t, s.CreateUser(ctx, &model.User{ID: "pw", Email: "pw@x.y", DisplayName: "PW", PasswordHash: "h"}))
+	require.NoError(t, s.CreateUser(ctx, &model.User{ID: "linked", Email: "linked@x.y", DisplayName: "L",
+		OIDCIssuer: "https://idp", OIDCSubject: "sub-A"}))
+
+	// linking an unlinked account succeeds
+	require.NoError(t, s.LinkOIDCIdentity(ctx, "pw", "https://idp", "sub-new"))
+	got, err := s.UserByOIDCSubject(ctx, "https://idp", "sub-new")
+	require.NoError(t, err)
+	require.Equal(t, "pw", got.ID)
+
+	// re-linking the same identity is idempotent
+	require.NoError(t, s.LinkOIDCIdentity(ctx, "pw", "https://idp", "sub-new"))
+
+	// linking an account already bound to a DIFFERENT identity is rejected and
+	// does not overwrite the existing link
+	require.ErrorIs(t, s.LinkOIDCIdentity(ctx, "linked", "https://idp", "sub-B"), store.ErrConflict)
+	require.ErrorIs(t, s.LinkOIDCIdentity(ctx, "linked", "https://other", "sub-A"), store.ErrConflict)
+	still, err := s.UserByOIDCSubject(ctx, "https://idp", "sub-A")
+	require.NoError(t, err)
+	require.Equal(t, "linked", still.ID, "the existing link must be preserved")
+
+	// an unknown id matches no row and is reported as a conflict
+	require.ErrorIs(t, s.LinkOIDCIdentity(ctx, "nope", "https://idp", "sub-x"), store.ErrConflict)
+}
+
 func TestChannelsAndEpisodes(t *testing.T) {
 	s := newStore(t)
 	seedUser(t, s)

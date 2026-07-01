@@ -53,19 +53,26 @@ func (s *Server) handleLoginForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
-	rawEmail := r.FormValue("email")
-	password := r.FormValue("password")
-
-	// Brute-force speed bump: refuse further attempts from an IP that has
-	// already exhausted its failed-attempt budget, before touching the store or
-	// hashing a password.
+	// Brute-force speed bump: refuse further attempts from an IP that has already
+	// exhausted its failed-attempt budget BEFORE reading or parsing the request
+	// body, so a throttled attacker cannot make us spool/parse a body (or hash a
+	// password, or touch the store) at all. This must run first: an earlier
+	// FormValue here would parse the body — and for a multipart body, spool it to
+	// disk — before the throttle ever applied.
 	key := clientIP(r)
 	if retryAfter, blocked := s.loginLimiter.blocked(key, s.now()); blocked {
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
 		s.render(w, r, http.StatusTooManyRequests, "login", "Log in",
-			loginPage{Email: rawEmail, Error: "Too many failed login attempts. Please wait and try again."})
+			loginPage{Error: "Too many failed login attempts. Please wait and try again."})
 		return
 	}
+
+	// Cap and constrain the body (urlencoded only, 64 KiB) before any FormValue.
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
+	rawEmail := r.FormValue("email")
+	password := r.FormValue("password")
 
 	// Look up by the canonical form so a login with different casing than at
 	// signup ("Alice@Example.com" vs "alice@example.com") still finds the account.
@@ -145,6 +152,12 @@ func retryAfterSeconds(d time.Duration) int {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	// Constrain the body even though logout reads no fields: this rejects a
+	// hostile multipart/oversized POST to /logout up front (415/413) rather than
+	// leaving net/http to read/drain it, keeping the small-form contract uniform.
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
 	// Logout is "log out everywhere": bump the user's session epoch so every
 	// session issued for them (not just this browser's cookie) stops validating;
 	// clearing the cookie alone only affects the current client.
@@ -226,6 +239,10 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap and constrain the body (urlencoded only, 64 KiB) before any FormValue.
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
 	rawEmail := strings.TrimSpace(r.FormValue("email"))
 	name := strings.TrimSpace(r.FormValue("name"))
 	password := r.FormValue("password")

@@ -456,20 +456,89 @@ func TestOIDCLinksVerifiedEmail(t *testing.T) {
 	require.NotEmpty(t, linked.PasswordHash, "linking keeps the existing password")
 }
 
-// epochRaceOnUpdateStore wraps a store.Store and, on the link path's UpdateUser,
-// first bumps the user's session epoch — standing in for a "log out everywhere"
-// (or password change) landing between UserByEmail and UpdateUser. It is used to
-// assert the link path reloads the user before issuing a session, so the cookie
-// carries the CURRENT epoch rather than the stale one UserByEmail read.
+// An account already linked to one identity (subject S1) must NOT have its OIDC
+// link overwritten when a DIFFERENT identity (subject S2) signs in asserting the
+// same verified email — e.g. a reused/aliased mailbox or a second issuer claiming
+// the address. That overwrite would be an account takeover. The sign-in for S2 is
+// rejected and the stored (issuer, subject) is left pointing at S1.
+func TestOIDCRejectsRelinkToAlreadyLinkedAccount(t *testing.T) {
+	// The account is already linked to subject S1.
+	s2 := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-S2",
+		Email: "shared@user.test", EmailVerified: true, Name: "Attacker"}
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: s2}))
+	require.NoError(t, h.store.CreateUser(t.Context(), &model.User{ID: "victim",
+		Email: "shared@user.test", DisplayName: "Victim",
+		OIDCIssuer: "https://idp.test", OIDCSubject: "sub-S1"}))
+
+	// A second identity (S2) with the same verified email tries to sign in.
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusForbidden, resp.StatusCode)
+
+	// S2 was not linked to any account, and S1 still owns the account.
+	_, err = h.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-S2")
+	require.ErrorIs(t, err, store.ErrNotFound, "the newcomer identity must not be linked")
+	stillS1, err := h.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-S1")
+	require.NoError(t, err)
+	require.Equal(t, "victim", stillS1.ID, "the original link must be preserved")
+}
+
+// A password-only (unlinked) account links successfully on first OIDC sign-in.
+func TestOIDCLinksPasswordOnlyAccount(t *testing.T) {
+	id := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-link-new",
+		Email: "pwuser@user.test", EmailVerified: true, Name: "PW User"}
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: id}))
+	require.NoError(t, h.store.CreateUser(t.Context(), &model.User{ID: "pwonly",
+		Email: "pwuser@user.test", DisplayName: "PW User", PasswordHash: mustHash(t, "secret")}))
+
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	require.Equal(t, "/admin/", resp.Header.Get("Location"))
+
+	linked, err := h.store.UserByOIDCSubject(t.Context(), "https://idp.test", "sub-link-new")
+	require.NoError(t, err)
+	require.Equal(t, "pwonly", linked.ID)
+	require.NotEmpty(t, linked.PasswordHash, "linking keeps the existing password")
+}
+
+// A returning user whose subject already matches the stored link logs in via the
+// subject lookup — the idempotent path, which must keep working unchanged.
+func TestOIDCReturningMatchingSubjectLogsIn(t *testing.T) {
+	id := &auth.Identity{Issuer: "https://idp.test", Subject: "sub-returning",
+		Email: "returning@user.test", EmailVerified: true, Name: "Returning"}
+	h := newHarness(t, server.WithAuthenticator(fakeAuthn{identity: id}))
+	require.NoError(t, h.store.CreateUser(t.Context(), &model.User{ID: "returning1",
+		Email: "returning@user.test", DisplayName: "Returning",
+		OIDCIssuer: "https://idp.test", OIDCSubject: "sub-returning"}))
+
+	state := h.startOIDC(t)
+	resp, err := h.client.Get(h.base + "/auth/oidc/callback?state=" + state + "&code=good")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	require.Equal(t, "/admin/", resp.Header.Get("Location"))
+}
+
+// epochRaceOnUpdateStore wraps a store.Store and, on the link path's
+// LinkOIDCIdentity, first bumps the user's session epoch — standing in for a "log
+// out everywhere" (or password change) landing between UserByEmail and the link
+// write. It is used to assert the link path reloads the user before issuing a
+// session, so the cookie carries the CURRENT epoch rather than the stale one
+// UserByEmail read.
 type epochRaceOnUpdateStore struct {
 	store.Store
 }
 
-func (s epochRaceOnUpdateStore) UpdateUser(ctx context.Context, u *model.User) error {
-	if err := s.BumpSessionEpoch(ctx, u.ID); err != nil {
+func (s epochRaceOnUpdateStore) LinkOIDCIdentity(ctx context.Context, userID, issuer, subject string) error {
+	if err := s.BumpSessionEpoch(ctx, userID); err != nil {
 		return err
 	}
-	return s.Store.UpdateUser(ctx, u)
+	return s.Store.LinkOIDCIdentity(ctx, userID, issuer, subject)
 }
 
 // The OIDC link path must reload the user after UpdateUser and issue the session
