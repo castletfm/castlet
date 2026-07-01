@@ -287,12 +287,19 @@ func (w *Worker) transcribe(ctx context.Context, job *model.Job) error {
 	return nil
 }
 
+// setStatus records the episode's transcript status with a targeted UPDATE.
+// It deliberately does NOT write the whole row: transcription runs for minutes,
+// during which an admin may edit the episode's title/description/language/
+// position. A full read-modify-write from the worker's stale copy would silently
+// revert those edits (lost update), so only transcript_status/updated_at change.
 func (w *Worker) setStatus(ctx context.Context, ep *model.Episode, status model.TranscriptStatus) {
-	ep.TranscriptStatus = status
-	ep.UpdatedAt = time.Now()
-	if err := w.store.UpdateEpisode(ctx, ep); err != nil {
+	now := time.Now()
+	if err := w.store.SetEpisodeTranscriptStatus(ctx, ep.ID, status, now); err != nil {
 		w.logger.Error("update transcript status", "episode", ep.ID, "status", status, "error", err)
+		return
 	}
+	ep.TranscriptStatus = status
+	ep.UpdatedAt = now
 }
 
 // markTranscript loads the job's episode and records a terminal transcript

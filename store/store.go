@@ -54,6 +54,10 @@ type Store interface {
 
 	CreateEpisode(ctx context.Context, e *model.Episode) error
 	UpdateEpisode(ctx context.Context, e *model.Episode) error
+	// SetEpisodeTranscriptStatus updates only the transcript_status (and
+	// updated_at) of an episode. It is a targeted write so a concurrent admin
+	// edit to the rest of the row is not clobbered by the transcription worker.
+	SetEpisodeTranscriptStatus(ctx context.Context, id string, status model.TranscriptStatus, updatedAt time.Time) error
 	DeleteEpisode(ctx context.Context, id string) error
 	EpisodeByID(ctx context.Context, id string) (*model.Episode, error)
 	// EpisodeByMediaKey finds the episode whose media is stored under key, so

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/store"
@@ -178,6 +179,20 @@ func (s *Store) UpdateEpisode(ctx context.Context, e *model.Episode) error {
 		string(e.Status), string(e.TranscriptStatus), toUnixPtr(e.PublishedAt), toUnix(e.UpdatedAt), e.Language, e.Position, e.ID)
 	if err != nil {
 		return fmt.Errorf("sqlite: update episode: %w", mapErr(err))
+	}
+	return requireAffected(res)
+}
+
+// SetEpisodeTranscriptStatus updates only the transcript_status and updated_at
+// columns, leaving the rest of the row untouched. The transcription worker uses
+// this instead of UpdateEpisode so an admin edit made mid-transcription is not
+// reverted by the worker's stale in-memory copy of the episode.
+func (s *Store) SetEpisodeTranscriptStatus(ctx context.Context, id string, status model.TranscriptStatus, updatedAt time.Time) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE episodes SET transcript_status = ?, updated_at = ? WHERE id = ?`,
+		string(status), toUnix(updatedAt), id)
+	if err != nil {
+		return fmt.Errorf("sqlite: set episode transcript status: %w", mapErr(err))
 	}
 	return requireAffected(res)
 }
