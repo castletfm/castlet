@@ -37,6 +37,10 @@ var ErrServerClosed = errors.New("server: closed")
 // media uploads over slow links are not cut off by this global cap.
 const readTimeout = 30 * time.Second
 
+// shutdownDrainGrace bounds how long Run waits for the Serve goroutine to
+// return after Shutdown/Close before giving up on it, so Run always returns.
+const shutdownDrainGrace = 2 * time.Second
+
 // Server serves the Castlet web application. The receiver holds only validated
 // configuration and is safe to Run more than once.
 type Server struct {
@@ -66,15 +70,16 @@ type Server struct {
 type Option = option.Interface
 
 type (
-	identAddr           struct{}
-	identBaseURL        struct{}
-	identSiteName       struct{}
-	identMaxUploadBytes struct{}
-	identLogger         struct{}
-	identRenderer       struct{}
-	identAllowSignup    struct{}
-	identAuthenticator  struct{}
-	identAllowedDomains struct{}
+	identAddr            struct{}
+	identBaseURL         struct{}
+	identSiteName        struct{}
+	identMaxUploadBytes  struct{}
+	identLogger          struct{}
+	identRenderer        struct{}
+	identAllowSignup     struct{}
+	identAuthenticator   struct{}
+	identAllowedDomains  struct{}
+	identShutdownTimeout struct{}
 )
 
 // WithAddr sets the listen address (default ":8080").
@@ -109,6 +114,11 @@ func WithAuthenticator(a auth.Authenticator) Option { return option.New(identAut
 // WithAllowedDomains restricts OIDC sign-in (linking and just-in-time
 // provisioning) to the given email domains. An empty list allows any domain.
 func WithAllowedDomains(domains []string) Option { return option.New(identAllowedDomains{}, domains) }
+
+// WithShutdownTimeout bounds how long a context-driven shutdown waits for
+// in-flight requests to drain before remaining connections are force-closed
+// (default 10s).
+func WithShutdownTimeout(d time.Duration) Option { return option.New(identShutdownTimeout{}, d) }
 
 // New constructs a Server from its dependencies. It returns an error only if
 // the default renderer fails to parse its templates.
@@ -148,6 +158,8 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *sessi
 			s.authn = option.MustGet[auth.Authenticator](o)
 		case identAllowedDomains:
 			s.allowedDomains = option.MustGet[[]string](o)
+		case identShutdownTimeout:
+			s.shutdownTimeout = option.MustGet[time.Duration](o)
 		}
 	}
 	if s.renderer == nil {
@@ -210,8 +222,21 @@ func (s *Server) Run(ctx context.Context) (*Controller, error) {
 		case <-ctx.Done():
 			shCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 			defer cancel()
-			_ = httpSrv.Shutdown(shCtx)
-			<-serveErr // let Serve unwind
+			// Graceful drain first. If it does not finish within the timeout
+			// (e.g. a stuck /media stream), Shutdown returns the deadline
+			// error; force-close the remaining connections so we never hang.
+			if err := httpSrv.Shutdown(shCtx); err != nil {
+				s.logger.Warn("server: graceful shutdown incomplete, forcing close", "error", err)
+				_ = httpSrv.Close()
+			}
+			// Bound the wait for Serve to unwind. Close (and Shutdown on
+			// success) make Serve return promptly, but never block Run's exit
+			// on it: a wedged serve goroutine must not keep Run alive forever.
+			select {
+			case <-serveErr:
+			case <-time.After(shutdownDrainGrace):
+				s.logger.Warn("server: serve goroutine did not unwind after shutdown")
+			}
 			e := ErrServerClosed
 			ctrl.err.Store(&e)
 		case e := <-serveErr:
