@@ -20,6 +20,11 @@ var (
 	// ErrConflict is returned when a write violates a uniqueness constraint
 	// (e.g. a duplicate email or id).
 	ErrConflict = errors.New("store: conflict")
+	// ErrInvalidReorder is returned by ReorderEpisodes when orderedIDs is not an
+	// exact permutation of the channel's current episode ids (it contains
+	// duplicates, omits a current episode, or names a foreign id). Callers
+	// should surface it as a client error (400), not a server error.
+	ErrInvalidReorder = errors.New("store: invalid reorder")
 )
 
 // EpisodeFilter narrows ListEpisodes. The zero value lists every episode,
@@ -65,6 +70,15 @@ type Store interface {
 	// ErrNotFound when no episode references the key.
 	EpisodeByMediaKey(ctx context.Context, key string) (*model.Episode, error)
 	ListEpisodes(ctx context.Context, f EpisodeFilter) ([]*model.Episode, error)
+	// ReorderEpisodes renumbers the given channel's episodes so each id's
+	// position equals its index in orderedIDs. orderedIDs must be an exact
+	// permutation of the channel's current episode ids; a list with duplicates,
+	// a missing current episode, or a foreign id is rejected with
+	// ErrInvalidReorder and no rows are changed. All updates run in one
+	// transaction, so a mid-way failure cannot leave positions partially
+	// renumbered (all-or-nothing). Only the position and updated_at columns are
+	// touched; ids already at their target position are left untouched.
+	ReorderEpisodes(ctx context.Context, channelID string, orderedIDs []string, updatedAt time.Time) error
 
 	// SaveTranscript replaces any existing transcript for the episode.
 	SaveTranscript(ctx context.Context, t *model.Transcript) error
