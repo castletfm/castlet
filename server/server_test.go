@@ -141,6 +141,12 @@ func TestSecurityHeaders(t *testing.T) {
 
 	resp, _ := h.get(t, "/")
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+	requireSecurityHeaders(t, resp)
+}
+
+// requireSecurityHeaders asserts the baseline security headers are present.
+func requireSecurityHeaders(t *testing.T, resp *http.Response) {
+	t.Helper()
 	require.Equal(t, "nosniff", resp.Header.Get("X-Content-Type-Options"))
 	require.Equal(t, "DENY", resp.Header.Get("X-Frame-Options"))
 	require.Equal(t, "no-referrer", resp.Header.Get("Referrer-Policy"))
