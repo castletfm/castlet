@@ -1,9 +1,18 @@
 package server
 
 import (
+	"context"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/castletfm/castlet/model"
+	"github.com/castletfm/castlet/store/sqlite"
+	"github.com/stretchr/testify/require"
 )
 
 // TestUploadReadTimeout guards the read-deadline derivation: at the default
@@ -42,6 +51,42 @@ func TestUploadReadTimeout(t *testing.T) {
 	if need := time.Duration(minUploadRate) * got / time.Second; need < notMultiple {
 		t.Fatalf("uploadReadTimeout (%s) delivers only %d bytes at minUploadRate, want >= %d", got, need, notMultiple)
 	}
+}
+
+// TestEpisodeCreateNonMultipartSkipsDeadline guards the ordering of
+// handleEpisodeCreate: the long per-upload read deadline must be extended only
+// after the cheap no-body checks (ownership + multipart Content-Type) pass. A
+// non-multipart request must be rejected with 415 under the global ReadTimeout,
+// i.e. without SetReadDeadline ever being called — otherwise net/http could
+// drain the unread body under the long upload deadline instead.
+func TestEpisodeCreateNonMultipartSkipsDeadline(t *testing.T) {
+	ctx := t.Context()
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "t.db"))
+	require.NoError(t, err)
+	require.NoError(t, st.Migrate(ctx))
+	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "a@b.c",
+		DisplayName: "A", CreatedAt: time.Now()}))
+	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1",
+		Title: "My Show", Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	renderer, err := newTemplateRenderer()
+	require.NoError(t, err)
+	s := &Server{store: st, renderer: renderer, logger: slog.Default(),
+		siteName: "Castlet", maxUploadBytes: 64, now: time.Now}
+
+	rec := httptest.NewRecorder()
+	fake := &deadlineWriter{ResponseWriter: rec}
+	req := httptest.NewRequest(http.MethodPost, "/admin/channels/c1/episodes",
+		strings.NewReader("title=Hello"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.SetPathValue("id", "c1")
+	req = req.WithContext(context.WithValue(req.Context(), userCtxKey, &model.User{ID: "u1"}))
+
+	s.handleEpisodeCreate(fake, req)
+
+	require.Equal(t, http.StatusUnsupportedMediaType, rec.Code)
+	require.False(t, fake.called,
+		"read deadline must not be extended before the multipart Content-Type check passes")
 }
 
 // deadlineWriter is a fake deadline-capable ResponseWriter recording the last

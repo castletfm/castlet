@@ -196,22 +196,10 @@ func (s *Server) handleEpisodeNew(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
-	// Cap the request body before anything reads it. r.FormValue/r.FormFile
-	// trigger multipart parsing, which would otherwise spool the entire upload
-	// to memory (then disk) with no limit, so the cap must wrap r.Body first —
-	// after a FormValue call it is too late.
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
-
-	// Extend the read deadline for this handler: the global ReadTimeout bounds
-	// body-drip on normal routes but is too short for a large upload over a slow
-	// link, so grant a generous window here. ErrNotSupported (no deadline
-	// support on the underlying conn) is harmless — the request just keeps the
-	// global deadline.
-	if err := http.NewResponseController(w).SetReadDeadline(s.now().Add(s.uploadReadTimeout())); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		s.serverError(w, r, err)
-		return
-	}
-
+	// Do the cheap, no-body checks first so they return under the global
+	// ReadTimeout: extending the read deadline before these run would let an
+	// early-return path (unauthorized, or a non-multipart Content-Type) drain
+	// its unread body under the long upload deadline instead.
 	ch, ok := s.ownedChannel(w, r, r.PathValue("id"))
 	if !ok {
 		return
@@ -224,6 +212,22 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	// that allocation for non-multipart requests.
 	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mediaType != "multipart/form-data" {
 		s.renderError(w, r, http.StatusUnsupportedMediaType, "The upload must be sent as multipart/form-data.")
+		return
+	}
+
+	// Cap the request body before anything reads it. r.FormValue/r.FormFile
+	// trigger multipart parsing, which would otherwise spool the entire upload
+	// to memory (then disk) with no limit, so the cap must wrap r.Body first —
+	// after a FormValue call it is too late.
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+
+	// Extend the read deadline immediately before parsing the body: the global
+	// ReadTimeout bounds body-drip on normal routes but is too short for a large
+	// upload over a slow link, so grant a generous window here. ErrNotSupported
+	// (no deadline support on the underlying conn) is harmless — the request
+	// just keeps the global deadline.
+	if err := http.NewResponseController(w).SetReadDeadline(s.now().Add(s.uploadReadTimeout())); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		s.serverError(w, r, err)
 		return
 	}
 
