@@ -227,6 +227,38 @@ func (s *Store) SetEpisodeTranscriptStatus(ctx context.Context, id string, statu
 	return requireAffected(res)
 }
 
+// UpdateEpisodeMetadata updates only the admin-editable metadata columns (title,
+// description, spoken language) and updated_at, leaving the rest of the row —
+// crucially transcript_status and its timestamps — untouched. The admin edit
+// handler uses this instead of the full-row UpdateEpisode so a metadata edit made
+// from a stale-loaded episode cannot revert a transcript_status the worker just
+// committed (the reverse of the worker-side clobber SetEpisodeTranscriptStatus
+// guards against).
+func (s *Store) UpdateEpisodeMetadata(ctx context.Context, id, title, description, language string, updatedAt time.Time) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE episodes SET title = ?, description = ?, language = ?, updated_at = ? WHERE id = ?`,
+		title, description, language, toUnix(updatedAt), id)
+	if err != nil {
+		return fmt.Errorf("sqlite: update episode metadata: %w", mapErr(err))
+	}
+	return requireAffected(res)
+}
+
+// SetEpisodePublication updates only the publication columns (status,
+// published_at) and updated_at, leaving the rest of the row — crucially
+// transcript_status and its timestamps — untouched. The publish/unpublish handler
+// uses this instead of the full-row UpdateEpisode so a publish toggle made from a
+// stale-loaded episode cannot revert a transcript_status the worker just committed.
+func (s *Store) SetEpisodePublication(ctx context.Context, id string, status model.EpisodeStatus, publishedAt *time.Time, updatedAt time.Time) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE episodes SET status = ?, published_at = ?, updated_at = ? WHERE id = ?`,
+		string(status), toUnixPtr(publishedAt), toUnix(updatedAt), id)
+	if err != nil {
+		return fmt.Errorf("sqlite: set episode publication: %w", mapErr(err))
+	}
+	return requireAffected(res)
+}
+
 // channelEpisodeIDs returns the set of episode ids currently belonging to the
 // channel, read through tx so it sees the transaction's own view.
 func channelEpisodeIDs(ctx context.Context, tx *sql.Tx, channelID string) (map[string]bool, error) {

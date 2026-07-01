@@ -219,6 +219,57 @@ func TestChannelsAndEpisodes(t *testing.T) {
 	require.Empty(t, missKey)
 }
 
+// TestAdminWritesDoNotClobberTranscriptStatus proves the reverse-direction race
+// (ADV-001): after the worker commits a transcript_status via the targeted
+// SetEpisodeTranscriptStatus, an admin metadata edit and a publish/unpublish
+// toggle applied through the targeted admin writes leave transcript_status
+// untouched, while still updating their own columns. A full-row UpdateEpisode from
+// a stale in-memory episode would instead revert transcript_status.
+func TestAdminWritesDoNotClobberTranscriptStatus(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s)
+	ctx := t.Context()
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "Show",
+		Language: "en", CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	// Episode starts as a draft with no transcript; an admin loads this copy.
+	stale := &model.Episode{ID: "e1", ChannelID: "c1", Title: "Original", Description: "orig desc",
+		Language: "en", MediaKey: "k1", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptNone,
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	require.NoError(t, s.CreateEpisode(ctx, stale))
+
+	// The worker finishes transcription and commits TranscriptDone via its targeted
+	// write. The admin still holds the pre-transcription `stale` copy.
+	require.NoError(t, s.SetEpisodeTranscriptStatus(ctx, "e1", model.TranscriptDone, time.Now()))
+
+	// Admin metadata edit from the stale copy: title/description/language change,
+	// transcript_status must remain done.
+	require.NoError(t, s.UpdateEpisodeMetadata(ctx, stale.ID, "New Title", "new desc", "ja", time.Now()))
+	got, err := s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, "New Title", got.Title)
+	require.Equal(t, "new desc", got.Description)
+	require.Equal(t, "ja", got.Language)
+	require.Equal(t, model.TranscriptDone, got.TranscriptStatus, "metadata edit must not revert transcript_status")
+	require.Equal(t, model.EpisodeDraft, got.Status, "metadata edit must not change publication status")
+
+	// Admin publish from the same stale copy: status/published_at change,
+	// transcript_status must remain done.
+	pub := time.Now()
+	require.NoError(t, s.SetEpisodePublication(ctx, stale.ID, model.EpisodePublished, &pub, time.Now()))
+	got, err = s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.EpisodePublished, got.Status)
+	require.NotNil(t, got.PublishedAt)
+	require.Equal(t, model.TranscriptDone, got.TranscriptStatus, "publish must not revert transcript_status")
+	require.Equal(t, "New Title", got.Title, "publish must not revert the earlier metadata edit")
+
+	// Missing ids surface ErrNotFound for both targeted writes.
+	require.ErrorIs(t, s.UpdateEpisodeMetadata(ctx, "nope", "x", "y", "en", time.Now()), store.ErrNotFound)
+	require.ErrorIs(t, s.SetEpisodePublication(ctx, "nope", model.EpisodeDraft, nil, time.Now()), store.ErrNotFound)
+}
+
 // TestDeleteEpisodeOrphan proves DeleteEpisode's atomic orphan report (CST-013):
 // a shared, content-addressed media key is reported orphaned only once the LAST
 // referencing episode is gone, and a channel's cover art keeps a key alive.

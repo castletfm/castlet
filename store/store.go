@@ -137,7 +137,26 @@ type Store interface {
 	ChannelImageKeyExists(ctx context.Context, key string) (bool, error)
 
 	CreateEpisode(ctx context.Context, e *model.Episode) error
+	// UpdateEpisode writes the full episode row. It is retained for callers that
+	// legitimately own every column; admin edits must NOT use it, because writing
+	// transcript_status from a stale in-memory episode would revert a status the
+	// worker just committed. Admin-owned edits use the targeted
+	// UpdateEpisodeMetadata / SetEpisodePublication writes below instead.
 	UpdateEpisode(ctx context.Context, e *model.Episode) error
+	// UpdateEpisodeMetadata updates only the admin-editable metadata columns
+	// (title, description, spoken language) and updated_at. It is a targeted write
+	// that leaves transcript_status (and its timestamps) untouched, so an admin
+	// metadata edit from a stale-loaded episode cannot revert a transcript_status
+	// the transcription worker just committed — the reverse-direction counterpart
+	// to SetEpisodeTranscriptStatus. Returns ErrNotFound when no episode has the id.
+	UpdateEpisodeMetadata(ctx context.Context, id, title, description, language string, updatedAt time.Time) error
+	// SetEpisodePublication updates only the publication columns (status,
+	// published_at) and updated_at. It is a targeted write that leaves
+	// transcript_status (and its timestamps) untouched, so a publish/unpublish
+	// toggle from a stale-loaded episode cannot revert a transcript_status the
+	// transcription worker just committed. Returns ErrNotFound when no episode has
+	// the id.
+	SetEpisodePublication(ctx context.Context, id string, status model.EpisodeStatus, publishedAt *time.Time, updatedAt time.Time) error
 	// SetEpisodeTranscriptStatus updates only the transcript_status (and
 	// updated_at) of an episode. It is a targeted write so a concurrent admin
 	// edit to the rest of the row is not clobbered by the transcription worker.
