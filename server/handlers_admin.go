@@ -87,6 +87,9 @@ func (s *Server) handleChannelNew(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChannelCreate(w http.ResponseWriter, r *http.Request) {
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
 	user := userFrom(r.Context())
 	ch := &model.Channel{
 		ID:          idgen.New(),
@@ -120,6 +123,9 @@ func (s *Server) handleChannelEdit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChannelUpdate(w http.ResponseWriter, r *http.Request) {
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
 	ch, ok := s.ownedChannel(w, r, r.PathValue("id"))
 	if !ok {
 		return
@@ -456,6 +462,9 @@ func (s *Server) handleEpisodeEdit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEpisodeUpdate(w http.ResponseWriter, r *http.Request) {
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
 	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
 	if !ok {
 		return
@@ -491,6 +500,9 @@ func (s *Server) handleEpisodeUnpublish(w http.ResponseWriter, r *http.Request) 
 // order, swaps the target with its neighbour, then renumbers positions densely
 // so the manual order is well-defined from then on.
 func (s *Server) handleEpisodeMove(w http.ResponseWriter, r *http.Request) {
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
 	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
 	if !ok {
 		return
@@ -539,6 +551,9 @@ func (s *Server) handleEpisodeMove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) setEpisodePublished(w http.ResponseWriter, r *http.Request, publish bool) {
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
 	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
 	if !ok {
 		return
@@ -566,6 +581,9 @@ func (s *Server) setEpisodePublished(w http.ResponseWriter, r *http.Request, pub
 // its saved language (set on the edit page): it resets the status to pending and
 // re-enqueues the job, without re-uploading the media.
 func (s *Server) handleEpisodeTranscribe(w http.ResponseWriter, r *http.Request) {
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
 	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
 	if !ok {
 		return
@@ -612,6 +630,9 @@ func (s *Server) handleEpisodeStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEpisodeDelete(w http.ResponseWriter, r *http.Request) {
+	if err := s.parseSmallForm(w, r); err != nil {
+		return
+	}
 	ep, ch, ok := s.ownedEpisode(w, r, r.PathValue("id"))
 	if !ok {
 		return
