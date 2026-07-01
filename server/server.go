@@ -2,8 +2,10 @@
 // RSS feed, media delivery, cookie-based login, and the admin area. It follows
 // the house Run/Controller lifecycle: Run binds the listener synchronously and
 // returns a Controller; cancelling the context passed to Run gracefully shuts
-// the server down. There is no recover() middleware — a panicking handler
-// propagates so the operator's restart policy applies.
+// the server down. A per-request recover() middleware turns a panic in any
+// handler into a logged 500 (and re-panics http.ErrAbortHandler), so one bad
+// request cannot take the process down; non-request goroutines still follow
+// the existing "let it crash" policy and rely on the operator's restart policy.
 package server
 
 import (
