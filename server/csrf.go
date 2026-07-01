@@ -19,7 +19,9 @@ const (
 	// csrfField is the form field / query parameter carrying the token back.
 	csrfField = "csrf_token"
 	// csrfHeader lets a fetch()-based caller submit the token without a form.
-	csrfHeader = "X-CSRF-Token"
+	// Stored in canonical MIME form; http.Header.Get canonicalizes the caller's
+	// "X-CSRF-Token" to this, so browser-sent headers still match.
+	csrfHeader = "X-Csrf-Token"
 	// csrfTokenBytes is the raw entropy behind a token before base64 encoding.
 	csrfTokenBytes = 32
 )
