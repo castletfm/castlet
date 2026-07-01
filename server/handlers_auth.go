@@ -46,18 +46,58 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	// Bump the epoch so every session for this user (not just this browser's
-	// cookie) is invalidated — "log out everywhere". Clearing the cookie only
-	// affects the current client.
-	if u := userFrom(r.Context()); u != nil {
-		if err := s.store.BumpSessionEpoch(r.Context(), u.ID); err != nil {
-			// Revocation failed: other sessions for this user may still be live, so
-			// we must not report a successful "log out everywhere". Best-effort clear
-			// this browser's cookie, then return a 500 rather than a success redirect.
+	// Logout is "log out everywhere": bump the user's session epoch so every
+	// session issued for them (not just this browser's cookie) stops validating;
+	// clearing the cookie alone only affects the current client.
+	//
+	// This is deliberately self-contained and fail-closed. It re-parses the signed
+	// session cookie here rather than trusting loadUser's request-context user,
+	// because loadUser SUPPRESSES UserByID errors: during a store outage the
+	// context user is nil, and a logout that keyed the epoch bump off that would
+	// silently skip revocation while redirecting as a successful "logged out
+	// everywhere", leaving the user's other sessions live. On any store lookup or
+	// bump error we therefore best-effort clear this browser's cookie but return a
+	// 500 instead of a success redirect.
+	uid, epoch, ok := s.sessions.UserID(r, s.now())
+	if !ok {
+		// No cookie, or a tampered/expired/forged one: there is no session to
+		// revoke, so clearing the cookie and redirecting is a benign success.
+		s.sessions.Clear(w)
+		s.redirect(w, r, "/")
+		return
+	}
+
+	u, err := s.store.UserByID(r.Context(), uid)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			// The user no longer exists: nothing to revoke, treat as already
+			// logged out.
 			s.sessions.Clear(w)
-			s.serverError(w, r, err)
+			s.redirect(w, r, "/")
 			return
 		}
+		// Store outage: we cannot confirm the epoch bump, so fail closed rather
+		// than claim a successful "log out everywhere".
+		s.sessions.Clear(w)
+		s.serverError(w, r, err)
+		return
+	}
+
+	if u.SessionEpoch != epoch {
+		// The cookie's epoch is already stale — a prior "log out everywhere" or a
+		// password change already revoked it, so there is nothing left to do.
+		s.sessions.Clear(w)
+		s.redirect(w, r, "/")
+		return
+	}
+
+	if err := s.store.BumpSessionEpoch(r.Context(), u.ID); err != nil {
+		// Revocation failed: other sessions for this user may still be live, so we
+		// must not report a successful "log out everywhere". Best-effort clear this
+		// browser's cookie, then return a 500 rather than a success redirect.
+		s.sessions.Clear(w)
+		s.serverError(w, r, err)
+		return
 	}
 	s.sessions.Clear(w)
 	s.redirect(w, r, "/")
