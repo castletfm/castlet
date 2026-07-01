@@ -287,11 +287,35 @@ func buildAuthenticator(cfg *config.Config, logger *slog.Logger) (auth.Authentic
 // where backends stage full object bodies to temp files. Keeping this on the
 // data volume — rather than the system /tmp — means large or concurrent uploads
 // and transcriptions exhaust the operator-provisioned data disk, not the host's
-// (often tiny) /tmp. It is created 0o700 because staged media may be private.
+// (often tiny) /tmp. It is owner-only (0o700) because staged media may be private.
 func stagingDir(cfg *config.Config) (string, error) {
 	dir := filepath.Join(cfg.DataDir, "tmp")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("app: create staging dir: %w", err)
+	}
+	// MkdirAll only applies the 0o700 mode when it *creates* the directory. A dir
+	// left over from a prior run (or pre-created by the operator) could be
+	// world-/group-readable, leaking private staged media. Lstat (not Stat) so a
+	// symlink is seen as a symlink: reject a symlink or a non-directory rather
+	// than staging into an unexpected or attacker-pointed path, then tighten the
+	// mode so an existing looser directory is corrected to owner-only.
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return "", fmt.Errorf("app: stat staging dir: %w", err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("app: staging dir %q is a symlink", dir)
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("app: staging dir %q is not a directory", dir)
+	}
+	// Only chmod if the mode is actually looser than owner-only; this avoids a
+	// spurious failure on filesystems that don't support chmod (e.g. some
+	// network mounts) when the directory is already correct.
+	if fi.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return "", fmt.Errorf("app: secure staging dir: %w", err)
+		}
 	}
 	return dir, nil
 }
