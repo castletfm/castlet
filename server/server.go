@@ -48,6 +48,7 @@ type Server struct {
 	baseURL         string
 	siteName        string
 	allowSignup     bool
+	allowedDomains  []string // email domains permitted to sign in via OIDC; empty allows any
 	maxUploadBytes  int64
 	shutdownTimeout time.Duration
 	logger          *slog.Logger
@@ -66,6 +67,7 @@ type (
 	identRenderer       struct{}
 	identAllowSignup    struct{}
 	identAuthenticator  struct{}
+	identAllowedDomains struct{}
 )
 
 // WithAddr sets the listen address (default ":8080").
@@ -96,6 +98,10 @@ func WithAllowSignup(allow bool) Option { return option.New(identAllowSignup{}, 
 // WithAuthenticator enables OIDC single sign-on using the given authenticator.
 // When unset, OIDC routes are disabled and the SSO button is hidden.
 func WithAuthenticator(a auth.Authenticator) Option { return option.New(identAuthenticator{}, a) }
+
+// WithAllowedDomains restricts OIDC sign-in (linking and just-in-time
+// provisioning) to the given email domains. An empty list allows any domain.
+func WithAllowedDomains(domains []string) Option { return option.New(identAllowedDomains{}, domains) }
 
 // New constructs a Server from its dependencies. It returns an error only if
 // the default renderer fails to parse its templates.
@@ -133,6 +139,8 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, sessions *sessi
 			s.allowSignup = option.MustGet[bool](o)
 		case identAuthenticator:
 			s.authn = option.MustGet[auth.Authenticator](o)
+		case identAllowedDomains:
+			s.allowedDomains = option.MustGet[[]string](o)
 		}
 	}
 	if s.renderer == nil {

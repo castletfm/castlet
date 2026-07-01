@@ -352,16 +352,21 @@ func (s *Server) handleEpisodeMove(w http.ResponseWriter, r *http.Request) {
 	}
 	eps[i], eps[j] = eps[j], eps[i]
 
+	// Renumber densely in one transaction so a mid-way failure cannot leave the
+	// channel's positions partially renumbered.
+	ids := make([]string, len(eps))
 	for idx, e := range eps {
-		if e.Position == idx {
-			continue
-		}
-		e.Position = idx
-		e.UpdatedAt = s.now()
-		if err := s.store.UpdateEpisode(r.Context(), e); err != nil {
-			s.serverError(w, r, err)
+		ids[idx] = e.ID
+	}
+	if err := s.store.ReorderEpisodes(r.Context(), ch.ID, ids, s.now()); err != nil {
+		if errors.Is(err, store.ErrInvalidReorder) {
+			// A concurrent add/delete left our snapshot stale; ask the user to retry.
+			s.renderError(w, r, http.StatusBadRequest,
+				"The episode order is out of date. Please reload and try again.")
 			return
 		}
+		s.serverError(w, r, err)
+		return
 	}
 	s.redirect(w, r, dest)
 }
@@ -442,18 +447,29 @@ func (s *Server) handleEpisodeDelete(w http.ResponseWriter, r *http.Request) {
 	s.redirect(w, r, "/admin/channels/"+ch.ID+"/episodes")
 }
 
-// deleteOrphanBlob removes a media blob, but only if no (other) episode still
+// deleteOrphanBlob removes a media blob, but only if no other row still
 // references it. Media is content-addressed, so identical uploads share a key;
-// this keeps a delete from yanking a blob another episode depends on.
+// this keeps a delete from yanking a blob another owner depends on. Both
+// episodes and channel cover art can own a key, so both must be checked before a
+// blob is removed.
 func (s *Server) deleteOrphanBlob(ctx context.Context, key string) {
 	if key == "" {
 		return
 	}
 	if _, err := s.store.EpisodeByMediaKey(ctx, key); err == nil {
-		return // still referenced
+		return // still referenced by another episode
 	} else if !errors.Is(err, store.ErrNotFound) {
 		s.logger.Error("check media references", "key", key, "error", err)
 		return
+	}
+	// No episode owns the key, but a channel's cover art may: content-addressed
+	// media is shared, so an identical image and audio upload can collide. Don't
+	// delete a blob a channel image still references (would 404 the cover art).
+	if cover, err := s.store.ChannelImageKeyExists(ctx, key); err != nil {
+		s.logger.Error("check channel image references", "key", key, "error", err)
+		return
+	} else if cover {
+		return // still referenced by a channel image
 	}
 	if err := s.blobs.Delete(ctx, key); err != nil {
 		s.logger.Error("delete media blob", "key", key, "error", err)

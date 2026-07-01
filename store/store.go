@@ -26,6 +26,11 @@ var (
 	// expired. The stale worker's settlement is a no-op and must not overwrite the
 	// reclaiming attempt's state.
 	ErrStaleClaim = errors.New("store: stale job claim")
+	// ErrInvalidReorder is returned by ReorderEpisodes when orderedIDs is not an
+	// exact permutation of the channel's current episode ids (it contains
+	// duplicates, omits a current episode, or names a foreign id). Callers
+	// should surface it as a client error (400), not a server error.
+	ErrInvalidReorder = errors.New("store: invalid reorder")
 )
 
 // EpisodeFilter narrows ListEpisodes. The zero value lists every episode,
@@ -41,6 +46,9 @@ type EpisodeFilter struct {
 type Store interface {
 	// Migrate creates or upgrades the schema. Safe to call repeatedly.
 	Migrate(ctx context.Context) error
+	// Ping verifies the store is reachable, backing the server's readiness
+	// probe. It should stay cheap (a connection check or SELECT 1).
+	Ping(ctx context.Context) error
 	// Close releases underlying resources (connection pool, file handles).
 	Close() error
 
@@ -57,6 +65,10 @@ type Store interface {
 	ChannelByID(ctx context.Context, id string) (*model.Channel, error)
 	ListChannels(ctx context.Context) ([]*model.Channel, error)
 	ListChannelsByUser(ctx context.Context, userID string) ([]*model.Channel, error)
+	// ChannelImageKeyExists reports whether any channel references the blob
+	// stored under key as its cover art. Channels are always public, so such a
+	// blob may be served even when no published episode references the key.
+	ChannelImageKeyExists(ctx context.Context, key string) (bool, error)
 
 	CreateEpisode(ctx context.Context, e *model.Episode) error
 	UpdateEpisode(ctx context.Context, e *model.Episode) error
@@ -66,11 +78,28 @@ type Store interface {
 	SetEpisodeTranscriptStatus(ctx context.Context, id string, status model.TranscriptStatus, updatedAt time.Time) error
 	DeleteEpisode(ctx context.Context, id string) error
 	EpisodeByID(ctx context.Context, id string) (*model.Episode, error)
-	// EpisodeByMediaKey finds the episode whose media is stored under key, so
-	// the media endpoint can serve it with the right content type. Returns
-	// ErrNotFound when no episode references the key.
+	// EpisodeByMediaKey finds an episode whose media is stored under key. Media
+	// is content-addressed, so a key may be shared by several episodes; this
+	// returns an arbitrary one and is used only to test whether any episode
+	// references the key. Returns ErrNotFound when none does.
 	EpisodeByMediaKey(ctx context.Context, key string) (*model.Episode, error)
+	// PublishedEpisodeByMediaKey finds a published episode whose media is stored
+	// under key, so the media endpoint can both gate on publication and serve the
+	// blob with that episode's content type. Media is content-addressed, so a key
+	// may be shared by a draft and a published episode; a draft's MIME must not be
+	// used when a different published episode is what makes the key public.
+	// Returns ErrNotFound when no published episode references the key.
+	PublishedEpisodeByMediaKey(ctx context.Context, key string) (*model.Episode, error)
 	ListEpisodes(ctx context.Context, f EpisodeFilter) ([]*model.Episode, error)
+	// ReorderEpisodes renumbers the given channel's episodes so each id's
+	// position equals its index in orderedIDs. orderedIDs must be an exact
+	// permutation of the channel's current episode ids; a list with duplicates,
+	// a missing current episode, or a foreign id is rejected with
+	// ErrInvalidReorder and no rows are changed. All updates run in one
+	// transaction, so a mid-way failure cannot leave positions partially
+	// renumbered (all-or-nothing). Only the position and updated_at columns are
+	// touched; ids already at their target position are left untouched.
+	ReorderEpisodes(ctx context.Context, channelID string, orderedIDs []string, updatedAt time.Time) error
 
 	// SaveTranscript replaces any existing transcript for the episode.
 	SaveTranscript(ctx context.Context, t *model.Transcript) error

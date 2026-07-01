@@ -83,10 +83,14 @@ func (t *Transcriber) Transcribe(ctx context.Context, in transcribe.Input) (*tra
 		args[i] = strings.ReplaceAll(a, "{{audio}}", tmp.Name())
 	}
 
-	var stdout, stderr bytes.Buffer
+	// Bound the captured output so a verbose or stuck process can't exhaust the
+	// worker's memory. stdout carries the transcript JSON (generous cap); stderr
+	// is only diagnostic (small cap).
+	stdout := &cappedBuffer{limit: maxStdoutBytes}
+	stderr := &cappedBuffer{limit: maxStderrBytes}
 	cmd := exec.CommandContext(ctx, t.name, args...)
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	// Run in its own process group and kill the whole group on context
 	// cancellation. exec.CommandContext otherwise signals only the direct child,
 	// so grandchildren spawned by a wrapper (e.g. `docker run` or a whisper
@@ -103,6 +107,11 @@ func (t *Transcriber) Transcribe(ctx context.Context, in transcribe.Input) (*tra
 	}
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("command: %s failed: %w: %s", t.name, err, strings.TrimSpace(stderr.String()))
+	}
+	// Fail loudly rather than parse a truncated transcript into a mis-parsed
+	// (or, worse, silently short) result.
+	if stdout.overflow {
+		return nil, fmt.Errorf("command: %s produced more than %d bytes of stdout", t.name, maxStdoutBytes)
 	}
 
 	var out struct {
@@ -127,6 +136,40 @@ func (t *Transcriber) Transcribe(ctx context.Context, in transcribe.Input) (*tra
 	}
 	return res, nil
 }
+
+// Caps on captured child output. stdout holds the transcript JSON, so it gets a
+// generous cap; stderr is only used for diagnostics.
+const (
+	maxStdoutBytes = 64 << 20 // 64 MiB
+	maxStderrBytes = 1 << 20  // 1 MiB
+)
+
+// cappedBuffer is an io.Writer that accumulates at most limit bytes and then
+// discards the rest, recording that an overflow happened. It reports every write
+// as fully consumed so the child process is never blocked or errored by a short
+// write; the excess is simply dropped to keep memory bounded.
+type cappedBuffer struct {
+	buf      bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if remaining := c.limit - c.buf.Len(); remaining > 0 {
+		if len(p) <= remaining {
+			c.buf.Write(p)
+			return len(p), nil
+		}
+		c.buf.Write(p[:remaining])
+	}
+	if len(p) > 0 {
+		c.overflow = true
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) Bytes() []byte  { return c.buf.Bytes() }
+func (c *cappedBuffer) String() string { return c.buf.String() }
 
 // extFor picks a file extension so tools that sniff by extension behave.
 func extFor(in transcribe.Input) string {

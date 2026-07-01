@@ -133,6 +133,17 @@ func (s *Store) ListChannelsByUser(ctx context.Context, userID string) ([]*model
 		`SELECT `+channelCols+` FROM channels WHERE user_id = ? ORDER BY title COLLATE NOCASE`, userID)
 }
 
+func (s *Store) ChannelImageKeyExists(ctx context.Context, key string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM channels WHERE image_key = ? AND image_key <> ''`,
+		key).Scan(&n)
+	if err != nil {
+		return false, mapErr(err)
+	}
+	return n > 0, nil
+}
+
 func (s *Store) channelList(ctx context.Context, query string, args ...any) ([]*model.Channel, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -197,6 +208,86 @@ func (s *Store) SetEpisodeTranscriptStatus(ctx context.Context, id string, statu
 	return requireAffected(res)
 }
 
+// channelEpisodeIDs returns the set of episode ids currently belonging to the
+// channel, read through tx so it sees the transaction's own view.
+func channelEpisodeIDs(ctx context.Context, tx *sql.Tx, channelID string) (map[string]bool, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM episodes WHERE channel_id = ?`, channelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// ReorderEpisodes renumbers a channel's episodes atomically. It first loads the
+// channel's current episode ids and requires orderedIDs to be an exact
+// permutation of that set: a list with duplicates, a missing current episode, or
+// a foreign id (one not in the channel) is rejected with store.ErrInvalidReorder
+// before any UPDATE runs, so a stale or malformed list can never commit
+// duplicate or gapped positions. Each id's position is then set to its index in
+// orderedIDs inside a single transaction, so a failure part-way through rolls
+// back and cannot leave positions partially renumbered. The `position <> ?`
+// guard skips rows already at their target position, so updated_at is only
+// bumped for episodes that actually move.
+func (s *Store) ReorderEpisodes(ctx context.Context, channelID string, orderedIDs []string, updatedAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return mapErr(err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// Load the channel's current episode ids so orderedIDs can be validated as an
+	// exact permutation before anything is renumbered.
+	current, err := channelEpisodeIDs(ctx, tx, channelID)
+	if err != nil {
+		return fmt.Errorf("sqlite: reorder episodes: %w", mapErr(err))
+	}
+
+	if len(orderedIDs) != len(current) {
+		return fmt.Errorf("sqlite: reorder episodes: expected %d ids, got %d: %w",
+			len(current), len(orderedIDs), store.ErrInvalidReorder)
+	}
+	seen := make(map[string]bool, len(orderedIDs))
+	for _, id := range orderedIDs {
+		if !current[id] {
+			return fmt.Errorf("sqlite: reorder episodes: id %q is not in channel: %w",
+				id, store.ErrInvalidReorder)
+		}
+		if seen[id] {
+			return fmt.Errorf("sqlite: reorder episodes: duplicate id %q: %w",
+				id, store.ErrInvalidReorder)
+		}
+		seen[id] = true
+	}
+	// Equal length + all present in current + no duplicates ⇒ exact permutation,
+	// so every current episode is covered and none is missing.
+
+	for idx, id := range orderedIDs {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE episodes SET position = ?, updated_at = ?
+			 WHERE id = ? AND channel_id = ? AND position <> ?`,
+			idx, toUnix(updatedAt), id, channelID, idx); err != nil {
+			return fmt.Errorf("sqlite: reorder episodes: %w", mapErr(err))
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: reorder episodes: %w", mapErr(err))
+	}
+	return nil
+}
+
 func (s *Store) DeleteEpisode(ctx context.Context, id string) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM episodes WHERE id = ?`, id)
 	if err != nil {
@@ -217,6 +308,17 @@ func (s *Store) EpisodeByID(ctx context.Context, id string) (*model.Episode, err
 func (s *Store) EpisodeByMediaKey(ctx context.Context, key string) (*model.Episode, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+episodeCols+` FROM episodes WHERE media_key = ?`, key)
+	e, err := scanEpisode(row)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return e, nil
+}
+
+func (s *Store) PublishedEpisodeByMediaKey(ctx context.Context, key string) (*model.Episode, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+episodeCols+` FROM episodes WHERE media_key = ? AND status = ? LIMIT 1`,
+		key, string(model.EpisodePublished))
 	e, err := scanEpisode(row)
 	if err != nil {
 		return nil, mapErr(err)

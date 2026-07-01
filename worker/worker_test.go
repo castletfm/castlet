@@ -2,6 +2,7 @@ package worker_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/castletfm/castlet/blob/localfs"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/queue/dbqueue"
+	"github.com/castletfm/castlet/store"
 	"github.com/castletfm/castlet/store/sqlite"
 	"github.com/castletfm/castlet/transcribe"
 	"github.com/castletfm/castlet/transcribe/null"
@@ -214,6 +216,297 @@ func TestWorkerReclaimDeadLetterFailsEpisode(t *testing.T) {
 
 	_, err = st.TranscriptByEpisode(t.Context(), "e1")
 	require.Error(t, err, "no transcript should be saved for a dead-lettered job")
+}
+
+// cancelingTranscriber simulates a shutdown (SIGTERM) arriving mid-job: it
+// cancels the worker's context and then fails, so the terminal Nack runs with
+// an already-cancelled request context.
+type cancelingTranscriber struct {
+	cancel context.CancelFunc
+}
+
+func (c cancelingTranscriber) Transcribe(ctx context.Context, in transcribe.Input) (*transcribe.Result, error) {
+	c.cancel()
+	return nil, errors.New("boom")
+}
+
+// nackRecordingQueue serves a single job and records the context error observed
+// at the moment Nack is called, so a test can assert the terminal bookkeeping
+// write is not made with a cancelled context.
+type nackRecordingQueue struct {
+	job        *model.Job
+	dequeued   bool
+	nackCtxErr error
+	nacked     chan struct{}
+}
+
+func (q *nackRecordingQueue) Enqueue(context.Context, model.JobKind, any) error { return nil }
+
+func (q *nackRecordingQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, bool, error) {
+	if q.dequeued {
+		return nil, false, nil
+	}
+	q.dequeued = true
+	return q.job, false, nil
+}
+
+func (q *nackRecordingQueue) Ack(context.Context, *model.Job) error { return nil }
+
+func (q *nackRecordingQueue) Nack(ctx context.Context, _ *model.Job, _ error) (bool, error) {
+	q.nackCtxErr = ctx.Err()
+	close(q.nacked)
+	return false, nil
+}
+
+// TestWorkerNackSurvivesShutdown asserts that when the worker's context is
+// cancelled while a job is being processed, the terminal Nack is still made with
+// a live context, so the job's final state change is persisted rather than lost
+// to context.Canceled (which would strand the job in "processing").
+func TestWorkerNackSurvivesShutdown(t *testing.T) {
+	st, blobs, _ := setup(t)
+	seedEpisode(t, st, blobs, dbqueue.New(st))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	q := &nackRecordingQueue{
+		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
+		nacked: make(chan struct{}),
+	}
+	_, err := worker.New(st, blobs, q, cancelingTranscriber{cancel: cancel},
+		worker.WithPollInterval(10*time.Millisecond)).Run(ctx)
+	require.NoError(t, err)
+
+	select {
+	case <-q.nacked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Nack was not called")
+	}
+	require.NoError(t, q.nackCtxErr, "terminal Nack must run with a context that survives shutdown")
+}
+
+// cancelBeforeSettleTranscriber simulates shutdown (SIGTERM) arriving between
+// the transcription work and the terminal status persistence: it cancels the
+// worker's context and then returns a successful result, so the final status
+// write and Ack run with an already-cancelled request context.
+type cancelBeforeSettleTranscriber struct {
+	cancel context.CancelFunc
+}
+
+func (c cancelBeforeSettleTranscriber) Transcribe(ctx context.Context, in transcribe.Input) (*transcribe.Result, error) {
+	c.cancel()
+	return &transcribe.Result{Language: "en", Segments: []transcribe.Segment{
+		{StartSecs: 0, EndSecs: 1, Text: "hello"},
+	}}, nil
+}
+
+// ackRecordingQueue serves a single job and records whether it was terminated
+// via Ack or Nack, so a test can assert the success path acks the job only
+// after its terminal state persists.
+type ackRecordingQueue struct {
+	job      *model.Job
+	dequeued bool
+	acked    chan struct{}
+	nacked   chan struct{}
+}
+
+func (q *ackRecordingQueue) Enqueue(context.Context, model.JobKind, any) error { return nil }
+
+func (q *ackRecordingQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, bool, error) {
+	if q.dequeued {
+		return nil, false, nil
+	}
+	q.dequeued = true
+	return q.job, false, nil
+}
+
+func (q *ackRecordingQueue) Ack(context.Context, *model.Job) error { close(q.acked); return nil }
+
+func (q *ackRecordingQueue) Nack(context.Context, *model.Job, error) (bool, error) {
+	close(q.nacked)
+	return false, nil
+}
+
+// TestWorkerAckSurvivesShutdownSuccess asserts that when the worker's context is
+// cancelled after transcription succeeds but before the terminal status is
+// persisted, the episode is still durably settled to "done" AND the job is
+// acked (never left terminal-done with the episode stuck processing).
+func TestWorkerAckSurvivesShutdownSuccess(t *testing.T) {
+	st, blobs, _ := setup(t)
+	seedEpisode(t, st, blobs, dbqueue.New(st))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	q := &ackRecordingQueue{
+		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
+		acked:  make(chan struct{}),
+		nacked: make(chan struct{}),
+	}
+	_, err := worker.New(st, blobs, q, cancelBeforeSettleTranscriber{cancel: cancel},
+		worker.WithPollInterval(10*time.Millisecond)).Run(ctx)
+	require.NoError(t, err)
+
+	select {
+	case <-q.acked:
+	case <-q.nacked:
+		t.Fatal("job was nacked; a successful transcript must persist and ack under a shutdown-surviving context")
+	case <-time.After(3 * time.Second):
+		t.Fatal("job was neither acked nor nacked")
+	}
+
+	ep, err := st.EpisodeByID(t.Context(), "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptDone, ep.TranscriptStatus,
+		"episode status must be durably settled to done even though the worker ctx was cancelled")
+
+	tr, err := st.TranscriptByEpisode(t.Context(), "e1")
+	require.NoError(t, err)
+	require.Len(t, tr.Segments, 1)
+}
+
+// budgetExhaustingStore blocks SaveTranscript until the settlement context it is
+// handed expires, simulating a settlement step that consumes its entire budget.
+// Every other call delegates to the embedded store.
+type budgetExhaustingStore struct {
+	store.Store
+}
+
+func (s budgetExhaustingStore) SaveTranscript(ctx context.Context, _ *model.Transcript) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestWorkerNackSurvivesSettlementBudgetExhaustion asserts that when the
+// settlement writes consume their whole timeout, the terminal Nack still runs
+// under a fresh, live context (not the exhausted settlement context), so the
+// claimed job is durably Nack'd for retry rather than stranded in "processing".
+func TestWorkerNackSurvivesSettlementBudgetExhaustion(t *testing.T) {
+	st, blobs, _ := setup(t)
+	seedEpisode(t, st, blobs, dbqueue.New(st))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	q := &nackRecordingQueue{
+		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
+		nacked: make(chan struct{}),
+	}
+	// A tiny settle budget plus a store that blocks SaveTranscript until that
+	// budget is spent means settlement always times out; the queue transition
+	// must not inherit the exhausted context.
+	bstore := budgetExhaustingStore{Store: st}
+	_, err := worker.New(bstore, blobs, q, fakeTranscriber{},
+		worker.WithPollInterval(10*time.Millisecond),
+		worker.WithSettleTimeout(20*time.Millisecond)).Run(ctx)
+	require.NoError(t, err)
+
+	select {
+	case <-q.nacked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Nack was not called after settlement exhausted its budget")
+	}
+	require.NoError(t, q.nackCtxErr,
+		"terminal Nack must run under a fresh live context, not the exhausted settlement context")
+}
+
+// failingTranscriber always fails, so the worker takes the fail/Nack path.
+type failingTranscriber struct{}
+
+func (failingTranscriber) Transcribe(context.Context, transcribe.Input) (*transcribe.Result, error) {
+	return nil, errors.New("boom")
+}
+
+// deadNackQueue serves a single job and, on Nack, consumes the whole context it
+// is handed before reporting the job permanently dead, simulating a Nack that
+// spends its entire bounded budget. This lets a test assert the subsequent
+// dead-job status settlement runs under its OWN fresh context rather than the
+// exhausted Nack context.
+type deadNackQueue struct {
+	job      *model.Job
+	dequeued bool
+	nacked   chan struct{}
+}
+
+func (q *deadNackQueue) Enqueue(context.Context, model.JobKind, any) error { return nil }
+
+func (q *deadNackQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, bool, error) {
+	if q.dequeued {
+		return nil, false, nil
+	}
+	q.dequeued = true
+	return q.job, false, nil
+}
+
+func (q *deadNackQueue) Ack(context.Context, *model.Job) error { return nil }
+
+func (q *deadNackQueue) Nack(ctx context.Context, _ *model.Job, _ error) (bool, error) {
+	<-ctx.Done() // spend the entire Nack budget, leaving ctx expired
+	close(q.nacked)
+	return true, nil
+}
+
+// deadStatusRecordingStore records the context error observed when the dead-job
+// TranscriptFailed status is written, so a test can assert that settlement runs
+// under a live context rather than the exhausted Nack context.
+type deadStatusRecordingStore struct {
+	store.Store
+	statusCtxErr error
+	recorded     chan struct{}
+}
+
+func (s *deadStatusRecordingStore) SetEpisodeTranscriptStatus(ctx context.Context, id string, status model.TranscriptStatus, at time.Time) error {
+	err := s.Store.SetEpisodeTranscriptStatus(ctx, id, status, at)
+	if status == model.TranscriptFailed {
+		s.statusCtxErr = ctx.Err()
+		close(s.recorded)
+	}
+	return err
+}
+
+// TestWorkerDeadJobStatusSurvivesNackBudgetExhaustion asserts that when Nack
+// reports a job permanently dead after consuming its whole context budget, the
+// terminal TranscriptFailed status write still runs under its OWN fresh live
+// context, so the episode is durably settled to "failed" rather than stranded in
+// "processing" on an already-expired context.
+func TestWorkerDeadJobStatusSurvivesNackBudgetExhaustion(t *testing.T) {
+	base, blobs, _ := setup(t)
+	seedEpisode(t, base, blobs, dbqueue.New(base))
+
+	st := &deadStatusRecordingStore{Store: base, recorded: make(chan struct{})}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	q := &deadNackQueue{
+		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
+		nacked: make(chan struct{}),
+	}
+	// A tiny settle budget means Nack draining its context to expiry is quick;
+	// the dead-job status write must not inherit that exhausted context.
+	_, err := worker.New(st, blobs, q, failingTranscriber{},
+		worker.WithPollInterval(10*time.Millisecond),
+		worker.WithSettleTimeout(20*time.Millisecond)).Run(ctx)
+	require.NoError(t, err)
+
+	select {
+	case <-q.nacked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Nack was not called")
+	}
+
+	select {
+	case <-st.recorded:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dead-job TranscriptFailed status was never written; it likely ran under the exhausted Nack context")
+	}
+	require.NoError(t, st.statusCtxErr,
+		"dead-job status settlement must run under a fresh live context, not the exhausted Nack context")
+
+	ep, err := base.EpisodeByID(t.Context(), "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptFailed, ep.TranscriptStatus,
+		"a dead job must settle the episode to failed, not leave it stuck processing")
 }
 
 func TestWorkerNullSettlesToNone(t *testing.T) {

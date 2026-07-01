@@ -111,6 +111,16 @@ func isDuplicateColumn(err error) bool {
 	return strings.Contains(err.Error(), "duplicate column name")
 }
 
+// Ping verifies the database is reachable, backing the readiness probe. It uses
+// the driver's connection check rather than a query so it stays cheap even when
+// polled frequently by a load balancer or process supervisor.
+func (s *Store) Ping(ctx context.Context) error {
+	if err := s.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("sqlite: ping: %w", err)
+	}
+	return nil
+}
+
 // Close closes the underlying connection pool.
 func (s *Store) Close() error { return s.db.Close() }
 

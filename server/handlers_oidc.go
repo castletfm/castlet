@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -92,6 +93,21 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 func (s *Server) resolveOIDCUser(r *http.Request, id *auth.Identity) (*model.User, error) {
 	ctx := r.Context()
 
+	// When an email-domain allowlist is configured, enforce it on every
+	// sign-in path, including accounts already linked by subject, so removing
+	// a domain from the allowlist blocks its previously linked users too.
+	if len(s.allowedDomains) > 0 {
+		if id.Email == "" {
+			return nil, errors.New("Your identity provider did not share an email address.")
+		}
+		if !id.EmailVerified {
+			return nil, errors.New("Your identity provider did not verify your email address.")
+		}
+		if !s.emailDomainAllowed(id.Email) {
+			return nil, errors.New("Your email domain is not permitted to sign in.")
+		}
+	}
+
 	user, err := s.store.UserByOIDCSubject(ctx, id.Issuer, id.Subject)
 	if err == nil {
 		return user, nil
@@ -123,7 +139,11 @@ func (s *Server) resolveOIDCUser(r *http.Request, id *auth.Identity) (*model.Use
 		return nil, err
 	}
 
-	// Provision a new account (just-in-time).
+	// Provision a new account (just-in-time), but only for a verified email so
+	// a broad/multi-tenant issuer cannot self-provision arbitrary identities.
+	if !id.EmailVerified {
+		return nil, errors.New("Your identity provider did not verify your email address.")
+	}
 	name := id.Name
 	if name == "" {
 		name = id.Email
@@ -140,6 +160,19 @@ func (s *Server) resolveOIDCUser(r *http.Request, id *auth.Identity) (*model.Use
 		return nil, err
 	}
 	return user, nil
+}
+
+// emailDomainAllowed reports whether email's domain is in the configured
+// allowlist. With no allowlist, every domain is permitted.
+func (s *Server) emailDomainAllowed(email string) bool {
+	if len(s.allowedDomains) == 0 {
+		return true
+	}
+	at := strings.LastIndex(email, "@")
+	if at < 0 {
+		return false
+	}
+	return slices.Contains(s.allowedDomains, strings.ToLower(email[at+1:]))
 }
 
 func validOIDCState(r *http.Request) bool {

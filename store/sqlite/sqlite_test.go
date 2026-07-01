@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -141,6 +142,76 @@ func TestChannelsAndEpisodes(t *testing.T) {
 
 	require.NoError(t, s.DeleteEpisode(ctx, "e2"))
 	require.ErrorIs(t, s.DeleteEpisode(ctx, "e2"), store.ErrNotFound)
+}
+
+func TestReorderEpisodes(t *testing.T) {
+	s := newStore(t)
+	seedUser(t, s)
+	ctx := t.Context()
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	created := time.Now()
+	ids := []string{"e1", "e2", "e3", "e4"}
+	for i, id := range ids {
+		require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: id, ChannelID: "c1", Title: id,
+			Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptNone,
+			Position: i, CreatedAt: created, UpdatedAt: created}))
+	}
+
+	order := func(t *testing.T) []string {
+		t.Helper()
+		eps, err := s.ListEpisodes(ctx, store.EpisodeFilter{ChannelID: "c1"})
+		require.NoError(t, err)
+		out := make([]string, len(eps))
+		for i, e := range eps {
+			out[i] = e.ID
+			require.Equal(t, i, e.Position, "positions must be dense")
+		}
+		return out
+	}
+	require.Equal(t, []string{"e1", "e2", "e3", "e4"}, order(t))
+
+	// Move e2 down (swap e2/e3) -> only the two moved rows are renumbered.
+	moved := created.Add(time.Hour)
+	require.NoError(t, s.ReorderEpisodes(ctx, "c1", []string{"e1", "e3", "e2", "e4"}, moved))
+	require.Equal(t, []string{"e1", "e3", "e2", "e4"}, order(t))
+
+	// Untouched rows keep their old updated_at; moved rows are bumped.
+	e1, err := s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, created.Unix(), e1.UpdatedAt.Unix(), "unmoved episode must not be re-stamped")
+	e2, err := s.EpisodeByID(ctx, "e2")
+	require.NoError(t, err)
+	require.Equal(t, moved.Unix(), e2.UpdatedAt.Unix(), "moved episode must be re-stamped")
+
+	// orderedIDs must be an exact permutation of the channel's current ids. A
+	// stale/malformed list is rejected with ErrInvalidReorder and changes nothing.
+	before := order(t)
+	// (a) duplicate id.
+	require.ErrorIs(t, s.ReorderEpisodes(ctx, "c1", []string{"e1", "e1", "e3", "e2"}, moved),
+		store.ErrInvalidReorder)
+	require.Equal(t, before, order(t), "duplicate id must not persist any change")
+	// (b) omitted/missing id (e4 dropped, list too short).
+	require.ErrorIs(t, s.ReorderEpisodes(ctx, "c1", []string{"e1", "e3", "e2"}, moved),
+		store.ErrInvalidReorder)
+	require.Equal(t, before, order(t), "missing id must not persist any change")
+	// (c) foreign id (not in this channel, replacing e4).
+	require.ErrorIs(t, s.ReorderEpisodes(ctx, "c1", []string{"e1", "e3", "e2", "stray"}, moved),
+		store.ErrInvalidReorder)
+	require.Equal(t, before, order(t), "foreign id must not persist any change")
+
+	// (d) a valid permutation succeeds and renumbers densely.
+	require.NoError(t, s.ReorderEpisodes(ctx, "c1", []string{"e4", "e2", "e3", "e1"}, moved))
+	require.Equal(t, []string{"e4", "e2", "e3", "e1"}, order(t))
+
+	// Atomicity: a failing reorder (cancelled context) must be all-or-nothing,
+	// leaving no partial renumber behind.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	err = s.ReorderEpisodes(cancelled, "c1", []string{"e1", "e3", "e2", "e4"}, moved.Add(time.Hour))
+	require.Error(t, err)
+	require.Equal(t, []string{"e4", "e2", "e3", "e1"}, order(t), "failed reorder must not persist any change")
 }
 
 func TestTranscriptRoundTrip(t *testing.T) {

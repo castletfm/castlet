@@ -56,8 +56,24 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /e/{id}/{$}", s.handleEpisode)
 
 	// logRequests is outermost so a recovered panic still produces the normal
-	// completion line (with the 500 status); securityHeaders then sets baseline
-	// headers on every response (including error pages) before recoverPanic
-	// wraps loadUser and the handlers so their panics become a logged 500.
-	return s.logRequests(s.securityHeaders(s.recoverPanic(s.loadUser(mux))))
+	// completion line (with the 500 status); recoverPanic then wraps loadUser and
+	// the handlers so their panics become a logged 500.
+	app := s.logRequests(s.recoverPanic(s.loadUser(mux)))
+
+	// Health probes are mounted on an outer mux so they bypass request logging
+	// (they are polled constantly by load balancers / supervisors) and the auth
+	// middleware, while still getting panic recovery. Everything else falls
+	// through to the full application chain unchanged.
+	probe := func(next http.HandlerFunc) http.Handler {
+		return s.recoverPanic(next)
+	}
+	root := http.NewServeMux()
+	root.Handle("GET /healthz", probe(s.handleHealthz))
+	root.Handle("GET /readyz", probe(s.handleReadyz))
+	root.Handle("/", app)
+
+	// securityHeaders wraps the whole root mux (not each branch) so the baseline
+	// headers land on every response exactly once, including the redirects the
+	// mux itself generates for cleaned/canonical paths (e.g. //healthz).
+	return s.securityHeaders(root)
 }
