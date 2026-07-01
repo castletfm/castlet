@@ -22,9 +22,11 @@ type Store struct {
 
 var _ blob.BlobStore = (*Store)(nil)
 
-// New returns a Store rooted at dir, creating the directory tree if needed.
+// New returns a Store rooted at dir, creating the directory tree if needed. The
+// root is created owner-only (0o700) so a default umask can't leave media
+// world-readable on a shared host; object files land at 0o600 (see Put).
 func New(dir string) (*Store, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("localfs: create root %q: %w", dir, err)
 	}
 	return &Store{root: dir}, nil
@@ -57,6 +59,12 @@ func (s *Store) Put(ctx context.Context, key string, r io.Reader) (int64, error)
 	if err != nil {
 		tmp.Close()
 		return 0, fmt.Errorf("localfs: write %q: %w", key, err)
+	}
+	// os.CreateTemp already makes the file 0o600, but set it explicitly so the
+	// committed object's permissions don't depend on that implementation detail.
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return 0, fmt.Errorf("localfs: chmod %q: %w", key, err)
 	}
 	if err := tmp.Close(); err != nil {
 		return 0, fmt.Errorf("localfs: close %q: %w", key, err)
