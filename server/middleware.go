@@ -114,3 +114,11 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 	w.wrote = true
 	return w.ResponseWriter.Write(b)
 }
+
+// Unwrap exposes the wrapped ResponseWriter so http.ResponseController can
+// traverse the chain to the underlying connection. Without it, optional
+// capabilities like SetReadDeadline (used by the upload handler) would resolve
+// to http.ErrNotSupported and silently no-op.
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}

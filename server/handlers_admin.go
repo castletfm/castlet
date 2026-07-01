@@ -9,11 +9,43 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"time"
 
 	"github.com/castletfm/castlet/internal/idgen"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/store"
 )
+
+const (
+	// minUploadRate is the slowest upload throughput the server is willing to
+	// wait for, in bytes per second. 128 KiB/s (~1 Mbps) is conservative for a
+	// slow-but-legitimate link; a client sending slower than this is treated as
+	// a stalled/drip upload and eventually cut off.
+	minUploadRate = 128 << 10 // 128 KiB/s
+
+	// uploadTimeoutFloor is the minimum read window granted regardless of size,
+	// covering small uploads and transcriber/model spin-up latency.
+	uploadTimeoutFloor = 5 * time.Minute
+)
+
+// uploadReadTimeout derives the read deadline for a media upload from the
+// configured max upload size and minUploadRate: a client uploading at the
+// minimum accepted rate must be able to deliver the largest allowed body within
+// the window, i.e. max(floor, maxUploadBytes/minUploadRate). It is much larger
+// than the global readTimeout so a big upload over a slow link can proceed,
+// while a fully idle/drip upload is still eventually bounded. At the 512 MiB
+// default cap this yields ~1 hour.
+func (s *Server) uploadReadTimeout() time.Duration {
+	// Round up: a cap that is not an exact multiple of minUploadRate still needs
+	// enough seconds to deliver the trailing bytes at the minimum rate, so floor
+	// division would clip the window just below the true time required.
+	secs := (s.maxUploadBytes + minUploadRate - 1) / minUploadRate
+	d := time.Duration(secs) * time.Second
+	if d < uploadTimeoutFloor {
+		return uploadTimeoutFloor
+	}
+	return d
+}
 
 // --- dashboard --------------------------------------------------------------
 
@@ -169,6 +201,16 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	// to memory (then disk) with no limit, so the cap must wrap r.Body first —
 	// after a FormValue call it is too late.
 	r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+
+	// Extend the read deadline for this handler: the global ReadTimeout bounds
+	// body-drip on normal routes but is too short for a large upload over a slow
+	// link, so grant a generous window here. ErrNotSupported (no deadline
+	// support on the underlying conn) is harmless — the request just keeps the
+	// global deadline.
+	if err := http.NewResponseController(w).SetReadDeadline(s.now().Add(s.uploadReadTimeout())); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		s.serverError(w, r, err)
+		return
+	}
 
 	ch, ok := s.ownedChannel(w, r, r.PathValue("id"))
 	if !ok {
