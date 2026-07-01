@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -8,6 +9,32 @@ import (
 	"github.com/castletfm/castlet/worker"
 	"github.com/stretchr/testify/require"
 )
+
+// TestOpenStoreMigrateIsDatabaseOnly proves that a migration depends only on the
+// database: OpenStore + Migrate must succeed even when the OIDC issuer is
+// unreachable and the blob-store config points at a missing file. Those would
+// make app.New fail (OIDC discovery, blob construction), so the migrate command
+// must not go through it.
+func TestOpenStoreMigrateIsDatabaseOnly(t *testing.T) {
+	cfg := &config.Config{
+		DataDir: t.TempDir(),
+		// Values that would break app.New but are irrelevant to a DB migration.
+		OIDCIssuer:      "http://127.0.0.1:1/unreachable-idp",
+		BlobStoreConfig: "/nonexistent/blob-store-config.json",
+		Transcriber:     "command", // requires --transcribe-command, which is unset
+	}
+
+	st, err := OpenStore(cfg)
+	require.NoError(t, err, "opening the store must not need any other backend")
+	defer st.Close()
+
+	require.NoError(t, st.Migrate(context.Background()), "migration must depend only on the database")
+
+	// Sanity check: the same config must indeed break the full app, confirming
+	// the migrate path genuinely avoids that construction.
+	_, err = New(cfg)
+	require.Error(t, err, "app.New must fail on the unreachable/misconfigured backends")
+}
 
 // TestTuningOptionsZeroConfigUsesComponentDefaults guards against a regression
 // where a partially/manually built config.Config (e.g. the user-create path in

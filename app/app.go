@@ -52,10 +52,7 @@ type App struct {
 func New(cfg *config.Config) (*App, error) {
 	logger := newLogger(cfg.LogLevel)
 
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
-		return nil, fmt.Errorf("app: create data dir: %w", err)
-	}
-	st, err := sqlite.Open(filepath.Join(cfg.DataDir, "castlet.db"))
+	st, err := OpenStore(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +80,23 @@ func New(cfg *config.Config) (*App, error) {
 		authn:       authn,
 		logger:      logger,
 	}, nil
+}
+
+// OpenStore opens (creating the data directory if needed) the metadata store
+// described by cfg, without constructing any other backend. It does not run
+// migrations; call Migrate on the returned store. This is the single
+// store-open path shared by New and the migrate command, so a database-only
+// migration never has to build the blob store, transcriber, or OIDC
+// authenticator (whose discovery can block or fail when the IdP is down).
+func OpenStore(cfg *config.Config) (store.Store, error) {
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+		return nil, fmt.Errorf("app: create data dir: %w", err)
+	}
+	st, err := sqlite.Open(filepath.Join(cfg.DataDir, "castlet.db"))
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
 // The operational knobs all follow one invariant: a zero field means "use the
