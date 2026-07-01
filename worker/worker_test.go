@@ -39,6 +39,31 @@ func (d deadlineTranscriber) Transcribe(ctx context.Context, in transcribe.Input
 	return &transcribe.Result{Language: "en"}, nil
 }
 
+// editingTranscriber simulates an admin editing the episode's title while the
+// (slow) transcription is in flight: it performs a full-row UpdateEpisode from a
+// freshly loaded copy, exactly as an admin edit handler would, then returns a
+// transcript. The worker holds a stale copy from job start, so if it wrote the
+// whole row back the edit would be lost.
+type editingTranscriber struct {
+	st *sqlite.Store
+	id string
+}
+
+func (e editingTranscriber) Transcribe(ctx context.Context, in transcribe.Input) (*transcribe.Result, error) {
+	cur, err := e.st.EpisodeByID(ctx, e.id)
+	if err != nil {
+		return nil, err
+	}
+	cur.Title = "Edited Mid-Job"
+	cur.UpdatedAt = time.Now()
+	if err := e.st.UpdateEpisode(ctx, cur); err != nil {
+		return nil, err
+	}
+	return &transcribe.Result{Language: "en", Segments: []transcribe.Segment{
+		{StartSecs: 0, EndSecs: 1, Text: "hello"},
+	}}, nil
+}
+
 func setup(t *testing.T) (*sqlite.Store, *localfs.Store, *dbqueue.Queue) {
 	t.Helper()
 	st, err := sqlite.Open(filepath.Join(t.TempDir(), "w.db"))
@@ -120,6 +145,29 @@ func TestWorkerJobHasTimeout(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("transcriber was not invoked in time")
 	}
+}
+
+// TestWorkerDoesNotClobberConcurrentEdit proves that an admin edit to the
+// episode made while transcription is running is preserved: the worker's
+// transcript-status write must be a targeted UPDATE, not a full-row overwrite
+// from its stale copy.
+func TestWorkerDoesNotClobberConcurrentEdit(t *testing.T) {
+	st, blobs, q := setup(t)
+	id := seedEpisode(t, st, blobs, q)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	tr := editingTranscriber{st: st, id: id}
+	_, err := worker.New(st, blobs, q, tr, worker.WithPollInterval(10*time.Millisecond)).Run(ctx)
+	require.NoError(t, err)
+
+	waitStatus(t, st, id, model.TranscriptDone)
+
+	ep, err := st.EpisodeByID(t.Context(), id)
+	require.NoError(t, err)
+	require.Equal(t, "Edited Mid-Job", ep.Title,
+		"admin edit made during transcription must not be reverted by the worker")
+	require.Equal(t, model.TranscriptDone, ep.TranscriptStatus)
 }
 
 func TestWorkerNullSettlesToNone(t *testing.T) {
