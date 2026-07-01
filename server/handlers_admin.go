@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 
 	"github.com/castletfm/castlet/internal/idgen"
@@ -163,8 +164,36 @@ func (s *Server) handleEpisodeNew(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
+	// Cap the request body before anything reads it. r.FormValue/r.FormFile
+	// trigger multipart parsing, which would otherwise spool the entire upload
+	// to memory (then disk) with no limit, so the cap must wrap r.Body first —
+	// after a FormValue call it is too late.
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+
 	ch, ok := s.ownedChannel(w, r, r.PathValue("id"))
 	if !ok {
+		return
+	}
+
+	// This endpoint only handles multipart file uploads. Require a
+	// multipart/form-data Content-Type before touching the body: for any other
+	// type ParseMultipartForm falls back to ParseForm, which reads the whole
+	// request up to the (large) upload cap into memory. Guarding here avoids
+	// that allocation for non-multipart requests.
+	if mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mediaType != "multipart/form-data" {
+		s.renderError(w, r, http.StatusUnsupportedMediaType, "The upload must be sent as multipart/form-data.")
+		return
+	}
+
+	// Parse the (capped) multipart body explicitly so an over-cap upload
+	// surfaces as a clean 413 instead of being silently swallowed by FormValue.
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			s.renderError(w, r, http.StatusRequestEntityTooLarge, "The uploaded file is too large.")
+			return
+		}
+		s.renderError(w, r, http.StatusBadRequest, "The upload could not be read.")
 		return
 	}
 
@@ -180,8 +209,7 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cap the request body, then read the uploaded file.
-	r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+	// Read the uploaded file from the already-parsed multipart form.
 	file, header, err := r.FormFile("media")
 	if err != nil {
 		reRender(http.StatusBadRequest, "A media file is required (audio or video).")
@@ -189,7 +217,7 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	mime := detectUploadMIME(header)
+	mimeType := detectUploadMIME(header)
 	// Content-address the media: the blob key is the sha256 of the bytes, so a
 	// media URL is permanently bound to exactly those bytes — they cannot change
 	// without becoming a different URL. (The uploaded file is seekable, so we can
@@ -216,8 +244,8 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 		Title:            form.Title,
 		Description:      form.Description,
 		MediaKey:         mediaKey,
-		MediaMIME:        mime,
-		MediaKind:        model.DetectMediaKind(mime),
+		MediaMIME:        mimeType,
+		MediaKind:        model.DetectMediaKind(mimeType),
 		MediaBytes:       n,
 		Language:         form.Language,
 		Status:           model.EpisodeDraft,
