@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"mime/multipart"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -231,4 +233,102 @@ func TestUploadDuplicateMediaAbortsFast(t *testing.T) {
 	require.Equal(t, "close", rec.Header().Get("Connection"))
 	require.True(t, fake.called)
 	assertNoStagedFiles(t, uploadDir)
+}
+
+// countingReader counts the bytes read through it, so a test can prove the
+// handler stops reading the body early instead of consuming the whole thing.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// TestUploadAggregateFieldBudgetHardCap proves the total text ever read is
+// hard-capped at ~maxUploadFieldsBytes regardless of how the client splits it:
+// a body whose fields sum far over the aggregate budget is rejected after
+// reading only about the budget, not the whole (much larger) body.
+func TestUploadAggregateFieldBudgetHardCap(t *testing.T) {
+	s, _, _, uploadDir := newUploadServer(t)
+	s.maxUploadBytes = 8 << 20 // well above the body so the field cap (not the body cap) trips
+
+	// Many fields, each under the per-field cap, summing far over the aggregate
+	// budget. Names are unknown (read+discarded) but still counted against it.
+	fields := map[string]string{"title": "Hello"}
+	const per = 40 << 10 // 40 KiB < maxUploadFieldBytes (64 KiB)
+	const count = 50     // 50*40KiB = 2 MiB >> maxUploadFieldsBytes (256 KiB)
+	for i := range count {
+		fields["f"+strconv.Itoa(i)] = strings.Repeat("x", per)
+	}
+	body, contentType := buildUpload(t, fields,
+		[]filePart{{field: "media", filename: "clip.mp3", contentType: "audio/mpeg", content: []byte("small media")}})
+	total := int64(body.Len())
+
+	counter := &countingReader{r: body}
+	req := httptest.NewRequest(http.MethodPost, "/admin/channels/c1/episodes", counter)
+	req.Header.Set("Content-Type", contentType)
+	req.ContentLength = total
+	req.SetPathValue("id", "c1")
+	req = req.WithContext(context.WithValue(req.Context(), userCtxKey, &model.User{ID: "u1"}))
+	rec := httptest.NewRecorder()
+	fake := &deadlineWriter{ResponseWriter: rec}
+
+	s.handleEpisodeCreate(fake, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code, "fields over the aggregate budget must be rejected")
+	require.Equal(t, "close", rec.Header().Get("Connection"))
+	require.True(t, fake.called)
+	// The handler must have stopped reading well before the whole body: the hard
+	// cap bounds the text read to ~maxUploadFieldsBytes plus one field + multipart
+	// framing, far below the ~2 MiB body.
+	assert.Less(t, counter.n, int64(maxUploadFieldsBytes+2*maxUploadFieldBytes),
+		"total text read must be bounded by the aggregate budget, not the field sum")
+	assert.Less(t, counter.n, total/2, "must stop reading well before consuming the whole body")
+	assertNoStagedFiles(t, uploadDir)
+}
+
+// failingBlobs makes Put fail, to simulate a storage backend fault.
+type failingBlobs struct{ blob.BlobStore }
+
+func (failingBlobs) Put(context.Context, string, io.Reader) (int64, error) {
+	return 0, errors.New("blob store unavailable")
+}
+
+// TestUploadServerStagingFailureReturns500 proves a server-side staging fault
+// (here os.CreateTemp failing because the staging dir does not exist) yields a
+// 5xx, not a client 4xx.
+func TestUploadServerStagingFailureReturns500(t *testing.T) {
+	s, _, _, uploadDir := newUploadServer(t)
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	s.uploadTempDir = missing // CreateTemp will fail here
+
+	body, contentType := buildUpload(t, map[string]string{"title": "Hello"},
+		[]filePart{{field: "media", filename: "clip.mp3", contentType: "audio/mpeg", content: []byte("audio")}})
+	req := newUploadRequest(body, contentType)
+	rec := httptest.NewRecorder()
+
+	s.handleEpisodeCreate(rec, req)
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code,
+		"a temp-file staging failure is a server error, not a client 4xx")
+	assertNoStagedFiles(t, uploadDir) // original staging dir stays empty; no leak
+}
+
+// TestUploadBlobPutFailureReturns500 proves a blob.Put failure yields a 5xx.
+func TestUploadBlobPutFailureReturns500(t *testing.T) {
+	s, _, blobs, _ := newUploadServer(t)
+	s.blobs = failingBlobs{blobs}
+
+	body, contentType := buildUpload(t, map[string]string{"title": "Hello"},
+		[]filePart{{field: "media", filename: "clip.mp3", contentType: "audio/mpeg", content: []byte("audio")}})
+	req := newUploadRequest(body, contentType)
+	rec := httptest.NewRecorder()
+
+	s.handleEpisodeCreate(rec, req)
+
+	require.Equal(t, http.StatusInternalServerError, rec.Code, "a blob.Put failure must be a 500")
 }

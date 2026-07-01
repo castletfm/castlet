@@ -89,11 +89,18 @@ type stagedUpload struct {
 
 func (u *stagedUpload) field(name string) string { return u.fields[name] }
 
-// errUploadFields is returned when the non-file fields violate a bound (a single
-// field or the aggregate is too large, too many parts, or an unexpected file
-// part). The caller treats it as a client error and aborts the connection
-// promptly rather than draining the offending part.
+// errUploadFields is returned when the request violates an upload bound (a single
+// field or the aggregate text is too large, too many parts, or a missing/extra/
+// duplicate media part). It is a CLIENT error: the caller aborts the connection
+// promptly (rather than draining the offending part) and renders a 4xx.
 var errUploadFields = errors.New("server: upload form fields exceed limits")
+
+// errServerStaging wraps a SERVER-side staging/storage failure (temp-file
+// create/write/seek). The caller renders a 5xx and logs it, so a disk,
+// permission, or storage fault is not misreported as a client 4xx. Client-side
+// problems (malformed/oversized upload) are returned unwrapped (or as
+// errUploadFields / *http.MaxBytesError) and map to a 4xx instead.
+var errServerStaging = errors.New("server: upload staging failed")
 
 // stageMultipartUpload streams the multipart request without buffering the media
 // into memory or the system /tmp: the "media" file part is streamed into a temp
@@ -148,32 +155,43 @@ func (s *Server) stageMultipartUpload(r *http.Request) (_ *stagedUpload, err err
 			u.mime = detectUploadMIME(part.Header.Get("Content-Type"), part.FileName())
 			f, ferr := os.CreateTemp(s.uploadTempDir, "castlet-upload-*")
 			if ferr != nil {
-				return nil, ferr // do not Close/drain the part
+				return nil, errors.Join(errServerStaging, ferr) // server: no Close/drain
 			}
 			u.file = f
 			hasher := sha256.New()
+			// io.Copy is bounded by the MaxBytesReader on r.Body; an over-cap body
+			// surfaces as *http.MaxBytesError (the caller classifies that as a client
+			// 413). Any other copy failure is a temp-file write / storage fault, so
+			// mark it as a server error. Either way, do not Close/drain the part.
 			if _, cerr := io.Copy(io.MultiWriter(f, hasher), part); cerr != nil {
-				return nil, cerr // do not Close/drain
+				return nil, errors.Join(errServerStaging, cerr)
 			}
 			part.Close() // fully consumed to EOF above; no drain
 			u.mediaKey = hex.EncodeToString(hasher.Sum(nil))
 			continue
 		}
 
-		// Non-file field: read bounded (limit+1 so an over-limit field is caught
-		// without draining it). A field or aggregate over its cap is a client error.
-		v, rerr := io.ReadAll(io.LimitReader(part, maxUploadFieldBytes+1))
+		// Non-file field: bound EACH read to the smaller of the per-field cap and
+		// the REMAINING aggregate budget, so the TOTAL text ever read is hard-capped
+		// at ~maxUploadFieldsBytes no matter how the client splits it across fields
+		// (not the per-field cap times the field count). Reading limit+1 lets an
+		// over-limit field be caught without draining it. A read error here is a body
+		// read (client) — including *http.MaxBytesError — so it is returned unwrapped
+		// (the caller maps it to a 4xx), not marked as a server error.
+		limit := maxUploadFieldBytes
+		if rem := maxUploadFieldsBytes - fieldsTotal; rem < limit {
+			limit = rem
+		}
+		v, rerr := io.ReadAll(io.LimitReader(part, int64(limit)+1))
 		if rerr != nil {
 			return nil, rerr // do not Close/drain
 		}
-		if len(v) > maxUploadFieldBytes {
-			return nil, errUploadFields // over-limit field: do not Close/drain
+		if len(v) > limit {
+			// Over the per-field cap or the remaining aggregate budget: client error.
+			return nil, errUploadFields // do not Close/drain
 		}
 		fieldsTotal += len(v)
-		if fieldsTotal > maxUploadFieldsBytes {
-			return nil, errUploadFields // aggregate over budget: do not Close/drain
-		}
-		part.Close() // fully consumed (read < limit+1 -> reached part EOF); no drain
+		part.Close() // fully consumed (read <= limit -> reached part EOF); no drain
 		if knownUploadFields[name] {
 			u.fields[name] = string(v)
 		}
@@ -181,7 +199,7 @@ func (s *Server) stageMultipartUpload(r *http.Request) (_ *stagedUpload, err err
 	}
 	if u.file != nil {
 		if _, serr := u.file.Seek(0, io.SeekStart); serr != nil {
-			return nil, serr
+			return nil, errors.Join(errServerStaging, serr) // server: rewind failed
 		}
 	}
 	return u, nil
@@ -433,13 +451,22 @@ func (s *Server) handleEpisodeCreate(w http.ResponseWriter, r *http.Request) {
 	// under the long upload window before or after the 4xx is written.
 	staged, err := s.stageMultipartUpload(r)
 	if err != nil {
+		// Tear the connection down (revoke the long deadline, mark it to close) on
+		// every failure, then classify: an over-cap body is a 413, a server-side
+		// staging/storage fault is a logged 500, and any other problem (malformed
+		// multipart, over-limit field, missing/duplicate/extra media part, too many
+		// parts) is a client 400. errServerStaging is checked after MaxBytesError so
+		// an over-cap copy still reports 413, not 500.
 		s.abortUpload(w)
 		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
+		switch {
+		case errors.As(err, &maxErr):
 			s.renderError(w, r, http.StatusRequestEntityTooLarge, "The uploaded file is too large.")
-			return
+		case errors.Is(err, errServerStaging):
+			s.serverError(w, r, err) // logs + renders 500
+		default:
+			s.renderError(w, r, http.StatusBadRequest, "The upload could not be read.")
 		}
-		s.renderError(w, r, http.StatusBadRequest, "The upload could not be read.")
 		return
 	}
 	// Remove the staged media on EVERY exit path (success or error) once it exists.
