@@ -133,6 +133,17 @@ func (s *Store) ListChannelsByUser(ctx context.Context, userID string) ([]*model
 		`SELECT `+channelCols+` FROM channels WHERE user_id = ? ORDER BY title COLLATE NOCASE`, userID)
 }
 
+func (s *Store) ChannelImageKeyExists(ctx context.Context, key string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM channels WHERE image_key = ? AND image_key <> ''`,
+		key).Scan(&n)
+	if err != nil {
+		return false, mapErr(err)
+	}
+	return n > 0, nil
+}
+
 func (s *Store) channelList(ctx context.Context, query string, args ...any) ([]*model.Channel, error) {
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -297,6 +308,17 @@ func (s *Store) EpisodeByID(ctx context.Context, id string) (*model.Episode, err
 func (s *Store) EpisodeByMediaKey(ctx context.Context, key string) (*model.Episode, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+episodeCols+` FROM episodes WHERE media_key = ?`, key)
+	e, err := scanEpisode(row)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	return e, nil
+}
+
+func (s *Store) PublishedEpisodeByMediaKey(ctx context.Context, key string) (*model.Episode, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+episodeCols+` FROM episodes WHERE media_key = ? AND status = ? LIMIT 1`,
+		key, string(model.EpisodePublished))
 	e, err := scanEpisode(row)
 	if err != nil {
 		return nil, mapErr(err)
