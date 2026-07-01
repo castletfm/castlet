@@ -18,8 +18,10 @@ const userCtxKey ctxKey = iota
 // invalid session simply leaves the context user nil.
 func (s *Server) loadUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if uid, ok := s.sessions.UserID(r, s.now()); ok {
-			if u, err := s.store.UserByID(r.Context(), uid); err == nil {
+		if uid, epoch, ok := s.sessions.UserID(r, s.now()); ok {
+			// The cookie's epoch must still match the user's current epoch;
+			// bumping it (logout / password change) invalidates older sessions.
+			if u, err := s.store.UserByID(r.Context(), uid); err == nil && u.SessionEpoch == epoch {
 				r = r.WithContext(context.WithValue(r.Context(), userCtxKey, u))
 			}
 		}

@@ -48,6 +48,77 @@ func TestUsers(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrConflict)
 }
 
+func TestBumpSessionEpoch(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	u := seedUser(t, s)
+	require.Zero(t, u.SessionEpoch, "new users start at epoch 0")
+
+	require.NoError(t, s.BumpSessionEpoch(ctx, u.ID))
+	got, err := s.UserByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, got.SessionEpoch)
+
+	require.NoError(t, s.BumpSessionEpoch(ctx, u.ID))
+	got, err = s.UserByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, 2, got.SessionEpoch)
+
+	require.ErrorIs(t, s.BumpSessionEpoch(ctx, "nope"), store.ErrNotFound)
+}
+
+// CreateUser must never persist a caller-supplied session_epoch: the column
+// defaults to 0 and BumpSessionEpoch is its sole writer. Writing it here would
+// let a stale in-memory epoch seed a revoked-looking (or pre-bumped) value.
+func TestCreateUserIgnoresSessionEpoch(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	require.NoError(t, s.CreateUser(ctx, &model.User{
+		ID: "u1", Email: "a@example.com", DisplayName: "A", PasswordHash: "x",
+		SessionEpoch: 99, CreatedAt: time.Now(),
+	}))
+
+	got, err := s.UserByID(ctx, "u1")
+	require.NoError(t, err)
+	require.Zero(t, got.SessionEpoch, "CreateUser must ignore a caller-supplied epoch and default to 0")
+}
+
+// A generic UpdateUser must never write session_epoch: a stale user struct
+// (holding an older epoch) must not clobber an epoch a prior BumpSessionEpoch
+// already advanced, which would re-validate cookies a "log out everywhere"
+// revoked.
+func TestUpdateUserDoesNotClobberSessionEpoch(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	u := seedUser(t, s) // epoch 0
+	require.NoError(t, s.BumpSessionEpoch(ctx, u.ID))
+
+	// u still carries the stale epoch 0; write it back via a normal update.
+	u.DisplayName = "Renamed"
+	require.NoError(t, s.UpdateUser(ctx, u))
+
+	got, err := s.UserByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, "Renamed", got.DisplayName, "UpdateUser still persists other fields")
+	require.Equal(t, 1, got.SessionEpoch, "UpdateUser must not reset a bumped epoch")
+}
+
+// Migrate must be safe to run repeatedly (it runs on every startup), including
+// its ALTER TABLE backfills, and must preserve existing data.
+func TestMigrateIdempotent(t *testing.T) {
+	s := newStore(t) // already migrated once by newStore
+	ctx := t.Context()
+	u := seedUser(t, s)
+	require.NoError(t, s.BumpSessionEpoch(ctx, u.ID))
+
+	require.NoError(t, s.Migrate(ctx))
+	require.NoError(t, s.Migrate(ctx))
+
+	got, err := s.UserByID(ctx, u.ID)
+	require.NoError(t, err)
+	require.Equal(t, 1, got.SessionEpoch, "re-running Migrate must not reset data")
+}
+
 func TestUserOIDC(t *testing.T) {
 	s := newStore(t)
 	ctx := t.Context()

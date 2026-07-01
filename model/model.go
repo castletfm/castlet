@@ -17,6 +17,7 @@ type User struct {
 	PasswordHash string // empty for OIDC-only accounts
 	OIDCIssuer   string // identity provider issuer, empty if not linked
 	OIDCSubject  string // stable subject within the issuer, empty if not linked
+	SessionEpoch int    // revocation counter; sessions are valid only while their epoch matches
 	CreatedAt    time.Time
 }
 

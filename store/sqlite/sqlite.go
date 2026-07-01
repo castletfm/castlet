@@ -91,6 +91,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	for _, ddl := range []string{
 		`ALTER TABLE users ADD COLUMN oidc_issuer TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN oidc_subject TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE users ADD COLUMN session_epoch INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE episodes ADD COLUMN language TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE episodes ADD COLUMN position INTEGER NOT NULL DEFAULT 0`,
 	} {

@@ -87,7 +87,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.sessions.Issue(w, user.ID, s.now())
+	s.sessions.Issue(w, user.ID, user.SessionEpoch, s.now())
 	s.redirect(w, r, "/admin/")
 }
 
@@ -137,7 +137,17 @@ func (s *Server) resolveOIDCUser(r *http.Request, id *auth.Identity) (*model.Use
 		if err := s.store.UpdateUser(ctx, existing); err != nil {
 			return nil, err
 		}
-		return existing, nil
+		// Reload before returning so the caller issues the session from the CURRENT
+		// epoch. UpdateUser deliberately never writes session_epoch, so the struct
+		// still carries whatever epoch UserByEmail read; an epoch bump ("log out
+		// everywhere" / password change) racing between that read and here would
+		// otherwise mint a cookie at the stale epoch that is immediately revoked.
+		// Honor the "reload before issuing a session after an update" contract.
+		reloaded, err := s.store.UserByID(ctx, existing.ID)
+		if err != nil {
+			return nil, err
+		}
+		return reloaded, nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
