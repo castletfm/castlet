@@ -18,11 +18,18 @@ import (
 	"time"
 
 	"github.com/castletfm/castlet/blob"
+	"github.com/castletfm/castlet/internal/metrics"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/queue"
 	"github.com/castletfm/castlet/store"
 	"github.com/castletfm/castlet/transcribe"
 	"github.com/lestrrat-go/option/v3"
+)
+
+// Metric names the worker records into its registry.
+const (
+	metricJobsTotal   = "transcription_jobs_total"
+	metricLastSuccess = "worker_last_success_timestamp_seconds"
 )
 
 // ErrWorkerClosed is recorded on the Controller when the worker stops because
@@ -100,6 +107,7 @@ type Worker struct {
 	jobTimeout    JobTimeoutPolicy
 	settleTimeout time.Duration
 	logger        *slog.Logger
+	metrics       *metrics.Registry
 }
 
 // Option configures New.
@@ -110,6 +118,7 @@ type (
 	identJobTimeout    struct{}
 	identSettleTimeout struct{}
 	identLogger        struct{}
+	identMetrics       struct{}
 )
 
 // WithPollInterval sets how often the worker polls when the queue is empty
@@ -128,6 +137,11 @@ func WithSettleTimeout(d time.Duration) Option { return option.New(identSettleTi
 
 // WithLogger sets the structured logger (default slog.Default()).
 func WithLogger(l *slog.Logger) Option { return option.New(identLogger{}, l) }
+
+// WithMetrics sets the metrics registry the worker records job outcomes and its
+// last-success timestamp into. Share one registry with the server so /metrics
+// reports both. When unset, the worker records into a private registry.
+func WithMetrics(r *metrics.Registry) Option { return option.New(identMetrics{}, r) }
 
 // New constructs a Worker from its dependencies.
 func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, tr transcribe.Transcriber, options ...Option) *Worker {
@@ -152,9 +166,16 @@ func New(st store.Store, blobs blob.BlobStore, q queue.JobQueue, tr transcribe.T
 			}
 		case identLogger:
 			w.logger = option.MustGet[*slog.Logger](o)
+		case identMetrics:
+			w.metrics = option.MustGet[*metrics.Registry](o)
 		}
 	}
 	w.jobTimeout = w.jobTimeout.withDefaults()
+	if w.metrics == nil {
+		w.metrics = metrics.New()
+	}
+	w.metrics.Register(metricJobsTotal, metrics.Counter, "Transcription job attempts by outcome (success, skipped, or failure).")
+	w.metrics.Register(metricLastSuccess, metrics.Gauge, "Unix timestamp of the worker's last successful transcription.")
 	return w
 }
 
@@ -245,6 +266,7 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 		markCtx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
 		defer cancel()
 		w.markTranscript(markCtx, job, model.TranscriptFailed)
+		w.metrics.Inc(metricJobsTotal, "outcome", "failure")
 		return true, nil
 	}
 	s, herr := w.handle(ctx, job)
@@ -272,10 +294,29 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 	// recorded, so Nack the job for retry rather than leave it done with the
 	// episode stuck processing.
 	ctx2, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
-	serr := w.settleAndComplete(ctx2, job, s)
+	committed, serr := w.settleAndComplete(ctx2, job, s)
 	cancel()
 	if serr != nil {
 		return true, w.fail(job, serr)
+	}
+	// Only a settlement that actually committed is counted. When the claim was
+	// lost to a reclaim the settlement is discarded as a no-op (committed ==
+	// false); the reclaiming attempt owns the job and will record its own outcome,
+	// so counting this stale no-op would double-count and wrongly advance
+	// last-success.
+	if committed {
+		// A committed settlement is only a real success when it actually produced
+		// a transcript (terminal status Done / transcript != nil). A committed
+		// TranscriptNone is the unsupported/no-op path (e.g. the null transcriber):
+		// nothing was transcribed, so count it as "skipped" and do NOT advance
+		// last-success — otherwise /metrics would report a successful transcription
+		// and move the worker's last-success forward without any transcript.
+		if s.status == model.TranscriptDone {
+			w.metrics.Inc(metricJobsTotal, "outcome", "success")
+			w.metrics.Set(metricLastSuccess, float64(time.Now().Unix()))
+		} else {
+			w.metrics.Inc(metricJobsTotal, "outcome", "skipped")
+		}
 	}
 	return true, nil
 }
@@ -297,6 +338,7 @@ func (w *Worker) ack(job *model.Job) error {
 // settlement context, which may already be exhausted) so the queue state
 // transition always runs live. cause is returned so the loop can log it.
 func (w *Worker) fail(job *model.Job, cause error) error {
+	w.metrics.Inc(metricJobsTotal, "outcome", "failure")
 	ctx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
 	defer cancel()
 	dead, nerr := w.queue.Nack(ctx, job, cause)
@@ -327,20 +369,25 @@ func (w *Worker) fail(job *model.Job, cause error) error {
 // episode now — so it is not an error: discard the stale result, changing
 // nothing. Any other write error is returned so the caller Nacks a job whose
 // result was not durably recorded.
-func (w *Worker) settleAndComplete(ctx context.Context, job *model.Job, s *settlement) error {
-	err := w.store.SettleEpisodeTranscriptAndCompleteJob(ctx, job.ID, job.Attempts, s.ep.ID, s.transcript, s.status, time.Now())
+//
+// committed reports whether the settlement was actually persisted: true only when
+// the fenced write landed, false when it was discarded as a stale no-op. The
+// caller uses this to record a success outcome ONLY for a real commit — a stale
+// no-op belongs to the reclaiming attempt and must not be counted here.
+func (w *Worker) settleAndComplete(ctx context.Context, job *model.Job, s *settlement) (committed bool, err error) {
+	err = w.store.SettleEpisodeTranscriptAndCompleteJob(ctx, job.ID, job.Attempts, s.ep.ID, s.transcript, s.status, time.Now())
 	if errors.Is(err, store.ErrStaleClaim) {
 		w.logger.Warn("transcription claim lost to reclaim; discarding stale settlement",
 			"job", job.ID, "episode", s.ep.ID)
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("worker: settle episode transcript and complete job: %w", err)
+		return false, fmt.Errorf("worker: settle episode transcript and complete job: %w", err)
 	}
 	if s.transcript != nil {
 		w.logger.Info("transcribed episode", "episode", s.ep.ID, "segments", len(s.transcript.Segments))
 	}
-	return nil
+	return true, nil
 }
 
 // handle runs a job's work under ctx and returns the terminal settlement to be

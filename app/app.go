@@ -21,6 +21,7 @@ import (
 	"github.com/castletfm/castlet/blob/localfs"
 	"github.com/castletfm/castlet/blob/s3"
 	"github.com/castletfm/castlet/config"
+	"github.com/castletfm/castlet/internal/metrics"
 	"github.com/castletfm/castlet/internal/session"
 	"github.com/castletfm/castlet/queue"
 	"github.com/castletfm/castlet/queue/dbqueue"
@@ -99,8 +100,13 @@ func (a *App) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// One registry shared by the worker and server so a single /metrics scrape
+	// covers HTTP, queue depth, and transcription outcomes.
+	reg := metrics.New()
+
 	wk := worker.New(a.store, a.blobs, a.queue, a.transcriber,
 		worker.WithLogger(a.logger),
+		worker.WithMetrics(reg),
 		worker.WithJobTimeout(worker.JobTimeoutPolicy{
 			Factor: a.cfg.TranscribeTimeoutFactor,
 			Max:    a.cfg.TranscribeTimeout,
@@ -117,6 +123,7 @@ func (a *App) Serve(ctx context.Context) error {
 		server.WithSiteName(a.cfg.SiteName),
 		server.WithAllowSignup(a.cfg.AllowSignup),
 		server.WithLogger(a.logger),
+		server.WithMetrics(reg),
 	}
 	if a.authn != nil {
 		opts = append(opts, server.WithAuthenticator(a.authn))

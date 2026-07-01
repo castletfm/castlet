@@ -106,11 +106,26 @@ func (s *Store) JobByID(ctx context.Context, id string) (*model.Job, error) {
 	return j, nil
 }
 
-// ClaimJob atomically selects and locks the oldest runnable job. A job is
-// runnable when its RunAfter is due and it is either pending or processing with
-// an expired lease (its worker crashed before finishing); the latter is how a
-// stuck job is reclaimed. Because the pool is a single writer, the
-// SELECT-then-UPDATE inside one transaction is race-free across worker
+// runnableJobPredicate is the SQL WHERE fragment that identifies the jobs
+// ClaimJob can hand out right now: pending or processing rows whose run_after is
+// due (run_after <= now). A pending job normally has a past run_after (runs
+// immediately) but may carry a FUTURE run_after when Nack/RescheduleJob defers a
+// retry — such a job is NOT yet runnable. A processing job is runnable only once
+// its lease deadline (a future run_after set at claim time) has elapsed, i.e.
+// its worker crashed and the lease expired.
+//
+// The three placeholders bind, in order: JobPending, JobProcessing, toUnix(now).
+// CountPendingJobs reuses this exact fragment and argument order so the
+// queue-depth gauge counts precisely the set ClaimJob could return — no more, no
+// less. Keep them in lockstep; changing the runnable rule means changing this
+// const alone.
+const runnableJobPredicate = `status IN (?, ?) AND run_after <= ?`
+
+// ClaimJob atomically selects and locks the oldest runnable job (see
+// runnableJobPredicate): its RunAfter is due and it is either pending or
+// processing with an expired lease (its worker crashed before finishing); the
+// latter is how a stuck job is reclaimed. Because the pool is a single writer,
+// the SELECT-then-UPDATE inside one transaction is race-free across worker
 // goroutines and processes sharing the file.
 func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Time, lease time.Duration) (*model.Job, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -122,7 +137,7 @@ func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Ti
 	// A freshly leased processing job has run_after in the future, so the
 	// run_after <= now gate only reclaims processing jobs whose lease expired.
 	query := `SELECT id, kind, payload, status, attempts, last_error, run_after, created_at, updated_at
-		FROM jobs WHERE status IN (?, ?) AND run_after <= ?`
+		FROM jobs WHERE ` + runnableJobPredicate
 	args := []any{string(model.JobPending), string(model.JobProcessing), toUnix(now)}
 	if len(kinds) > 0 {
 		ph := make([]string, len(kinds))
@@ -225,6 +240,24 @@ func (s *Store) setJobStatus(ctx context.Context, id string, token int, status m
 		return store.ErrStaleClaim
 	}
 	return nil
+}
+
+// CountPendingJobs counts the runnable job backlog: exactly the rows ClaimJob
+// could return right now. It reuses runnableJobPredicate (and its argument
+// order) verbatim, so the count matches ClaimJob cell-for-cell — a ready pending
+// job counts; a pending retry with a FUTURE run_after does not; a processing job
+// counts iff its lease has expired (run_after <= now). The same whole-second
+// precision (toUnix) and injected now keep the gauge and ClaimJob on one clock,
+// so the queue-depth gauge neither over- nor under-reports the backlog.
+func (s *Store) CountPendingJobs(ctx context.Context, now time.Time) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM jobs WHERE `+runnableJobPredicate,
+		string(model.JobPending), string(model.JobProcessing), toUnix(now)).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: count pending jobs: %w", mapErr(err))
+	}
+	return n, nil
 }
 
 func scanJob(sc interface{ Scan(...any) error }) (*model.Job, error) {

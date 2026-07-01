@@ -773,3 +773,58 @@ func TestJobClaimLeaseNotReclaimedBeforeDeadline(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "j1", reclaimed.ID)
 }
+
+// TestCountPendingJobsCountsRunnableBacklog proves the queue-depth gauge counts
+// EXACTLY the set ClaimJob could return right now, one cell of the runnable
+// truth table at a time:
+//   - a ready pending job (run_after <= now) counts;
+//   - a pending retry deferred to a FUTURE run_after (as Nack/RescheduleJob
+//     sets) does NOT count — it is not yet runnable;
+//   - a processing job whose lease expired (run_after <= now) counts;
+//   - a processing job with a live lease (run_after > now) does NOT count.
+//
+// This guards against the gauge over-reporting future-scheduled retries as
+// backlog, and under-reporting a crashed/expired job that is immediately
+// reclaimable.
+func TestCountPendingJobsCountsRunnableBacklog(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	// A plain pending job (due now) is part of the backlog.
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "pending", Kind: model.JobTranscribe, Payload: "{}",
+		Status: model.JobPending, RunAfter: now, CreatedAt: now, UpdatedAt: now}))
+
+	// A pending job scheduled far in the future (a deferred retry) is NOT yet
+	// runnable and must never be counted at any instant tested below.
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "future", Kind: model.JobTranscribe, Payload: "{}",
+		Status: model.JobPending, RunAfter: now.Add(time.Hour), CreatedAt: now, UpdatedAt: now}))
+
+	n, err := s.CountPendingJobs(ctx, now)
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "a future-scheduled pending retry is not runnable backlog")
+
+	// Claim the ready one: now processing with a live lease, so it is NOT counted;
+	// the future pending job is still not due either.
+	lease := time.Minute
+	claimed, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, lease)
+	require.NoError(t, err)
+	require.Equal(t, "pending", claimed.ID)
+
+	n, err = s.CountPendingJobs(ctx, now)
+	require.NoError(t, err)
+	require.Equal(t, 0, n, "a processing job with a live lease is not runnable")
+
+	// Once the lease expires, the crashed job is reclaimable and counts again. The
+	// future pending job (now+1h) is still not due at now+lease+1s, so the count
+	// stays at 1.
+	afterExpiry := now.Add(lease).Add(time.Second)
+	n, err = s.CountPendingJobs(ctx, afterExpiry)
+	require.NoError(t, err)
+	require.Equal(t, 1, n, "an expired processing job is reclaimable backlog")
+
+	// The count matches ClaimJob's reclaim decision at the same instant.
+	reclaimed, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, afterExpiry, lease)
+	require.NoError(t, err)
+	require.Equal(t, "pending", reclaimed.ID)
+}

@@ -225,4 +225,13 @@ type Store interface {
 	// 'processing'. It returns ErrStaleClaim when the job was reclaimed or is
 	// already in a terminal state (already settled).
 	FailJob(ctx context.Context, id string, token int, cause string) error
+	// CountPendingJobs returns the size of the runnable job backlog: exactly the
+	// jobs ClaimJob could return as of now — pending or processing rows whose
+	// run_after is due (run_after <= now). A pending retry deferred to a future
+	// run_after is not yet runnable and is not counted; a processing job counts
+	// only once its lease has expired. This mirrors ClaimJob's runnable predicate
+	// so the backing queue-depth metric neither over- nor under-reports the
+	// backlog. now is supplied by the caller so it shares the caller's clock; it
+	// should stay cheap.
+	CountPendingJobs(ctx context.Context, now time.Time) (int, error)
 }

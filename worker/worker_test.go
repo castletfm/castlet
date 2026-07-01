@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/castletfm/castlet/blob/localfs"
+	"github.com/castletfm/castlet/internal/metrics"
 	"github.com/castletfm/castlet/model"
 	"github.com/castletfm/castlet/queue/dbqueue"
 	"github.com/castletfm/castlet/store"
@@ -142,6 +143,32 @@ func TestWorkerTranscribes(t *testing.T) {
 
 	cancel()
 	require.NoError(t, ctrl.Wait())
+}
+
+// TestWorkerMetrics asserts a completed transcription bumps the success counter
+// and records a last-success timestamp in the shared registry.
+func TestWorkerMetrics(t *testing.T) {
+	st, blobs, q := setup(t)
+	id := seedEpisode(t, st, blobs, q)
+
+	reg := metrics.New()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	ctrl, err := worker.New(st, blobs, q, fakeTranscriber{},
+		worker.WithPollInterval(10*time.Millisecond), worker.WithMetrics(reg)).Run(ctx)
+	require.NoError(t, err)
+
+	waitStatus(t, st, id, model.TranscriptDone)
+	cancel()
+	require.NoError(t, ctrl.Wait())
+
+	var b strings.Builder
+	_, err = reg.WriteTo(&b)
+	require.NoError(t, err)
+	out := b.String()
+	require.Contains(t, out, `transcription_jobs_total{outcome="success"} 1`)
+	require.Contains(t, out, "worker_last_success_timestamp_seconds ")
+	require.NotContains(t, out, `transcription_jobs_total{outcome="failure"}`)
 }
 
 // TestWorkerJobHasTimeout asserts the worker hands the transcriber a context
@@ -592,8 +619,9 @@ func TestWorkerReclaimDuringJobCannotDowngrade(t *testing.T) {
 		job:    seedClaimedJob(t, st, "j1", "e1"),
 		nacked: make(chan struct{}),
 	}
-	_, err = worker.New(st, blobs, q, reclaimingTranscriber{st: st},
-		worker.WithPollInterval(10*time.Millisecond)).Run(wctx)
+	reg := metrics.New()
+	ctrl, err := worker.New(st, blobs, q, reclaimingTranscriber{st: st},
+		worker.WithPollInterval(10*time.Millisecond), worker.WithMetrics(reg)).Run(wctx)
 	require.NoError(t, err)
 
 	waitStatus(t, st, "e1", model.TranscriptDone)
@@ -618,15 +646,40 @@ func TestWorkerReclaimDuringJobCannotDowngrade(t *testing.T) {
 		t.Fatal("a stale settlement must be discarded silently, not turned into a Nack")
 	default:
 	}
+
+	// Drain the worker to a full stop so the original attempt's terminal
+	// bookkeeping (its stale, discarded settlement) has definitely run before we
+	// inspect metrics. A stale no-op is not a real success: it must not increment
+	// the success counter nor advance last-success — the reclaiming attempt owns
+	// the outcome. Counting it here would double-count and wrongly move the
+	// worker's last-success forward.
+	cancel()
+	require.NoError(t, ctrl.Wait())
+
+	var b strings.Builder
+	_, err = reg.WriteTo(&b)
+	require.NoError(t, err)
+	out := b.String()
+	require.NotContains(t, out, `transcription_jobs_total{outcome="success"}`,
+		"a stale reclaimed settlement must not be counted as a success")
+	// last-success has no value written (only its # HELP/# TYPE headers), so no
+	// data line for it should exist. A data line starts with the bare metric name
+	// and a space; the header lines start with "# ".
+	for ln := range strings.SplitSeq(out, "\n") {
+		require.False(t, strings.HasPrefix(ln, "worker_last_success_timestamp_seconds "),
+			"a stale reclaimed settlement must not advance last-success, got line: %q", ln)
+	}
 }
 
 func TestWorkerNullSettlesToNone(t *testing.T) {
 	st, blobs, q := setup(t)
 	id := seedEpisode(t, st, blobs, q)
 
+	reg := metrics.New()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	_, err := worker.New(st, blobs, q, null.New(), worker.WithPollInterval(10*time.Millisecond)).Run(ctx)
+	ctrl, err := worker.New(st, blobs, q, null.New(),
+		worker.WithPollInterval(10*time.Millisecond), worker.WithMetrics(reg)).Run(ctx)
 	require.NoError(t, err)
 
 	// null transcriber reports unsupported -> transcript status becomes "none"
@@ -634,4 +687,23 @@ func TestWorkerNullSettlesToNone(t *testing.T) {
 
 	_, err = st.TranscriptByEpisode(t.Context(), id)
 	require.Error(t, err, "no transcript should be saved")
+
+	cancel()
+	require.NoError(t, ctrl.Wait())
+
+	// A committed TranscriptNone produced no transcript: it must be counted as
+	// "skipped", NOT "success", and must not advance last-success — otherwise the
+	// default null transcriber would report phantom successful transcriptions.
+	var b strings.Builder
+	_, err = reg.WriteTo(&b)
+	require.NoError(t, err)
+	out := b.String()
+	require.Contains(t, out, `transcription_jobs_total{outcome="skipped"} 1`)
+	require.NotContains(t, out, `transcription_jobs_total{outcome="success"}`,
+		"a no-op TranscriptNone settlement must not be counted as a success")
+	// last-success has no value line written (only its # HELP/# TYPE headers).
+	for ln := range strings.SplitSeq(out, "\n") {
+		require.False(t, strings.HasPrefix(ln, "worker_last_success_timestamp_seconds "),
+			"a skipped settlement must not advance last-success, got line: %q", ln)
+	}
 }
