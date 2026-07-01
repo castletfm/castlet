@@ -208,17 +208,23 @@ build gains the OIDC columns/index on the next `castlet migrate` or `serve`.
 2. Loads episode + opens audio via `BlobStore.Get`.
 3. Calls `Transcriber.Transcribe(ctx, audio) → Result{Segments}`.
    - null transcriber returns `ErrUnsupported` → episode `transcript_status=none`.
-4. Settles the result via `Store.SettleEpisodeTranscript(ctx, jobID, token,
-   episodeID, transcript, status, …)`, which writes the transcript segments and
-   the episode `transcript_status` in one transaction — but ONLY for the active
-   claim (row's `attempts == token` and the job still `processing`), so a stale
-   attempt whose lease expired and job was reclaimed cannot clobber the reclaiming
-   attempt's episode/transcript state. A lost claim surfaces as `store.ErrStaleClaim`
-   and the result is discarded.
-5. On success `JobQueue.Ack(ctx, job)`; on a transient error `JobQueue.Nack(ctx,
-   job, cause)` reschedules with backoff, and after max attempts marks the job dead
-   (`dead=true`) → episode settled to `transcript_status=failed`. Both `Ack` and
-   `Nack` are fenced by `job.Attempts`, so a stale attempt's settlement no-ops.
+4. On success, settles the outcome via
+   `Store.SettleEpisodeTranscriptAndCompleteJob(ctx, jobID, token, episodeID,
+   transcript, status, …)`, which writes the transcript segments, the episode
+   `transcript_status`, AND the job completion together in ONE fenced transaction
+   — committed ONLY for the active claim (row's `attempts == token` and the job
+   still `processing`). Coupling the completion to the episode write in a single
+   transaction means a reclaim can never land between them: either the whole unit
+   commits while this attempt still holds the claim, or nothing does. A stale
+   attempt whose lease expired and job was reclaimed thus cannot clobber the
+   reclaiming attempt's episode/transcript/job state; a lost claim surfaces as
+   `store.ErrStaleClaim` and the result is discarded. There is no separate `Ack`
+   on the success path.
+5. On a transient error, `JobQueue.Nack(ctx, job, cause)` reschedules with
+   backoff; after max attempts it marks the job dead (`dead=true`) → episode
+   settled to `transcript_status=failed` via the fenced settlement path. `Nack`
+   and the dead-letter status write are fenced by `job.Attempts`, so a stale
+   attempt's settlement no-ops.
 
 **View an episode (public):**
 - `GET /{channel-slug}/{episode-slug}` renders title/description, a player
