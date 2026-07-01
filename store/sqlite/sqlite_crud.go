@@ -17,10 +17,13 @@ import (
 const userCols = `id, email, display_name, password_hash, oidc_issuer, oidc_subject, session_epoch, created_at`
 
 func (s *Store) CreateUser(ctx context.Context, u *model.User) error {
+	// session_epoch is intentionally omitted so it defaults to 0 (schema DEFAULT):
+	// BumpSessionEpoch is the sole persistence writer of that column, preventing a
+	// stale in-memory epoch from ever being written here.
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO users (id, email, display_name, password_hash, oidc_issuer, oidc_subject, session_epoch, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.ID, u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, u.SessionEpoch, toUnix(u.CreatedAt))
+		`INSERT INTO users (id, email, display_name, password_hash, oidc_issuer, oidc_subject, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		u.ID, u.Email, u.DisplayName, u.PasswordHash, u.OIDCIssuer, u.OIDCSubject, toUnix(u.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("sqlite: create user: %w", mapErr(err))
 	}

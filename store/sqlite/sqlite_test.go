@@ -67,6 +67,22 @@ func TestBumpSessionEpoch(t *testing.T) {
 	require.ErrorIs(t, s.BumpSessionEpoch(ctx, "nope"), store.ErrNotFound)
 }
 
+// CreateUser must never persist a caller-supplied session_epoch: the column
+// defaults to 0 and BumpSessionEpoch is its sole writer. Writing it here would
+// let a stale in-memory epoch seed a revoked-looking (or pre-bumped) value.
+func TestCreateUserIgnoresSessionEpoch(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	require.NoError(t, s.CreateUser(ctx, &model.User{
+		ID: "u1", Email: "a@example.com", DisplayName: "A", PasswordHash: "x",
+		SessionEpoch: 99, CreatedAt: time.Now(),
+	}))
+
+	got, err := s.UserByID(ctx, "u1")
+	require.NoError(t, err)
+	require.Zero(t, got.SessionEpoch, "CreateUser must ignore a caller-supplied epoch and default to 0")
+}
+
 // A generic UpdateUser must never write session_epoch: a stale user struct
 // (holding an older epoch) must not clobber an epoch a prior BumpSessionEpoch
 // already advanced, which would re-validate cookies a "log out everywhere"
