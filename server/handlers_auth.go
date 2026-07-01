@@ -77,9 +77,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// authenticate.
 	hash := dummyPasswordHash
 	realAccount := 0
+	// Only treat the stored hash as real if it is a well-formed bcrypt hash.
+	// A malformed (or empty) stored hash makes bcrypt.CompareHashAndPassword
+	// return cheaply, which would reintroduce the timing signal — fall back to
+	// the constant dummy hash so that path still pays the full cost.
 	if err == nil && user.PasswordHash != "" {
-		hash = []byte(user.PasswordHash)
-		realAccount = 1
+		if _, costErr := bcrypt.Cost([]byte(user.PasswordHash)); costErr == nil {
+			hash = []byte(user.PasswordHash)
+			realAccount = 1
+		}
 	}
 
 	// Always pay the bcrypt cost, regardless of which hash was selected.
