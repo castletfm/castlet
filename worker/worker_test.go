@@ -93,6 +93,22 @@ func seedEpisode(t *testing.T, st *sqlite.Store, blobs *localfs.Store, q *dbqueu
 	return "e1"
 }
 
+// seedClaimedJob inserts a job row that stands in for a fake queue's in-flight
+// job, so the worker's claim-fenced episode settlement (SettleEpisodeTranscript)
+// recognizes this attempt as the active claim. Its Attempts — the fencing token —
+// matches the job the fake queue hands the worker, and it is left "processing" as
+// a live claim would be. Returns the job to serve from the fake queue.
+func seedClaimedJob(t *testing.T, st *sqlite.Store, id, episodeID string) *model.Job {
+	t.Helper()
+	now := time.Now()
+	j := &model.Job{ID: id, Kind: model.JobTranscribe,
+		Payload: `{"episode_id":"` + episodeID + `"}`,
+		Status:  model.JobProcessing, Attempts: 1,
+		RunAfter: now, CreatedAt: now, UpdatedAt: now}
+	require.NoError(t, st.EnqueueJob(t.Context(), j))
+	return j
+}
+
 // waitStatus polls until the episode reaches want or the deadline passes.
 func waitStatus(t *testing.T, st *sqlite.Store, id string, want model.TranscriptStatus) {
 	t.Helper()
@@ -172,6 +188,52 @@ func TestWorkerDoesNotClobberConcurrentEdit(t *testing.T) {
 	require.Equal(t, model.TranscriptDone, ep.TranscriptStatus)
 }
 
+// TestWorkerReclaimDeadLetterFailsEpisode proves that a job reclaimed after it
+// has already exhausted its attempts (a worker that kept crashing before it
+// could Nack) settles BOTH the queue job and the episode transcript to failed.
+// The queue dead-letters the job at dequeue time; the worker must still mark the
+// episode failed rather than leaving it stuck "processing" forever, matching the
+// normal Nack-exhaustion path.
+func TestWorkerReclaimDeadLetterFailsEpisode(t *testing.T) {
+	st, blobs, _ := setup(t)
+	ctx := t.Context()
+
+	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "u@x.y", DisplayName: "U", CreatedAt: time.Now()}))
+	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	_, err := blobs.Put(ctx, "mk1", strings.NewReader("fake audio bytes"))
+	require.NoError(t, err)
+	require.NoError(t, st.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
+		MediaKey: "mk1", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptProcessing,
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	// A job left "processing" by a crashed worker that already used up its
+	// attempts, with an expired lease so it is reclaimable. The reclaim bumps
+	// attempts past maxAttempts, so the queue dead-letters it.
+	past := time.Now().Add(-time.Hour)
+	require.NoError(t, st.EnqueueJob(ctx, &model.Job{ID: "poison", Kind: model.JobTranscribe,
+		Payload: `{"episode_id":"e1"}`, Status: model.JobProcessing, Attempts: 2,
+		RunAfter: past, CreatedAt: past, UpdatedAt: past}))
+
+	q := dbqueue.New(st, dbqueue.WithMaxAttempts(2))
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// fakeTranscriber would drive the episode to Done if the job were (wrongly)
+	// run, so a Failed status also proves the job was not re-run.
+	_, err = worker.New(st, blobs, q, fakeTranscriber{}, worker.WithPollInterval(10*time.Millisecond)).Run(wctx)
+	require.NoError(t, err)
+
+	waitStatus(t, st, "e1", model.TranscriptFailed)
+
+	got, err := st.JobByID(t.Context(), "poison")
+	require.NoError(t, err)
+	require.Equal(t, model.JobFailed, got.Status, "dead-lettered job must be permanently failed")
+
+	_, err = st.TranscriptByEpisode(t.Context(), "e1")
+	require.Error(t, err, "no transcript should be saved for a dead-lettered job")
+}
+
 // cancelingTranscriber simulates a shutdown (SIGTERM) arriving mid-job: it
 // cancels the worker's context and then fails, so the terminal Nack runs with
 // an already-cancelled request context.
@@ -196,17 +258,17 @@ type nackRecordingQueue struct {
 
 func (q *nackRecordingQueue) Enqueue(context.Context, model.JobKind, any) error { return nil }
 
-func (q *nackRecordingQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, error) {
+func (q *nackRecordingQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, bool, error) {
 	if q.dequeued {
-		return nil, nil
+		return nil, false, nil
 	}
 	q.dequeued = true
-	return q.job, nil
+	return q.job, false, nil
 }
 
-func (q *nackRecordingQueue) Ack(context.Context, string) error { return nil }
+func (q *nackRecordingQueue) Ack(context.Context, *model.Job) error { return nil }
 
-func (q *nackRecordingQueue) Nack(ctx context.Context, _ string, _ error) (bool, error) {
+func (q *nackRecordingQueue) Nack(ctx context.Context, _ *model.Job, _ error) (bool, error) {
 	q.nackCtxErr = ctx.Err()
 	close(q.nacked)
 	return false, nil
@@ -241,8 +303,9 @@ func TestWorkerNackSurvivesShutdown(t *testing.T) {
 
 // cancelBeforeSettleTranscriber simulates shutdown (SIGTERM) arriving between
 // the transcription work and the terminal status persistence: it cancels the
-// worker's context and then returns a successful result, so the final status
-// write and Ack run with an already-cancelled request context.
+// worker's context and then returns a successful result, so the terminal
+// settle+complete (SettleEpisodeTranscriptAndCompleteJob) runs with an
+// already-cancelled request context.
 type cancelBeforeSettleTranscriber struct {
 	cancel context.CancelFunc
 }
@@ -255,36 +318,38 @@ func (c cancelBeforeSettleTranscriber) Transcribe(ctx context.Context, in transc
 }
 
 // ackRecordingQueue serves a single job and records whether it was terminated
-// via Ack or Nack, so a test can assert the success path acks the job only
-// after its terminal state persists.
+// via Nack, so a test can assert the success path does NOT fall back to Nack.
+// The success path now completes the job in the same fenced store transaction as
+// the episode settlement (store.SettleEpisodeTranscriptAndCompleteJob) rather than
+// via queue.Ack, so Ack is a no-op here and the test observes the store instead.
 type ackRecordingQueue struct {
 	job      *model.Job
 	dequeued bool
-	acked    chan struct{}
 	nacked   chan struct{}
 }
 
 func (q *ackRecordingQueue) Enqueue(context.Context, model.JobKind, any) error { return nil }
 
-func (q *ackRecordingQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, error) {
+func (q *ackRecordingQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, bool, error) {
 	if q.dequeued {
-		return nil, nil
+		return nil, false, nil
 	}
 	q.dequeued = true
-	return q.job, nil
+	return q.job, false, nil
 }
 
-func (q *ackRecordingQueue) Ack(context.Context, string) error { close(q.acked); return nil }
+func (q *ackRecordingQueue) Ack(context.Context, *model.Job) error { return nil }
 
-func (q *ackRecordingQueue) Nack(context.Context, string, error) (bool, error) {
+func (q *ackRecordingQueue) Nack(context.Context, *model.Job, error) (bool, error) {
 	close(q.nacked)
 	return false, nil
 }
 
 // TestWorkerAckSurvivesShutdownSuccess asserts that when the worker's context is
-// cancelled after transcription succeeds but before the terminal status is
+// cancelled after transcription succeeds but before the terminal outcome is
 // persisted, the episode is still durably settled to "done" AND the job is
-// acked (never left terminal-done with the episode stuck processing).
+// completed in the SAME fenced store transaction (never left terminal-done with
+// the episode stuck processing, and never downgraded by a would-be retry).
 func TestWorkerAckSurvivesShutdownSuccess(t *testing.T) {
 	st, blobs, _ := setup(t)
 	seedEpisode(t, st, blobs, dbqueue.New(st))
@@ -293,21 +358,27 @@ func TestWorkerAckSurvivesShutdownSuccess(t *testing.T) {
 	defer cancel()
 
 	q := &ackRecordingQueue{
-		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
-		acked:  make(chan struct{}),
+		job:    seedClaimedJob(t, st, "j1", "e1"),
 		nacked: make(chan struct{}),
 	}
 	_, err := worker.New(st, blobs, q, cancelBeforeSettleTranscriber{cancel: cancel},
 		worker.WithPollInterval(10*time.Millisecond)).Run(ctx)
 	require.NoError(t, err)
 
+	// The success path persists the episode status AND completes the job atomically
+	// under a shutdown-surviving context, so observe the store rather than the queue.
+	waitStatus(t, st, "e1", model.TranscriptDone)
+
 	select {
-	case <-q.acked:
 	case <-q.nacked:
-		t.Fatal("job was nacked; a successful transcript must persist and ack under a shutdown-surviving context")
-	case <-time.After(3 * time.Second):
-		t.Fatal("job was neither acked nor nacked")
+		t.Fatal("job was nacked; a successful transcript must persist under a shutdown-surviving context")
+	default:
 	}
+
+	job, err := st.JobByID(t.Context(), "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobDone, job.Status,
+		"job must be completed atomically with the episode settlement even though the worker ctx was cancelled")
 
 	ep, err := st.EpisodeByID(t.Context(), "e1")
 	require.NoError(t, err)
@@ -319,14 +390,16 @@ func TestWorkerAckSurvivesShutdownSuccess(t *testing.T) {
 	require.Len(t, tr.Segments, 1)
 }
 
-// budgetExhaustingStore blocks SaveTranscript until the settlement context it is
-// handed expires, simulating a settlement step that consumes its entire budget.
-// Every other call delegates to the embedded store.
+// budgetExhaustingStore blocks the terminal SUCCESS-path settlement (the combined
+// settle+complete, which carries the transcript) until the settlement context it
+// is handed expires, simulating a settlement step that consumes its entire budget.
+// The non-terminal progress marker and every other call delegate to the embedded
+// store.
 type budgetExhaustingStore struct {
 	store.Store
 }
 
-func (s budgetExhaustingStore) SaveTranscript(ctx context.Context, _ *model.Transcript) error {
+func (s budgetExhaustingStore) SettleEpisodeTranscriptAndCompleteJob(ctx context.Context, jobID string, token int, episodeID string, tr *model.Transcript, status model.TranscriptStatus, at time.Time) error {
 	<-ctx.Done()
 	return ctx.Err()
 }
@@ -346,9 +419,10 @@ func TestWorkerNackSurvivesSettlementBudgetExhaustion(t *testing.T) {
 		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
 		nacked: make(chan struct{}),
 	}
-	// A tiny settle budget plus a store that blocks SaveTranscript until that
-	// budget is spent means settlement always times out; the queue transition
-	// must not inherit the exhausted context.
+	// A tiny settle budget plus a store that blocks the combined settle+complete
+	// (SettleEpisodeTranscriptAndCompleteJob) until that budget is spent means
+	// settlement always times out; the queue transition must not inherit the
+	// exhausted context.
 	bstore := budgetExhaustingStore{Store: st}
 	_, err := worker.New(bstore, blobs, q, fakeTranscriber{},
 		worker.WithPollInterval(10*time.Millisecond),
@@ -384,17 +458,17 @@ type deadNackQueue struct {
 
 func (q *deadNackQueue) Enqueue(context.Context, model.JobKind, any) error { return nil }
 
-func (q *deadNackQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, error) {
+func (q *deadNackQueue) Dequeue(context.Context, ...model.JobKind) (*model.Job, bool, error) {
 	if q.dequeued {
-		return nil, nil
+		return nil, false, nil
 	}
 	q.dequeued = true
-	return q.job, nil
+	return q.job, false, nil
 }
 
-func (q *deadNackQueue) Ack(context.Context, string) error { return nil }
+func (q *deadNackQueue) Ack(context.Context, *model.Job) error { return nil }
 
-func (q *deadNackQueue) Nack(ctx context.Context, _ string, _ error) (bool, error) {
+func (q *deadNackQueue) Nack(ctx context.Context, _ *model.Job, _ error) (bool, error) {
 	<-ctx.Done() // spend the entire Nack budget, leaving ctx expired
 	close(q.nacked)
 	return true, nil
@@ -409,8 +483,8 @@ type deadStatusRecordingStore struct {
 	recorded     chan struct{}
 }
 
-func (s *deadStatusRecordingStore) SetEpisodeTranscriptStatus(ctx context.Context, id string, status model.TranscriptStatus, at time.Time) error {
-	err := s.Store.SetEpisodeTranscriptStatus(ctx, id, status, at)
+func (s *deadStatusRecordingStore) SettleEpisodeTranscript(ctx context.Context, jobID string, token int, episodeID string, tr *model.Transcript, status model.TranscriptStatus, at time.Time) error {
+	err := s.Store.SettleEpisodeTranscript(ctx, jobID, token, episodeID, tr, status, at)
 	if status == model.TranscriptFailed {
 		s.statusCtxErr = ctx.Err()
 		close(s.recorded)
@@ -433,7 +507,7 @@ func TestWorkerDeadJobStatusSurvivesNackBudgetExhaustion(t *testing.T) {
 	defer cancel()
 
 	q := &deadNackQueue{
-		job:    &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: `{"episode_id":"e1"}`},
+		job:    seedClaimedJob(t, base, "j1", "e1"),
 		nacked: make(chan struct{}),
 	}
 	// A tiny settle budget means Nack draining its context to expiry is quick;
@@ -461,6 +535,83 @@ func TestWorkerDeadJobStatusSurvivesNackBudgetExhaustion(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, model.TranscriptFailed, ep.TranscriptStatus,
 		"a dead job must settle the episode to failed, not leave it stuck processing")
+}
+
+// reclaimingTranscriber simulates a second worker reclaiming this job's expired
+// lease WHILE the original attempt is still transcribing, and settling the
+// episode to "done" itself. It then returns a result to the original attempt, so
+// the original worker's settlement is stale and must not downgrade the episode.
+type reclaimingTranscriber struct {
+	st *sqlite.Store
+}
+
+func (r reclaimingTranscriber) Transcribe(ctx context.Context, in transcribe.Input) (*transcribe.Result, error) {
+	second, err := r.st.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, time.Now().Add(time.Hour), time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	fresh := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: time.Now(),
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 5, Text: "reclaimed"}}}
+	if err := r.st.SettleEpisodeTranscriptAndCompleteJob(ctx, second.ID, second.Attempts, "e1",
+		fresh, model.TranscriptDone, time.Now()); err != nil {
+		return nil, err
+	}
+	// The original attempt now holds a stale result.
+	return &transcribe.Result{Language: "en", Segments: []transcribe.Segment{
+		{StartSecs: 0, EndSecs: 1, Text: "stale"},
+	}}, nil
+}
+
+// TestWorkerReclaimDuringJobCannotDowngrade proves the end-to-end anti-downgrade
+// guarantee: when the job is reclaimed and settled to "done" by another worker
+// while the original attempt is still running, the original attempt's terminal
+// settlement is a single fenced no-op — it neither downgrades the episode nor
+// double-completes the job, and the reclaiming attempt's transcript stands.
+func TestWorkerReclaimDuringJobCannotDowngrade(t *testing.T) {
+	st, blobs, _ := setup(t)
+	ctx := t.Context()
+	require.NoError(t, st.CreateUser(ctx, &model.User{ID: "u1", Email: "u@x.y", DisplayName: "U", CreatedAt: time.Now()}))
+	require.NoError(t, st.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+	_, err := blobs.Put(ctx, "mk1", strings.NewReader("fake audio bytes"))
+	require.NoError(t, err)
+	require.NoError(t, st.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
+		MediaKey: "mk1", MediaMIME: "audio/mpeg", MediaKind: model.MediaAudio,
+		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptProcessing,
+		CreatedAt: time.Now(), UpdatedAt: time.Now()}))
+
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	q := &ackRecordingQueue{
+		job:    seedClaimedJob(t, st, "j1", "e1"),
+		nacked: make(chan struct{}),
+	}
+	_, err = worker.New(st, blobs, q, reclaimingTranscriber{st: st},
+		worker.WithPollInterval(10*time.Millisecond)).Run(wctx)
+	require.NoError(t, err)
+
+	waitStatus(t, st, "e1", model.TranscriptDone)
+
+	// The reclaiming attempt's transcript must stand; the stale attempt must not
+	// have clobbered it.
+	tr, err := st.TranscriptByEpisode(t.Context(), "e1")
+	require.NoError(t, err)
+	require.Len(t, tr.Segments, 1)
+	require.Equal(t, "reclaimed", tr.Segments[0].Text,
+		"the stale attempt must not overwrite the reclaiming attempt's transcript")
+
+	// The job is completed exactly once by the reclaiming attempt (token 2); the
+	// stale attempt's settlement is a no-op.
+	job, err := st.JobByID(t.Context(), "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobDone, job.Status)
+	require.Equal(t, 2, job.Attempts)
+
+	select {
+	case <-q.nacked:
+		t.Fatal("a stale settlement must be discarded silently, not turned into a Nack")
+	default:
+	}
 }
 
 func TestWorkerNullSettlesToNone(t *testing.T) {

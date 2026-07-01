@@ -426,6 +426,147 @@ func (s *Store) TranscriptByEpisode(ctx context.Context, episodeID string) (*mod
 	return &t, nil
 }
 
+// SettleEpisodeTranscript atomically records a transcription job's episode side
+// effects under the fence of its claim. See store.Store for the contract.
+//
+// The fence is the claim token (jobs.attempts), which ClaimJob bumps on every
+// (re)claim: a stale attempt whose job was reclaimed no longer matches and
+// affects zero rows, so it gets ErrStaleClaim and touches neither the episode nor
+// the transcript. On top of the token, the accepted job status follows the real
+// state machine so a same-token call cannot settle an already-terminal job: every
+// progress/none/done settlement and every transcript save requires the job to
+// still be 'processing' (the state a live claim holds before its Ack), while
+// jobs.status = 'failed' is accepted ONLY for the transcript-less TranscriptFailed
+// mark — the dead-letter / Nack-exhaustion write that legitimately runs right
+// after the same claim flipped the job to 'failed'. Doing the claim check and the
+// mutations in one transaction (on the single-writer pool) makes the
+// check-and-write indivisible.
+func (s *Store) SettleEpisodeTranscript(ctx context.Context, jobID string, token int, episodeID string, transcript *model.Transcript, status model.TranscriptStatus, updatedAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: settle episode transcript: %w", mapErr(err))
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// The default state machine transition is FROM processing; only the
+	// transcript-less failed-episode mark may additionally run against an
+	// already-'failed' job (the dead-letter/Nack-exhaustion settlement).
+	statusCond := "status = ?"
+	statusArgs := []any{string(model.JobProcessing)}
+	if status == model.TranscriptFailed && transcript == nil {
+		statusCond = "status IN (?, ?)"
+		statusArgs = []any{string(model.JobProcessing), string(model.JobFailed)}
+	}
+
+	var claimed int
+	args := append([]any{jobID, token}, statusArgs...)
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(1) FROM jobs WHERE id = ? AND attempts = ? AND `+statusCond,
+		args...).Scan(&claimed); err != nil {
+		return fmt.Errorf("sqlite: verify job claim: %w", mapErr(err))
+	}
+	if claimed == 0 {
+		return store.ErrStaleClaim
+	}
+
+	if transcript != nil {
+		if err := saveTranscriptTx(ctx, tx, transcript); err != nil {
+			return err
+		}
+	}
+	if err := setEpisodeStatusTx(ctx, tx, episodeID, status, updatedAt); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: settle episode transcript: %w", mapErr(err))
+	}
+	return nil
+}
+
+// SettleEpisodeTranscriptAndCompleteJob atomically settles a SUCCESSFUL
+// transcription: in ONE transaction it completes the job and records the episode
+// side effects, so a reclaim can never land between the episode write and the job
+// completion (the gap that previously let a reclaiming attempt downgrade an
+// already-done episode). See store.Store for the contract.
+//
+// The claim fence and the completion are the SAME statement: the job is
+// transitioned to done only while attempts == token AND status = 'processing'
+// (the state a live claim holds before its Ack). A RowsAffected of 0 means the
+// claim is no longer valid — the job was reclaimed (attempts advanced) or is
+// already terminal — so the whole settlement (transcript save, episode status,
+// and job completion) is rejected together with ErrStaleClaim and nothing is
+// written. Only when the fence holds are the transcript (when non-nil) and the
+// targeted episode transcript_status write applied, all committed as one unit.
+func (s *Store) SettleEpisodeTranscriptAndCompleteJob(ctx context.Context, jobID string, token int, episodeID string, transcript *model.Transcript, status model.TranscriptStatus, updatedAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: settle episode transcript and complete job: %w", mapErr(err))
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// Fence AND complete in one statement: only the live claim can finish the job.
+	// Clear last_error so a successful completion wipes any message left by a prior
+	// failed attempt (RescheduleJob), matching CompleteJob -> setJobStatus.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, last_error = '', updated_at = ? WHERE id = ? AND attempts = ? AND status = ?`,
+		string(model.JobDone), toUnix(updatedAt), jobID, token, string(model.JobProcessing))
+	if err != nil {
+		return fmt.Errorf("sqlite: complete job: %w", mapErr(err))
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return store.ErrStaleClaim
+	}
+
+	if transcript != nil {
+		if err := saveTranscriptTx(ctx, tx, transcript); err != nil {
+			return err
+		}
+	}
+	if err := setEpisodeStatusTx(ctx, tx, episodeID, status, updatedAt); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: settle episode transcript and complete job: %w", mapErr(err))
+	}
+	return nil
+}
+
+// saveTranscriptTx upserts a transcript within an open transaction, so the
+// episode settlement methods can save it atomically with their other writes.
+func saveTranscriptTx(ctx context.Context, tx *sql.Tx, t *model.Transcript) error {
+	segs, err := json.Marshal(t.Segments)
+	if err != nil {
+		return fmt.Errorf("sqlite: marshal segments: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO transcripts (episode_id, language, segments, created_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(episode_id) DO UPDATE SET language = excluded.language,
+			segments = excluded.segments, created_at = excluded.created_at`,
+		t.EpisodeID, t.Language, string(segs), toUnix(t.CreatedAt)); err != nil {
+		return fmt.Errorf("sqlite: save transcript: %w", mapErr(err))
+	}
+	return nil
+}
+
+// setEpisodeStatusTx applies a targeted transcript_status write within an open
+// transaction, leaving the rest of the episode row untouched so a concurrent
+// admin edit is not reverted.
+func setEpisodeStatusTx(ctx context.Context, tx *sql.Tx, episodeID string, status model.TranscriptStatus, updatedAt time.Time) error {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE episodes SET transcript_status = ?, updated_at = ? WHERE id = ?`,
+		string(status), toUnix(updatedAt), episodeID); err != nil {
+		return fmt.Errorf("sqlite: set episode transcript status: %w", mapErr(err))
+	}
+	return nil
+}
+
 // requireAffected converts a zero-rows-affected result into ErrNotFound so
 // updates/deletes of missing ids surface consistently.
 func requireAffected(res interface{ RowsAffected() (int64, error) }) error {

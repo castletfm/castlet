@@ -217,8 +217,8 @@ func (w *Worker) loop(ctx context.Context) error {
 }
 
 // settlement is the durable terminal outcome a job produced. It is applied by
-// settle() under the shutdown-surviving context after the (cancellable) work
-// has finished, so the episode's final state is recorded even on SIGTERM.
+// settleAndComplete under the shutdown-surviving context after the (cancellable)
+// work has finished, so the episode's final state is recorded even on SIGTERM.
 type settlement struct {
 	ep         *model.Episode         // episode to update
 	transcript *model.Transcript      // saved before the status write when non-nil
@@ -228,47 +228,68 @@ type settlement struct {
 // processOne claims and handles a single job. It reports whether a job was
 // processed (so the caller can keep draining) and any handling error.
 func (w *Worker) processOne(ctx context.Context) (bool, error) {
-	job, err := w.queue.Dequeue(ctx, model.JobTranscribe)
+	job, deadLettered, err := w.queue.Dequeue(ctx, model.JobTranscribe)
 	if err != nil {
 		return false, err
 	}
 	if job == nil {
 		return false, nil
 	}
+	if deadLettered {
+		// The queue reclaimed a job past its attempt limit and permanently
+		// failed it instead of handing it back to run. Settle the episode
+		// transcript to failed too, matching the Nack-exhaustion path, so it is
+		// not left stuck "processing" forever. Do not run it. The mark runs under
+		// its own fresh shutdown-surviving budget, fenced by the fresh claim
+		// token, like every other settlement.
+		markCtx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
+		defer cancel()
+		w.markTranscript(markCtx, job, model.TranscriptFailed)
+		return true, nil
+	}
 	s, herr := w.handle(ctx, job)
 
-	// The terminal bookkeeping (transcript save, status write, and Ack/Nack)
-	// must survive shutdown. handle() runs the transcription under ctx (so the
-	// work itself stops on SIGTERM), but settling with that same, now-cancelled
-	// ctx would fail with context.Canceled: the job would be acked "done" while
-	// the episode stayed stuck mid-transcription. Each terminal step below runs
-	// under its OWN fresh background-derived timeout, so the queue state
-	// transition (Nack/Ack) is always durable even if the settlement writes
-	// consumed their whole budget.
+	// The terminal bookkeeping (the combined settle+complete on success, or the
+	// Nack/fail path) must survive shutdown. handle() runs the transcription under
+	// ctx (so the work itself stops on SIGTERM), but settling with that same,
+	// now-cancelled ctx would fail with context.Canceled: the outcome would be lost
+	// while the episode stayed stuck mid-transcription. Each terminal step below
+	// runs under its OWN fresh background-derived timeout, so it is always durable
+	// even if an earlier step consumed its whole budget.
 	if herr != nil {
 		return true, w.fail(job, herr)
 	}
-	// Persist the terminal outcome durably BEFORE acking. If the settlement
-	// write is lost, do NOT ack the job as success: Nack it so it is retried
-	// rather than left terminal-done with the episode stuck processing.
-	if s != nil {
-		ctx2, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
-		err := w.settle(ctx2, s)
-		cancel()
-		if err != nil {
-			return true, w.fail(job, err)
-		}
+	// A nil settlement means there is nothing to record (e.g. the episode was
+	// deleted mid-job); just complete the job so it is not retried forever.
+	if s == nil {
+		return true, w.ack(job)
 	}
-	return true, w.ack(job)
+	// Persist the terminal outcome AND complete the job in ONE fenced store
+	// transaction. Coupling the two means a reclaim can never land between the
+	// episode write and the completion to downgrade an already-done episode. A
+	// lost claim makes the whole unit a no-op (ErrStaleClaim, handled in
+	// settleAndComplete); any other error means the outcome was not durably
+	// recorded, so Nack the job for retry rather than leave it done with the
+	// episode stuck processing.
+	ctx2, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
+	serr := w.settleAndComplete(ctx2, job, s)
+	cancel()
+	if serr != nil {
+		return true, w.fail(job, serr)
+	}
+	return true, nil
 }
 
-// ack marks a job done under a fresh shutdown-surviving context, independent of
-// whatever the settlement step consumed, so a successful job is never left in
-// "processing" because the ack ran on an already-expired context.
+// ack is the no-side-effects completion path: it marks a job done under a fresh
+// shutdown-surviving context when there is nothing to settle (a nil settlement,
+// e.g. the episode was deleted mid-job). The successful transcription path does
+// NOT come here — it completes the job inside settleAndComplete's fenced
+// transaction. Deriving its own context keeps the completion durable even on
+// SIGTERM, so such a job is never left stuck in "processing".
 func (w *Worker) ack(job *model.Job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
 	defer cancel()
-	return w.queue.Ack(ctx, job.ID)
+	return w.queue.Ack(ctx, job)
 }
 
 // fail Nacks a job and, if the queue reports it permanently dead, records the
@@ -278,7 +299,7 @@ func (w *Worker) ack(job *model.Job) error {
 func (w *Worker) fail(job *model.Job, cause error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), w.settleTimeout)
 	defer cancel()
-	dead, nerr := w.queue.Nack(ctx, job.ID, cause)
+	dead, nerr := w.queue.Nack(ctx, job, cause)
 	if nerr != nil {
 		return fmt.Errorf("nack: %w (cause: %v)", nerr, cause)
 	}
@@ -294,18 +315,27 @@ func (w *Worker) fail(job *model.Job, cause error) error {
 	return cause
 }
 
-// settle applies a job's terminal outcome under the shutdown-surviving context:
-// the transcript (if any) then the episode status. It returns an error if either
-// write fails so the caller can avoid acking a job whose result was not durably
-// recorded.
-func (w *Worker) settle(ctx context.Context, s *settlement) error {
-	if s.transcript != nil {
-		if err := w.store.SaveTranscript(ctx, s.transcript); err != nil {
-			return fmt.Errorf("worker: save transcript: %w", err)
-		}
+// settleAndComplete applies a job's SUCCESSFUL terminal outcome in ONE fenced
+// store transaction under the shutdown-surviving context: the transcript (if
+// any), the episode status, and the job completion are written together, and
+// only while this attempt still holds the claim. Coupling the completion to the
+// episode write is what closes the window where a reclaim could land between a
+// separate settle and Ack and downgrade an already-done episode. A transcription
+// can outlive its queue lease (the per-job timeout caps at 2h, the default lease
+// is 10m), so by the time there is a result the job may have been reclaimed by
+// another worker; ErrStaleClaim means exactly that — another worker owns the
+// episode now — so it is not an error: discard the stale result, changing
+// nothing. Any other write error is returned so the caller Nacks a job whose
+// result was not durably recorded.
+func (w *Worker) settleAndComplete(ctx context.Context, job *model.Job, s *settlement) error {
+	err := w.store.SettleEpisodeTranscriptAndCompleteJob(ctx, job.ID, job.Attempts, s.ep.ID, s.transcript, s.status, time.Now())
+	if errors.Is(err, store.ErrStaleClaim) {
+		w.logger.Warn("transcription claim lost to reclaim; discarding stale settlement",
+			"job", job.ID, "episode", s.ep.ID)
+		return nil
 	}
-	if err := w.setStatus(ctx, s.ep, s.status); err != nil {
-		return err
+	if err != nil {
+		return fmt.Errorf("worker: settle episode transcript and complete job: %w", err)
 	}
 	if s.transcript != nil {
 		w.logger.Info("transcribed episode", "episode", s.ep.ID, "segments", len(s.transcript.Segments))
@@ -340,8 +370,11 @@ func (w *Worker) transcribe(ctx context.Context, job *model.Job) (*settlement, e
 		return nil, err
 	}
 
-	// Non-terminal progress marker: best-effort under the cancellable work ctx.
-	if err := w.setStatus(ctx, ep, model.TranscriptProcessing); err != nil {
+	// Non-terminal progress marker: best-effort under the cancellable work ctx,
+	// fenced by the claim like every other episode write. A lost claim (another
+	// worker reclaimed the job) is expected here and skipped silently.
+	if err := w.store.SettleEpisodeTranscript(ctx, job.ID, job.Attempts, ep.ID, nil,
+		model.TranscriptProcessing, time.Now()); err != nil && !errors.Is(err, store.ErrStaleClaim) {
 		w.logger.Error("update transcript status", "episode", ep.ID,
 			"status", model.TranscriptProcessing, "error", err)
 	}
@@ -373,6 +406,11 @@ func (w *Worker) transcribe(ctx context.Context, job *model.Job) (*settlement, e
 		return nil, fmt.Errorf("worker: transcribe: %w", err)
 	}
 
+	// The result is settled atomically under the claim fence in settleAndComplete:
+	// a transcription can outlive its lease and be reclaimed by another worker, and
+	// Store.SettleEpisodeTranscriptAndCompleteJob drops this attempt's
+	// transcript/status writes (ErrStaleClaim) when that has happened, so they
+	// cannot clobber the reclaiming attempt.
 	tr := &model.Transcript{EpisodeID: ep.ID, Language: res.Language, CreatedAt: time.Now()}
 	for _, s := range res.Segments {
 		tr.Segments = append(tr.Segments, model.Segment{StartSecs: s.StartSecs, EndSecs: s.EndSecs, Text: s.Text})
@@ -380,34 +418,17 @@ func (w *Worker) transcribe(ctx context.Context, job *model.Job) (*settlement, e
 	return &settlement{ep: ep, transcript: tr, status: model.TranscriptDone}, nil
 }
 
-// setStatus records the episode's transcript status with a targeted UPDATE and
-// returns any write error so terminal callers can gate the Ack on it. It
-// deliberately does NOT write the whole row: transcription runs for minutes,
-// during which an admin may edit the episode's title/description/language/
-// position. A full read-modify-write from the worker's stale copy would silently
-// revert those edits (lost update), so only transcript_status/updated_at change.
-func (w *Worker) setStatus(ctx context.Context, ep *model.Episode, status model.TranscriptStatus) error {
-	now := time.Now()
-	if err := w.store.SetEpisodeTranscriptStatus(ctx, ep.ID, status, now); err != nil {
-		return fmt.Errorf("worker: update transcript status: %w", err)
-	}
-	ep.TranscriptStatus = status
-	ep.UpdatedAt = now
-	return nil
-}
-
-// markTranscript loads the job's episode and records a terminal transcript
-// status (used when a job dies). Best-effort.
+// markTranscript records a terminal transcript status for a job's episode (used
+// when a job dies), fenced by the job's claim via SettleEpisodeTranscript so a
+// stale attempt cannot write it. Best-effort: ErrStaleClaim means another worker
+// owns the job now and is skipped silently; only unexpected errors are logged.
 func (w *Worker) markTranscript(ctx context.Context, job *model.Job, status model.TranscriptStatus) {
 	var p model.TranscribePayload
 	if err := json.Unmarshal([]byte(job.Payload), &p); err != nil {
 		return
 	}
-	ep, err := w.store.EpisodeByID(ctx, p.EpisodeID)
-	if err != nil {
-		return
-	}
-	if err := w.setStatus(ctx, ep, status); err != nil {
-		w.logger.Error("mark transcript status", "episode", ep.ID, "status", status, "error", err)
+	err := w.store.SettleEpisodeTranscript(ctx, job.ID, job.Attempts, p.EpisodeID, nil, status, time.Now())
+	if err != nil && !errors.Is(err, store.ErrStaleClaim) {
+		w.logger.Error("mark transcript status", "episode", p.EpisodeID, "status", status, "error", err)
 	}
 }

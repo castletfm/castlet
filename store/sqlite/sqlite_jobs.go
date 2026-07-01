@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/castletfm/castlet/model"
+	"github.com/castletfm/castlet/store"
 )
 
 func (s *Store) EnqueueJob(ctx context.Context, j *model.Job) error {
@@ -32,9 +33,12 @@ func (s *Store) JobByID(ctx context.Context, id string) (*model.Job, error) {
 	return j, nil
 }
 
-// ClaimJob atomically selects and locks the oldest runnable job. Because the
-// pool is a single writer, the SELECT-then-UPDATE inside one transaction is
-// race-free across worker goroutines and processes sharing the file.
+// ClaimJob atomically selects and locks the oldest runnable job. A job is
+// runnable when its RunAfter is due and it is either pending or processing with
+// an expired lease (its worker crashed before finishing); the latter is how a
+// stuck job is reclaimed. Because the pool is a single writer, the
+// SELECT-then-UPDATE inside one transaction is race-free across worker
+// goroutines and processes sharing the file.
 func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Time, lease time.Duration) (*model.Job, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -42,9 +46,11 @@ func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Ti
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
+	// A freshly leased processing job has run_after in the future, so the
+	// run_after <= now gate only reclaims processing jobs whose lease expired.
 	query := `SELECT id, kind, payload, status, attempts, last_error, run_after, created_at, updated_at
-		FROM jobs WHERE status = ? AND run_after <= ?`
-	args := []any{string(model.JobPending), toUnix(now)}
+		FROM jobs WHERE status IN (?, ?) AND run_after <= ?`
+	args := []any{string(model.JobPending), string(model.JobProcessing), toUnix(now)}
 	if len(kinds) > 0 {
 		ph := make([]string, len(kinds))
 		for i, k := range kinds {
@@ -60,16 +66,40 @@ func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Ti
 		return nil, mapErr(err) // ErrNotFound when nothing is runnable
 	}
 
+	// Snapshot the exact row state the claim decision was made on, so the UPDATE
+	// can be conditioned on it and reject a row that changed underneath us.
+	prevStatus := string(j.Status)
+	prevAttempts := j.Attempts
+	prevRunAfter := toUnix(j.RunAfter)
+
 	// Lease the job: mark processing, bump attempts, push run_after out by the
 	// lease so a crashed worker's job becomes reclaimable after it expires.
 	j.Status = model.JobProcessing
 	j.Attempts++
 	j.UpdatedAt = now
-	j.RunAfter = now.Add(lease)
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET status = ?, attempts = ?, run_after = ?, updated_at = ? WHERE id = ?`,
-		string(j.Status), j.Attempts, toUnix(j.RunAfter), toUnix(j.UpdatedAt), j.ID); err != nil {
+	// Round the lease deadline up to whole seconds so the persisted run_after
+	// never falls before the true sub-second deadline; RunAfter is normalized to
+	// the stored precision so callers compare against the durable value.
+	j.RunAfter = fromUnix(toUnixCeil(now.Add(lease)))
+	// Condition the UPDATE on the SELECTED row's status/attempts/run_after so a
+	// concurrent claim that already mutated the row cannot be double-claimed. On
+	// the single-writer pool this always matches; the guard defends the invariant
+	// regardless. RowsAffected != 1 means the row was claimed out from under us, so
+	// report nothing runnable rather than returning a row we did not actually lease.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, attempts = ?, run_after = ?, updated_at = ?
+		 WHERE id = ? AND status = ? AND attempts = ? AND run_after = ?`,
+		string(j.Status), j.Attempts, toUnix(j.RunAfter), toUnix(j.UpdatedAt),
+		j.ID, prevStatus, prevAttempts, prevRunAfter)
+	if err != nil {
 		return nil, mapErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n != 1 {
+		return nil, store.ErrNotFound
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, mapErr(err)
@@ -77,35 +107,51 @@ func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Ti
 	return j, nil
 }
 
-func (s *Store) CompleteJob(ctx context.Context, id string) error {
-	return s.setJobStatus(ctx, id, model.JobDone, "", nil)
+func (s *Store) CompleteJob(ctx context.Context, id string, token int) error {
+	return s.setJobStatus(ctx, id, token, model.JobDone, "", nil)
 }
 
-func (s *Store) RescheduleJob(ctx context.Context, id string, runAfter time.Time, cause string) error {
-	return s.setJobStatus(ctx, id, model.JobPending, cause, &runAfter)
+func (s *Store) RescheduleJob(ctx context.Context, id string, token int, runAfter time.Time, cause string) error {
+	return s.setJobStatus(ctx, id, token, model.JobPending, cause, &runAfter)
 }
 
-func (s *Store) FailJob(ctx context.Context, id string, cause string) error {
-	return s.setJobStatus(ctx, id, model.JobFailed, cause, nil)
+func (s *Store) FailJob(ctx context.Context, id string, token int, cause string) error {
+	return s.setJobStatus(ctx, id, token, model.JobFailed, cause, nil)
 }
 
-func (s *Store) setJobStatus(ctx context.Context, id string, status model.JobStatus, cause string, runAfter *time.Time) error {
+// setJobStatus applies a status transition, fenced by the claim token AND the
+// job being currently processing. The WHERE clause matches attempts = token so
+// only the current claim can settle the job: a stale attempt whose lease expired
+// and was reclaimed (which bumped attempts) affects zero rows and gets
+// ErrStaleClaim, so it cannot clobber the reclaiming attempt's status. The
+// additional status = 'processing' guard makes terminal states final: a job only
+// transitions FROM processing TO a terminal/next state, so once it is done or
+// failed the same token can no longer move it (e.g. a Complete followed by a
+// stray Reschedule affects zero rows and gets ErrStaleClaim).
+func (s *Store) setJobStatus(ctx context.Context, id string, token int, status model.JobStatus, cause string, runAfter *time.Time) error {
 	now := time.Now()
 	var res sql.Result
 	var err error
 	if runAfter != nil {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE jobs SET status = ?, last_error = ?, run_after = ?, updated_at = ? WHERE id = ?`,
-			string(status), cause, toUnix(*runAfter), toUnix(now), id)
+			`UPDATE jobs SET status = ?, last_error = ?, run_after = ?, updated_at = ? WHERE id = ? AND attempts = ? AND status = ?`,
+			string(status), cause, toUnix(*runAfter), toUnix(now), id, token, string(model.JobProcessing))
 	} else {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
-			string(status), cause, toUnix(now), id)
+			`UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND attempts = ? AND status = ?`,
+			string(status), cause, toUnix(now), id, token, string(model.JobProcessing))
 	}
 	if err != nil {
 		return fmt.Errorf("sqlite: update job status: %w", mapErr(err))
 	}
-	return requireAffected(res)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return store.ErrStaleClaim
+	}
+	return nil
 }
 
 func scanJob(sc interface{ Scan(...any) error }) (*model.Job, error) {
