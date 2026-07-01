@@ -77,21 +77,28 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// authenticate.
 	hash := dummyPasswordHash
 	realAccount := 0
-	// Only treat the stored hash as real if it is a well-formed bcrypt hash.
-	// A malformed (or empty) stored hash makes bcrypt.CompareHashAndPassword
-	// return cheaply, which would reintroduce the timing signal — fall back to
-	// the constant dummy hash so that path still pays the full cost.
 	if err == nil && user.PasswordHash != "" {
-		if _, costErr := bcrypt.Cost([]byte(user.PasswordHash)); costErr == nil {
-			hash = []byte(user.PasswordHash)
-			realAccount = 1
-		}
+		hash = []byte(user.PasswordHash)
+		realAccount = 1
 	}
 
-	// Always pay the bcrypt cost, regardless of which hash was selected.
+	// Always pay the full bcrypt cost regardless of which hash was selected, so
+	// response time never reveals whether the account exists. A nil result means
+	// the password matched; a plain mismatch has already paid the KDF cost. Any
+	// OTHER error means the stored hash was structurally unusable (empty, wrong
+	// prefix, bad cost, corrupt salt, …) so bcrypt returned cheaply before the
+	// KDF — burn a full comparison against the known-good dummy hash and never
+	// treat it as a real login. This closes the whole malformed-stored-hash
+	// timing class without trying to pre-validate every hash field.
 	match := 0
-	if bcrypt.CompareHashAndPassword(hash, []byte(password)) == nil {
+	switch cmpErr := bcrypt.CompareHashAndPassword(hash, []byte(password)); {
+	case cmpErr == nil:
 		match = 1
+	case errors.Is(cmpErr, bcrypt.ErrMismatchedHashAndPassword):
+		// Full KDF paid; wrong password.
+	default:
+		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(password))
+		realAccount = 0
 	}
 
 	// A login succeeds only for a real account whose password matched. subtle
