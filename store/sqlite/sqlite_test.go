@@ -187,10 +187,52 @@ func TestJobClaimLifecycle(t *testing.T) {
 	_, err = s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
 	require.ErrorIs(t, err, store.ErrNotFound)
 
-	require.NoError(t, s.CompleteJob(ctx, "j1"))
+	require.NoError(t, s.CompleteJob(ctx, "j1", claimed.Attempts))
 	done, err := s.JobByID(ctx, "j1")
 	require.NoError(t, err)
 	require.Equal(t, model.JobDone, done.Status)
+}
+
+// TestJobSettlementFencedByClaimToken proves the fencing token: after a job's
+// lease expires and a second worker reclaims it (advancing Attempts), the
+// ORIGINAL attempt's settlement is rejected as a no-op and does not clobber the
+// reclaiming attempt's state.
+func TestJobSettlementFencedByClaimToken(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: "{}",
+		Status: model.JobPending, RunAfter: now, CreatedAt: now, UpdatedAt: now}))
+
+	// First worker claims the job: token (Attempts) = 1.
+	first, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 1, first.Attempts)
+
+	// Its lease expires and a second worker reclaims the still-"running" job: the
+	// token advances to 2.
+	later := now.Add(2 * time.Minute)
+	second, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, later, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 2, second.Attempts)
+
+	// The original attempt now tries to settle with its stale token: rejected.
+	require.ErrorIs(t, s.CompleteJob(ctx, "j1", first.Attempts), store.ErrStaleClaim)
+	require.ErrorIs(t, s.FailJob(ctx, "j1", first.Attempts, "stale"), store.ErrStaleClaim)
+	require.ErrorIs(t, s.RescheduleJob(ctx, "j1", first.Attempts, later, "stale"), store.ErrStaleClaim)
+
+	// The job still belongs to the reclaiming attempt (processing, token 2).
+	got, err := s.JobByID(ctx, "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobProcessing, got.Status)
+	require.Equal(t, 2, got.Attempts)
+
+	// The current claim settles normally.
+	require.NoError(t, s.CompleteJob(ctx, "j1", second.Attempts))
+	got, err = s.JobByID(ctx, "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobDone, got.Status)
 }
 
 func TestJobClaimReclaimsExpiredLease(t *testing.T) {

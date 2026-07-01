@@ -20,6 +20,12 @@ var (
 	// ErrConflict is returned when a write violates a uniqueness constraint
 	// (e.g. a duplicate email or id).
 	ErrConflict = errors.New("store: conflict")
+	// ErrStaleClaim is returned by the job settlement methods (CompleteJob,
+	// RescheduleJob, FailJob) when the supplied claim token no longer matches the
+	// job's current claim: the job was reclaimed by another worker after its lease
+	// expired. The stale worker's settlement is a no-op and must not overwrite the
+	// reclaiming attempt's state.
+	ErrStaleClaim = errors.New("store: stale job claim")
 )
 
 // EpisodeFilter narrows ListEpisodes. The zero value lists every episode,
@@ -81,12 +87,22 @@ type Store interface {
 	// lease, increments Attempts, and returns it. A runnable job is either
 	// pending or a processing job whose lease expired (reclaimed from a crashed
 	// worker). It returns ErrNotFound when no job is runnable.
+	//
+	// The returned Job.Attempts doubles as the claim's fencing token: it is
+	// bumped on every claim, so a reclaim advances it. The settlement methods
+	// below take that token and apply only while it still matches, so a stale
+	// attempt whose job was reclaimed cannot clobber the reclaiming attempt.
 	ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Time, lease time.Duration) (*model.Job, error)
-	// CompleteJob marks a job done.
-	CompleteJob(ctx context.Context, id string) error
-	// RescheduleJob returns a job to pending with a new RunAfter and records
-	// the cause, for a transient failure.
-	RescheduleJob(ctx context.Context, id string, runAfter time.Time, cause string) error
-	// FailJob marks a job permanently failed and records the cause.
-	FailJob(ctx context.Context, id string, cause string) error
+	// CompleteJob marks a job done, but only while token still matches the job's
+	// current claim (its Attempts). It returns ErrStaleClaim when the job was
+	// reclaimed by another worker, leaving the job untouched.
+	CompleteJob(ctx context.Context, id string, token int) error
+	// RescheduleJob returns a job to pending with a new RunAfter and records the
+	// cause, for a transient failure, but only while token still matches the
+	// job's current claim. It returns ErrStaleClaim when the job was reclaimed.
+	RescheduleJob(ctx context.Context, id string, token int, runAfter time.Time, cause string) error
+	// FailJob marks a job permanently failed and records the cause, but only
+	// while token still matches the job's current claim. It returns ErrStaleClaim
+	// when the job was reclaimed.
+	FailJob(ctx context.Context, id string, token int, cause string) error
 }

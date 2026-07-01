@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/castletfm/castlet/model"
+	"github.com/castletfm/castlet/store"
 )
 
 func (s *Store) EnqueueJob(ctx context.Context, j *model.Job) error {
@@ -85,35 +86,47 @@ func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Ti
 	return j, nil
 }
 
-func (s *Store) CompleteJob(ctx context.Context, id string) error {
-	return s.setJobStatus(ctx, id, model.JobDone, "", nil)
+func (s *Store) CompleteJob(ctx context.Context, id string, token int) error {
+	return s.setJobStatus(ctx, id, token, model.JobDone, "", nil)
 }
 
-func (s *Store) RescheduleJob(ctx context.Context, id string, runAfter time.Time, cause string) error {
-	return s.setJobStatus(ctx, id, model.JobPending, cause, &runAfter)
+func (s *Store) RescheduleJob(ctx context.Context, id string, token int, runAfter time.Time, cause string) error {
+	return s.setJobStatus(ctx, id, token, model.JobPending, cause, &runAfter)
 }
 
-func (s *Store) FailJob(ctx context.Context, id string, cause string) error {
-	return s.setJobStatus(ctx, id, model.JobFailed, cause, nil)
+func (s *Store) FailJob(ctx context.Context, id string, token int, cause string) error {
+	return s.setJobStatus(ctx, id, token, model.JobFailed, cause, nil)
 }
 
-func (s *Store) setJobStatus(ctx context.Context, id string, status model.JobStatus, cause string, runAfter *time.Time) error {
+// setJobStatus applies a terminal status transition, fenced by the claim token.
+// The WHERE clause matches attempts = token so only the current claim can settle
+// the job: a stale attempt whose lease expired and was reclaimed (which bumped
+// attempts) affects zero rows and gets ErrStaleClaim, so it cannot clobber the
+// reclaiming attempt's status.
+func (s *Store) setJobStatus(ctx context.Context, id string, token int, status model.JobStatus, cause string, runAfter *time.Time) error {
 	now := time.Now()
 	var res sql.Result
 	var err error
 	if runAfter != nil {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE jobs SET status = ?, last_error = ?, run_after = ?, updated_at = ? WHERE id = ?`,
-			string(status), cause, toUnix(*runAfter), toUnix(now), id)
+			`UPDATE jobs SET status = ?, last_error = ?, run_after = ?, updated_at = ? WHERE id = ? AND attempts = ?`,
+			string(status), cause, toUnix(*runAfter), toUnix(now), id, token)
 	} else {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
-			string(status), cause, toUnix(now), id)
+			`UPDATE jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ? AND attempts = ?`,
+			string(status), cause, toUnix(now), id, token)
 	}
 	if err != nil {
 		return fmt.Errorf("sqlite: update job status: %w", mapErr(err))
 	}
-	return requireAffected(res)
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return store.ErrStaleClaim
+	}
+	return nil
 }
 
 func scanJob(sc interface{ Scan(...any) error }) (*model.Job, error) {

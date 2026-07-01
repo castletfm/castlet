@@ -217,7 +217,7 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 	if herr := w.handle(ctx, job); herr != nil {
-		dead, nerr := w.queue.Nack(ctx, job.ID, herr)
+		dead, nerr := w.queue.Nack(ctx, job, herr)
 		if nerr != nil {
 			return true, fmt.Errorf("nack: %w (cause: %v)", nerr, herr)
 		}
@@ -226,7 +226,7 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 		}
 		return true, herr
 	}
-	return true, w.queue.Ack(ctx, job.ID)
+	return true, w.queue.Ack(ctx, job)
 }
 
 func (w *Worker) handle(ctx context.Context, job *model.Job) error {
@@ -283,6 +283,18 @@ func (w *Worker) transcribe(ctx context.Context, job *model.Job) error {
 		return fmt.Errorf("worker: transcribe: %w", err)
 	}
 
+	// A transcription can outlive its queue lease (the per-job timeout caps at 2h,
+	// the default lease is 10m), so by the time we have a result the job may have
+	// been reclaimed by another worker. Ack is fenced by the claim token and would
+	// no-op, but the transcript/status writes below are keyed by episode, not job,
+	// so settling them would clobber the reclaiming attempt's state. Bail out
+	// before those writes when we can confirm we no longer hold the claim.
+	if !w.claimHeld(ctx, job) {
+		w.logger.Warn("transcription claim lost to reclaim; discarding stale result",
+			"job", job.ID, "episode", ep.ID)
+		return nil
+	}
+
 	tr := &model.Transcript{EpisodeID: ep.ID, Language: res.Language, CreatedAt: time.Now()}
 	for _, s := range res.Segments {
 		tr.Segments = append(tr.Segments, model.Segment{StartSecs: s.StartSecs, EndSecs: s.EndSecs, Text: s.Text})
@@ -308,6 +320,23 @@ func (w *Worker) setStatus(ctx context.Context, ep *model.Episode, status model.
 	}
 	ep.TranscriptStatus = status
 	ep.UpdatedAt = now
+}
+
+// claimHeld reports whether this worker still holds job's claim, i.e. the job is
+// still processing under the same fencing token (Attempts) it was claimed with.
+// It guards the episode/transcript settlement, which is keyed by episode rather
+// than job and so is not fenced by the queue on its own. We only skip settlement
+// when we can confirm the claim advanced; on a lookup error we proceed, since
+// the job-status settlement is independently fenced by the token (Ack/Nack
+// no-op after a reclaim), so the worst case is a redundant transcript write, not
+// a wrong terminal status.
+func (w *Worker) claimHeld(ctx context.Context, job *model.Job) bool {
+	cur, err := w.store.JobByID(ctx, job.ID)
+	if err != nil {
+		w.logger.Warn("verify job claim", "job", job.ID, "error", err)
+		return true
+	}
+	return cur.Status == model.JobProcessing && cur.Attempts == job.Attempts
 }
 
 // markTranscript loads the job's episode and records a terminal transcript

@@ -26,10 +26,18 @@ type JobQueue interface {
 	// NOT run such a job, only settle its side effects to failed — mirroring the
 	// attempt-exhaustion path where Nack reports dead=true.
 	Dequeue(ctx context.Context, kinds ...model.JobKind) (job *model.Job, deadLettered bool, err error)
-	// Ack marks an in-flight job as successfully completed.
-	Ack(ctx context.Context, jobID string) error
+	// Ack marks an in-flight job as successfully completed. The job carries the
+	// claim's fencing token (see Dequeue): a job's lease can expire and be
+	// reclaimed by another worker while the original attempt is still running, so
+	// Ack settles only while this attempt still holds the claim. A stale Ack whose
+	// job was reclaimed is a no-op (nil error), leaving the reclaiming attempt in
+	// charge.
+	Ack(ctx context.Context, job *model.Job) error
 	// Nack reports that processing failed. The queue reschedules the job with
 	// backoff, or marks it permanently dead once attempts are exhausted.
-	// dead reports whether the job is now permanently failed.
-	Nack(ctx context.Context, jobID string, cause error) (dead bool, err error)
+	// dead reports whether the job is now permanently failed. Like Ack, Nack is
+	// fenced by the job's claim token: a stale Nack whose job was reclaimed is a
+	// no-op returning dead=false, so it neither reschedules nor fails the
+	// reclaiming attempt's job.
+	Nack(ctx context.Context, job *model.Job, cause error) (dead bool, err error)
 }

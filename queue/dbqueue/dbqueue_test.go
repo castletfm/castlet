@@ -39,7 +39,7 @@ func TestEnqueueDequeueAck(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, next)
 
-	require.NoError(t, q.Ack(ctx, job.ID))
+	require.NoError(t, q.Ack(ctx, job))
 }
 
 func TestNackRetriesThenDies(t *testing.T) {
@@ -52,7 +52,7 @@ func TestNackRetriesThenDies(t *testing.T) {
 	job, _, err := q.Dequeue(ctx, model.JobTranscribe)
 	require.NoError(t, err)
 	require.Equal(t, 1, job.Attempts)
-	dead, err := q.Nack(ctx, job.ID, errors.New("boom"))
+	dead, err := q.Nack(ctx, job, errors.New("boom"))
 	require.NoError(t, err)
 	require.False(t, dead)
 
@@ -60,7 +60,7 @@ func TestNackRetriesThenDies(t *testing.T) {
 	job, _, err = q.Dequeue(ctx, model.JobTranscribe)
 	require.NoError(t, err)
 	require.Equal(t, 2, job.Attempts)
-	dead, err = q.Nack(ctx, job.ID, errors.New("boom again"))
+	dead, err = q.Nack(ctx, job, errors.New("boom again"))
 	require.NoError(t, err)
 	require.True(t, dead, "should be dead after maxAttempts")
 
@@ -68,6 +68,45 @@ func TestNackRetriesThenDies(t *testing.T) {
 	next, _, err := q.Dequeue(ctx, model.JobTranscribe)
 	require.NoError(t, err)
 	require.Nil(t, next)
+}
+
+// TestStaleSettlementNoOpAfterReclaim proves the queue fences settlement by the
+// claim token: a long job whose lease expires can be reclaimed by a second
+// worker while the first is still running, and the first worker's Ack/Nack must
+// then be no-ops so it cannot clobber the reclaiming attempt.
+func TestStaleSettlementNoOpAfterReclaim(t *testing.T) {
+	q, s := newQueue(t, dbqueue.WithMaxAttempts(5))
+	ctx := t.Context()
+	require.NoError(t, q.Enqueue(ctx, model.JobTranscribe, model.TranscribePayload{EpisodeID: "e1"}))
+
+	// First worker claims the job (token = Attempts = 1).
+	first, _, err := q.Dequeue(ctx, model.JobTranscribe)
+	require.NoError(t, err)
+	require.Equal(t, 1, first.Attempts)
+
+	// Its lease expires; a second worker reclaims it via the store with a "now"
+	// past the lease, advancing the token to 2.
+	second, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, time.Now().Add(time.Hour), time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 2, second.Attempts)
+
+	// Stale Ack and Nack from the first attempt are no-ops: no error, and the job
+	// remains owned (processing, token 2) by the reclaiming attempt.
+	require.NoError(t, q.Ack(ctx, first))
+	dead, err := q.Nack(ctx, first, errors.New("stale failure"))
+	require.NoError(t, err)
+	require.False(t, dead, "a stale Nack must not report the reclaimed job dead")
+
+	got, err := s.JobByID(ctx, first.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobProcessing, got.Status, "stale settlement must not change the reclaimed job")
+	require.Equal(t, 2, got.Attempts)
+
+	// The reclaiming attempt settles normally.
+	require.NoError(t, q.Ack(ctx, second))
+	got, err = s.JobByID(ctx, first.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.JobDone, got.Status)
 }
 
 func TestDequeueDeadLettersPoisonJob(t *testing.T) {

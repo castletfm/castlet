@@ -43,6 +43,16 @@ func WithMaxAttempts(n int) Option { return option.New(identMaxAttempts{}, n) }
 
 // WithLease sets how long a claimed job stays invisible before another worker
 // may reclaim it, bounding the damage from a crashed worker (default 10m).
+//
+// The lease governs *reclaim* only; it does not kill a running job. A legitimate
+// transcription can run far longer than the default lease (the per-job timeout
+// caps at 2h), so a live job's lease can expire and be reclaimed by a restarted
+// or second worker while the original attempt is still running. That overlap is
+// made safe by the claim's fencing token (Job.Attempts): only the current claim
+// can settle the job, so a stale attempt's Ack/Nack become no-ops rather than
+// clobbering the reclaiming attempt. Operators who want to avoid the overlap
+// (redundant work) entirely can raise the lease above the largest expected job
+// runtime.
 func WithLease(d time.Duration) Option { return option.New(identLease{}, d) }
 
 // WithBackoff overrides the retry backoff function. attempt is the number of
@@ -112,7 +122,9 @@ func (q *Queue) Dequeue(ctx context.Context, kinds ...model.JobKind) (*model.Job
 	// (deadLettered=true) so the caller can settle its side effects to failed,
 	// exactly as it does when Nack reports the job dead.
 	if j.Attempts > q.maxAttempts {
-		if err := q.store.FailJob(ctx, j.ID, "dbqueue: exceeded max attempts"); err != nil {
+		// The dead-letter is fenced by the fresh claim token (j.Attempts, just
+		// bumped by ClaimJob) like every other settlement.
+		if err := q.store.FailJob(ctx, j.ID, j.Attempts, "dbqueue: exceeded max attempts"); err != nil {
 			return nil, false, fmt.Errorf("dbqueue: dead-letter poison job: %w", err)
 		}
 		return j, true, nil
@@ -120,24 +132,44 @@ func (q *Queue) Dequeue(ctx context.Context, kinds ...model.JobKind) (*model.Job
 	return j, false, nil
 }
 
-func (q *Queue) Ack(ctx context.Context, jobID string) error {
-	return q.store.CompleteJob(ctx, jobID)
+func (q *Queue) Ack(ctx context.Context, job *model.Job) error {
+	// job.Attempts is the claim's fencing token. If the lease expired and another
+	// worker reclaimed the job, CompleteJob reports ErrStaleClaim; treat that as a
+	// no-op so this stale attempt does not mark a reclaimed job done.
+	if err := q.store.CompleteJob(ctx, job.ID, job.Attempts); err != nil {
+		if errors.Is(err, store.ErrStaleClaim) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
-func (q *Queue) Nack(ctx context.Context, jobID string, cause error) (bool, error) {
-	j, err := q.store.JobByID(ctx, jobID)
-	if err != nil {
-		return false, fmt.Errorf("dbqueue: nack lookup: %w", err)
-	}
+func (q *Queue) Nack(ctx context.Context, job *model.Job, cause error) (bool, error) {
 	msg := ""
 	if cause != nil {
 		msg = cause.Error()
 	}
-	// Attempts was already incremented when the job was claimed, so it is the
-	// number of tries spent so far.
-	if j.Attempts >= q.maxAttempts {
-		return true, q.store.FailJob(ctx, jobID, msg)
+	// job.Attempts was incremented when the job was claimed, so it is both the
+	// number of tries spent so far and this claim's fencing token. Using it
+	// directly (rather than re-reading the row) means a reclaim that advanced the
+	// token turns the settlement below into a no-op via ErrStaleClaim, instead of
+	// letting this stale attempt reschedule or fail the reclaimed job.
+	if job.Attempts >= q.maxAttempts {
+		if err := q.store.FailJob(ctx, job.ID, job.Attempts, msg); err != nil {
+			if errors.Is(err, store.ErrStaleClaim) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
 	}
-	runAfter := time.Now().Add(q.backoff(j.Attempts))
-	return false, q.store.RescheduleJob(ctx, jobID, runAfter, msg)
+	runAfter := time.Now().Add(q.backoff(job.Attempts))
+	if err := q.store.RescheduleJob(ctx, job.ID, job.Attempts, runAfter, msg); err != nil {
+		if errors.Is(err, store.ErrStaleClaim) {
+			return false, nil
+		}
+		return false, err
+	}
+	return false, nil
 }
