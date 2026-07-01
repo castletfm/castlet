@@ -2,6 +2,14 @@
 // implementation (queue/dbqueue) is backed by the metadata Store so a
 // standalone install needs no extra service; an enterprise deployment can
 // implement JobQueue over Redis, SQS, or similar.
+//
+// NOTE: the default worker settles a successful transcription and completes its
+// job in ONE fenced store transaction (store.SettleEpisodeTranscriptAndCompleteJob),
+// which couples the claim's fencing token to the store's job row. A JobQueue paired
+// with that worker must therefore mirror its claims into the store (as dbqueue does
+// via store.ClaimJob); a fully external queue that never touches the store job
+// methods cannot provide that atomic coupling and must be paired with a worker
+// whose settlement does not depend on it.
 package queue
 
 import (

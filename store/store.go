@@ -21,8 +21,9 @@ var (
 	// (e.g. a duplicate email or id).
 	ErrConflict = errors.New("store: conflict")
 	// ErrStaleClaim is returned by the job settlement methods (CompleteJob,
-	// RescheduleJob, FailJob) when the settlement is no longer valid. Settlement
-	// requires BOTH a matching claim token AND the job still being in 'processing'.
+	// RescheduleJob, FailJob, and the combined SettleEpisodeTranscriptAndCompleteJob)
+	// when the settlement is no longer valid. Settlement requires BOTH a matching
+	// claim token AND the job still being in 'processing'.
 	// It therefore covers two cases:
 	//   - The supplied claim token no longer matches the job's current claim: the
 	//     job was reclaimed by another worker after its lease expired. The stale
@@ -133,10 +134,29 @@ type Store interface {
 	// nothing, so episode/transcript writes are as fenced as the queue's own
 	// Ack/Nack.
 	SettleEpisodeTranscript(ctx context.Context, jobID string, token int, episodeID string, transcript *model.Transcript, status model.TranscriptStatus, updatedAt time.Time) error
+	// SettleEpisodeTranscriptAndCompleteJob is the atomic SUCCESS-path settlement:
+	// in ONE transaction it saves the transcript (when non-nil), applies the
+	// targeted episode transcript_status write, AND marks the job done — all fenced
+	// by the claim (attempts == token AND status == 'processing'). Coupling the job
+	// completion to the episode write in a single transaction is what prevents a
+	// reclaim from landing between them: with a separate settle then Ack, an expired
+	// lease could be reclaimed after the episode was set done, whereupon the
+	// reclaiming worker would downgrade the episode back to processing/failed. Here
+	// the two are indivisible: either the whole outcome is applied while this attempt
+	// still holds the claim, or nothing is (ErrStaleClaim) because the job was
+	// reclaimed or is already terminal. A worker-compatible JobQueue must therefore
+	// mirror its claims into this store's job row (the dbqueue+sqlite contract, see
+	// the Job persistence note below); the worker's success path calls this method
+	// instead of a separate SettleEpisodeTranscript + queue Ack.
+	SettleEpisodeTranscriptAndCompleteJob(ctx context.Context, jobID string, token int, episodeID string, transcript *model.Transcript, status model.TranscriptStatus, updatedAt time.Time) error
 
-	// Job persistence backs queue/dbqueue. A queue backed by an external
-	// service (Redis, SQS) implements queue.JobQueue directly and need not
-	// touch these methods.
+	// Job persistence backs queue/dbqueue. The default worker settles a job's
+	// terminal outcome and the job's completion in one fenced transaction via
+	// SettleEpisodeTranscriptAndCompleteJob, which couples the queue's claim token
+	// to this job row. A JobQueue used with that worker must therefore mirror its
+	// claims into these job methods (as queue/dbqueue does). A fully external queue
+	// (Redis, SQS) that does not use these methods can only be paired with a worker
+	// whose settlement does not couple to the store job row.
 	EnqueueJob(ctx context.Context, j *model.Job) error
 	// JobByID returns a single job, or ErrNotFound.
 	JobByID(ctx context.Context, id string) (*model.Job, error)

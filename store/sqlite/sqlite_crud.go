@@ -470,28 +470,97 @@ func (s *Store) SettleEpisodeTranscript(ctx context.Context, jobID string, token
 	}
 
 	if transcript != nil {
-		segs, err := json.Marshal(transcript.Segments)
-		if err != nil {
-			return fmt.Errorf("sqlite: marshal segments: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO transcripts (episode_id, language, segments, created_at)
-			 VALUES (?, ?, ?, ?)
-			 ON CONFLICT(episode_id) DO UPDATE SET language = excluded.language,
-				segments = excluded.segments, created_at = excluded.created_at`,
-			transcript.EpisodeID, transcript.Language, string(segs), toUnix(transcript.CreatedAt)); err != nil {
-			return fmt.Errorf("sqlite: save transcript: %w", mapErr(err))
+		if err := saveTranscriptTx(ctx, tx, transcript); err != nil {
+			return err
 		}
 	}
-
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE episodes SET transcript_status = ?, updated_at = ? WHERE id = ?`,
-		string(status), toUnix(updatedAt), episodeID); err != nil {
-		return fmt.Errorf("sqlite: set episode transcript status: %w", mapErr(err))
+	if err := setEpisodeStatusTx(ctx, tx, episodeID, status, updatedAt); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("sqlite: settle episode transcript: %w", mapErr(err))
+	}
+	return nil
+}
+
+// SettleEpisodeTranscriptAndCompleteJob atomically settles a SUCCESSFUL
+// transcription: in ONE transaction it completes the job and records the episode
+// side effects, so a reclaim can never land between the episode write and the job
+// completion (the gap that previously let a reclaiming attempt downgrade an
+// already-done episode). See store.Store for the contract.
+//
+// The claim fence and the completion are the SAME statement: the job is
+// transitioned to done only while attempts == token AND status = 'processing'
+// (the state a live claim holds before its Ack). A RowsAffected of 0 means the
+// claim is no longer valid — the job was reclaimed (attempts advanced) or is
+// already terminal — so the whole settlement (transcript save, episode status,
+// and job completion) is rejected together with ErrStaleClaim and nothing is
+// written. Only when the fence holds are the transcript (when non-nil) and the
+// targeted episode transcript_status write applied, all committed as one unit.
+func (s *Store) SettleEpisodeTranscriptAndCompleteJob(ctx context.Context, jobID string, token int, episodeID string, transcript *model.Transcript, status model.TranscriptStatus, updatedAt time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: settle episode transcript and complete job: %w", mapErr(err))
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// Fence AND complete in one statement: only the live claim can finish the job.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND attempts = ? AND status = ?`,
+		string(model.JobDone), toUnix(updatedAt), jobID, token, string(model.JobProcessing))
+	if err != nil {
+		return fmt.Errorf("sqlite: complete job: %w", mapErr(err))
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return store.ErrStaleClaim
+	}
+
+	if transcript != nil {
+		if err := saveTranscriptTx(ctx, tx, transcript); err != nil {
+			return err
+		}
+	}
+	if err := setEpisodeStatusTx(ctx, tx, episodeID, status, updatedAt); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sqlite: settle episode transcript and complete job: %w", mapErr(err))
+	}
+	return nil
+}
+
+// saveTranscriptTx upserts a transcript within an open transaction, so the
+// episode settlement methods can save it atomically with their other writes.
+func saveTranscriptTx(ctx context.Context, tx *sql.Tx, t *model.Transcript) error {
+	segs, err := json.Marshal(t.Segments)
+	if err != nil {
+		return fmt.Errorf("sqlite: marshal segments: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO transcripts (episode_id, language, segments, created_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(episode_id) DO UPDATE SET language = excluded.language,
+			segments = excluded.segments, created_at = excluded.created_at`,
+		t.EpisodeID, t.Language, string(segs), toUnix(t.CreatedAt)); err != nil {
+		return fmt.Errorf("sqlite: save transcript: %w", mapErr(err))
+	}
+	return nil
+}
+
+// setEpisodeStatusTx applies a targeted transcript_status write within an open
+// transaction, leaving the rest of the episode row untouched so a concurrent
+// admin edit is not reverted.
+func setEpisodeStatusTx(ctx context.Context, tx *sql.Tx, episodeID string, status model.TranscriptStatus, updatedAt time.Time) error {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE episodes SET transcript_status = ?, updated_at = ? WHERE id = ?`,
+		string(status), toUnix(updatedAt), episodeID); err != nil {
+		return fmt.Errorf("sqlite: set episode transcript status: %w", mapErr(err))
 	}
 	return nil
 }

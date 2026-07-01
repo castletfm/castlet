@@ -66,6 +66,12 @@ func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Ti
 		return nil, mapErr(err) // ErrNotFound when nothing is runnable
 	}
 
+	// Snapshot the exact row state the claim decision was made on, so the UPDATE
+	// can be conditioned on it and reject a row that changed underneath us.
+	prevStatus := string(j.Status)
+	prevAttempts := j.Attempts
+	prevRunAfter := toUnix(j.RunAfter)
+
 	// Lease the job: mark processing, bump attempts, push run_after out by the
 	// lease so a crashed worker's job becomes reclaimable after it expires.
 	j.Status = model.JobProcessing
@@ -75,10 +81,25 @@ func (s *Store) ClaimJob(ctx context.Context, kinds []model.JobKind, now time.Ti
 	// never falls before the true sub-second deadline; RunAfter is normalized to
 	// the stored precision so callers compare against the durable value.
 	j.RunAfter = fromUnix(toUnixCeil(now.Add(lease)))
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET status = ?, attempts = ?, run_after = ?, updated_at = ? WHERE id = ?`,
-		string(j.Status), j.Attempts, toUnix(j.RunAfter), toUnix(j.UpdatedAt), j.ID); err != nil {
+	// Condition the UPDATE on the SELECTED row's status/attempts/run_after so a
+	// concurrent claim that already mutated the row cannot be double-claimed. On
+	// the single-writer pool this always matches; the guard defends the invariant
+	// regardless. RowsAffected != 1 means the row was claimed out from under us, so
+	// report nothing runnable rather than returning a row we did not actually lease.
+	res, err := tx.ExecContext(ctx,
+		`UPDATE jobs SET status = ?, attempts = ?, run_after = ?, updated_at = ?
+		 WHERE id = ? AND status = ? AND attempts = ? AND run_after = ?`,
+		string(j.Status), j.Attempts, toUnix(j.RunAfter), toUnix(j.UpdatedAt),
+		j.ID, prevStatus, prevAttempts, prevRunAfter)
+	if err != nil {
 		return nil, mapErr(err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n != 1 {
+		return nil, store.ErrNotFound
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, mapErr(err)

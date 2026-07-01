@@ -439,6 +439,181 @@ func TestSettleEpisodeTranscriptRejectsPostFailure(t *testing.T) {
 	require.Equal(t, model.TranscriptFailed, ep.TranscriptStatus, "episode must not be resurrected to done")
 }
 
+// seedEpisodeJob creates a channel/episode and a pending transcribe job for it,
+// so the combined-settlement tests have a claimable job whose episode side
+// effects can be settled.
+func seedEpisodeJob(t *testing.T, s *sqlite.Store, now time.Time) {
+	t.Helper()
+	ctx := t.Context()
+	seedUser(t, s)
+	require.NoError(t, s.CreateChannel(ctx, &model.Channel{ID: "c1", UserID: "u1", Title: "S",
+		CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, s.CreateEpisode(ctx, &model.Episode{ID: "e1", ChannelID: "c1", Title: "E",
+		Status: model.EpisodeDraft, TranscriptStatus: model.TranscriptProcessing, CreatedAt: now, UpdatedAt: now}))
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "j1", Kind: model.JobTranscribe,
+		Payload: `{"episode_id":"e1"}`, Status: model.JobPending, RunAfter: now, CreatedAt: now, UpdatedAt: now}))
+}
+
+// TestSettleEpisodeTranscriptAndCompleteJobAtomic proves the SUCCESS-path
+// settlement writes the transcript, the episode status, AND the job completion
+// as one fenced unit for the live claim.
+func TestSettleEpisodeTranscriptAndCompleteJobAtomic(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+	seedEpisodeJob(t, s, now)
+
+	claimed, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 1, claimed.Attempts)
+
+	tr := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: now,
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 1, Text: "hi"}}}
+	require.NoError(t, s.SettleEpisodeTranscriptAndCompleteJob(ctx, "j1", claimed.Attempts, "e1", tr, model.TranscriptDone, now))
+
+	job, err := s.JobByID(ctx, "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobDone, job.Status, "job must be completed in the same transaction")
+
+	ep, err := s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptDone, ep.TranscriptStatus)
+
+	got, err := s.TranscriptByEpisode(ctx, "e1")
+	require.NoError(t, err)
+	require.Len(t, got.Segments, 1)
+	require.Equal(t, "hi", got.Segments[0].Text)
+}
+
+// TestSettleEpisodeTranscriptAndCompleteJobFencedByReclaim is the core anti-
+// downgrade proof: a reclaim that lands before the original attempt's combined
+// settlement makes the whole settlement (episode status, transcript, AND job
+// completion) a single no-op returning ErrStaleClaim — the reclaiming attempt is
+// never downgraded and the job is never double-completed. This is exactly the
+// window that a separate settle-then-Ack left open.
+func TestSettleEpisodeTranscriptAndCompleteJobFencedByReclaim(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+	seedEpisodeJob(t, s, now)
+
+	// First worker claims (token 1) and finishes its (slow) transcription.
+	first, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 1, first.Attempts)
+
+	// Its lease expires and a second worker reclaims the job, advancing the token.
+	later := now.Add(2 * time.Minute)
+	second, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, later, time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, 2, second.Attempts)
+
+	// The original attempt (stale token 1) now tries to settle its done result:
+	// the whole combined unit is rejected. Nothing is written.
+	staleTr := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: later,
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 1, Text: "stale"}}}
+	require.ErrorIs(t,
+		s.SettleEpisodeTranscriptAndCompleteJob(ctx, "j1", first.Attempts, "e1", staleTr, model.TranscriptDone, later),
+		store.ErrStaleClaim)
+
+	job, err := s.JobByID(ctx, "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobProcessing, job.Status, "stale settlement must not complete the reclaimed job")
+	require.Equal(t, 2, job.Attempts)
+	ep, err := s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptProcessing, ep.TranscriptStatus, "stale settlement must not downgrade the episode")
+	_, err = s.TranscriptByEpisode(ctx, "e1")
+	require.ErrorIs(t, err, store.ErrNotFound, "stale settlement must not save a transcript")
+
+	// The reclaiming attempt (token 2) settles atomically and owns the outcome.
+	freshTr := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: later,
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 2, Text: "fresh"}}}
+	require.NoError(t, s.SettleEpisodeTranscriptAndCompleteJob(ctx, "j1", second.Attempts, "e1", freshTr, model.TranscriptDone, later))
+	job, err = s.JobByID(ctx, "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobDone, job.Status)
+	ep, err = s.EpisodeByID(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, model.TranscriptDone, ep.TranscriptStatus)
+}
+
+// TestSettleEpisodeTranscriptAndCompleteJobRejectsTerminal proves the combined
+// settlement cannot re-fire: once the job is done, a second call with the SAME
+// (still-matching) token is a no-op returning ErrStaleClaim, so a duplicate
+// settlement can neither double-complete the job nor rewrite the episode.
+func TestSettleEpisodeTranscriptAndCompleteJobRejectsTerminal(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+	seedEpisodeJob(t, s, now)
+
+	claimed, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.NoError(t, err)
+
+	tr := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: now,
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 1, Text: "one"}}}
+	require.NoError(t, s.SettleEpisodeTranscriptAndCompleteJob(ctx, "j1", claimed.Attempts, "e1", tr, model.TranscriptDone, now))
+
+	// Second call with the same token: the job is already 'done', not 'processing'.
+	dup := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: now,
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 9, Text: "two"}}}
+	require.ErrorIs(t,
+		s.SettleEpisodeTranscriptAndCompleteJob(ctx, "j1", claimed.Attempts, "e1", dup, model.TranscriptDone, now),
+		store.ErrStaleClaim)
+
+	got, err := s.TranscriptByEpisode(ctx, "e1")
+	require.NoError(t, err)
+	require.Equal(t, "one", got.Segments[0].Text, "a duplicate settlement must not overwrite the transcript")
+}
+
+// TestClaimJobNoDoubleClaim proves the ClaimJob guard: with many workers racing
+// for a single pending job, exactly one claims it (the others see ErrNotFound)
+// and its attempts advance by exactly one. The conditional UPDATE + RowsAffected
+// check ensures a job is never handed to two workers as claimed.
+func TestClaimJobNoDoubleClaim(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+
+	require.NoError(t, s.EnqueueJob(ctx, &model.Job{ID: "j1", Kind: model.JobTranscribe, Payload: "{}",
+		Status: model.JobPending, RunAfter: now, CreatedAt: now, UpdatedAt: now}))
+
+	const racers = 8
+	type result struct {
+		job *model.Job
+		err error
+	}
+	results := make(chan result, racers)
+	start := make(chan struct{})
+	for range racers {
+		go func() {
+			<-start
+			j, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+			results <- result{job: j, err: err}
+		}()
+	}
+	close(start)
+
+	claims := 0
+	for range racers {
+		r := <-results
+		if r.err == nil {
+			claims++
+			require.Equal(t, "j1", r.job.ID)
+			require.Equal(t, 1, r.job.Attempts, "the single claim must consume exactly one attempt")
+			continue
+		}
+		require.ErrorIs(t, r.err, store.ErrNotFound, "a losing racer must see nothing runnable, not a double-claim")
+	}
+	require.Equal(t, 1, claims, "exactly one worker may claim the job")
+
+	got, err := s.JobByID(ctx, "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobProcessing, got.Status)
+	require.Equal(t, 1, got.Attempts, "attempts must not be double-incremented by a double-claim")
+}
+
 func TestJobClaimReclaimsExpiredLease(t *testing.T) {
 	s := newStore(t)
 	ctx := t.Context()
