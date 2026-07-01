@@ -567,6 +567,40 @@ func TestSettleEpisodeTranscriptAndCompleteJobRejectsTerminal(t *testing.T) {
 	require.Equal(t, "one", got.Segments[0].Text, "a duplicate settlement must not overwrite the transcript")
 }
 
+// TestSettleEpisodeTranscriptAndCompleteJobClearsPriorError proves the combined
+// success path wipes a message left by a prior failed attempt: a job that fails
+// once (RescheduleJob records last_error), is retried, then succeeds via the
+// combined settlement must end up 'done' with last_error empty — matching
+// CompleteJob -> setJobStatus, which always clears last_error on completion.
+func TestSettleEpisodeTranscriptAndCompleteJobClearsPriorError(t *testing.T) {
+	s := newStore(t)
+	ctx := t.Context()
+	now := time.Now()
+	seedEpisodeJob(t, s, now)
+
+	// First attempt claims, then fails transiently and reschedules with a cause.
+	first, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, now, time.Minute)
+	require.NoError(t, err)
+	later := now.Add(2 * time.Minute)
+	require.NoError(t, s.RescheduleJob(ctx, "j1", first.Attempts, later, "boom"))
+
+	failed, err := s.JobByID(ctx, "j1")
+	require.NoError(t, err)
+	require.Equal(t, "boom", failed.LastError, "reschedule must record the failure cause")
+
+	// Retry: re-claim (advancing the token) and settle successfully.
+	second, err := s.ClaimJob(ctx, []model.JobKind{model.JobTranscribe}, later, time.Minute)
+	require.NoError(t, err)
+	tr := &model.Transcript{EpisodeID: "e1", Language: "en", CreatedAt: later,
+		Segments: []model.Segment{{StartSecs: 0, EndSecs: 1, Text: "ok"}}}
+	require.NoError(t, s.SettleEpisodeTranscriptAndCompleteJob(ctx, "j1", second.Attempts, "e1", tr, model.TranscriptDone, later))
+
+	job, err := s.JobByID(ctx, "j1")
+	require.NoError(t, err)
+	require.Equal(t, model.JobDone, job.Status)
+	require.Empty(t, job.LastError, "successful completion must clear the prior failure message")
+}
+
 // TestClaimJobNoDoubleClaim proves the ClaimJob guard: with many workers racing
 // for a single pending job, exactly one claims it (the others see ErrNotFound)
 // and its attempts advance by exactly one. The conditional UPDATE + RowsAffected

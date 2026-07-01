@@ -506,8 +506,10 @@ func (s *Store) SettleEpisodeTranscriptAndCompleteJob(ctx context.Context, jobID
 	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
 	// Fence AND complete in one statement: only the live claim can finish the job.
+	// Clear last_error so a successful completion wipes any message left by a prior
+	// failed attempt (RescheduleJob), matching CompleteJob -> setJobStatus.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE jobs SET status = ?, updated_at = ? WHERE id = ? AND attempts = ? AND status = ?`,
+		`UPDATE jobs SET status = ?, last_error = '', updated_at = ? WHERE id = ? AND attempts = ? AND status = ?`,
 		string(model.JobDone), toUnix(updatedAt), jobID, token, string(model.JobProcessing))
 	if err != nil {
 		return fmt.Errorf("sqlite: complete job: %w", mapErr(err))
