@@ -89,13 +89,17 @@ func cmdMigrate(args []string) error {
 	if err != nil {
 		return err
 	}
-	application, err := app.New(cfg)
+	// A migration touches only the database, so open just the store instead of
+	// building the full app. That avoids OIDC discovery, blob-store, and
+	// transcriber construction, which can block or fail when those backends are
+	// unavailable but the DB itself is fine.
+	st, err := app.OpenStore(cfg)
 	if err != nil {
 		return err
 	}
-	defer application.Close()
+	defer st.Close()
 
-	if err := application.Migrate(context.Background()); err != nil {
+	if err := st.Migrate(context.Background()); err != nil {
 		return err
 	}
 	fmt.Println("migration complete")

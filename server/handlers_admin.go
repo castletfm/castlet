@@ -467,12 +467,11 @@ func (s *Server) handleEpisodeUpdate(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, http.StatusBadRequest, "admin_episode_edit", "Edit episode", form)
 		return
 	}
-	// Metadata only — MediaKey is left untouched, so the bytes never change.
-	ep.Title = form.Title
-	ep.Description = form.Description
-	ep.Language = form.Language
-	ep.UpdatedAt = s.now()
-	if err := s.store.UpdateEpisode(r.Context(), ep); err != nil {
+	// Metadata only — MediaKey is left untouched, so the bytes never change. Use a
+	// targeted metadata write (not full-row UpdateEpisode) so this edit, made from a
+	// possibly stale-loaded episode, cannot revert a transcript_status the worker
+	// just committed while we held the form open.
+	if err := s.store.UpdateEpisodeMetadata(r.Context(), ep.ID, form.Title, form.Description, form.Language, s.now()); err != nil {
 		s.serverError(w, r, err)
 		return
 	}
@@ -544,17 +543,19 @@ func (s *Server) setEpisodePublished(w http.ResponseWriter, r *http.Request, pub
 	if !ok {
 		return
 	}
+	status := model.EpisodeDraft
+	publishedAt := ep.PublishedAt // unpublish leaves the original publish time intact
 	if publish {
-		ep.Status = model.EpisodePublished
-		if ep.PublishedAt == nil {
+		status = model.EpisodePublished
+		if publishedAt == nil {
 			now := s.now()
-			ep.PublishedAt = &now
+			publishedAt = &now
 		}
-	} else {
-		ep.Status = model.EpisodeDraft
 	}
-	ep.UpdatedAt = s.now()
-	if err := s.store.UpdateEpisode(r.Context(), ep); err != nil {
+	// Targeted publication write (not full-row UpdateEpisode) so this toggle, made
+	// from a possibly stale-loaded episode, cannot revert a transcript_status the
+	// worker just committed.
+	if err := s.store.SetEpisodePublication(r.Context(), ep.ID, status, publishedAt, s.now()); err != nil {
 		s.serverError(w, r, err)
 		return
 	}

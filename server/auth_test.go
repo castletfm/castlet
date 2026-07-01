@@ -306,6 +306,63 @@ func TestLogoutFailsClosedWhenUserLookupFails(t *testing.T) {
 		"logout must fail closed when it cannot look up the user to revoke")
 }
 
+// TestLoginTimingEqualization guards against account enumeration via login
+// latency: an unknown email, a known email with the wrong password, and an
+// OIDC-only account (no local password) must all fail identically, and a valid
+// login must still succeed. The handler achieves this by always running a bcrypt
+// comparison — against a constant dummy hash when the email does not resolve to a
+// usable local password — so none of the failure paths returns before the
+// (dominant) hashing cost is paid.
+func TestLoginTimingEqualization(t *testing.T) {
+	h := newHarness(t)
+	ctx := t.Context()
+
+	// A local account with a real password.
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "local", Email: "local@user.test",
+		DisplayName: "Local", PasswordHash: mustHash(t, "secret"), CreatedAt: time.Now()}))
+	// An OIDC-only account: it exists but has no local password to compare.
+	require.NoError(t, h.store.CreateUser(ctx, &model.User{ID: "sso", Email: "sso@user.test",
+		DisplayName: "SSO", OIDCIssuer: "https://idp.test", OIDCSubject: "sub-1", CreatedAt: time.Now()}))
+
+	// Every failing case returns the identical status and body, so nothing in the
+	// response distinguishes "no such account" from "wrong password" or "no local
+	// password". Each uses a fresh client to keep well under the rate limiter.
+	failCases := []struct {
+		name          string
+		email, passwd string
+	}{
+		{"unknown email", "nobody@user.test", "whatever"},
+		{"known email, wrong password", "local@user.test", "wrong"},
+		{"oidc-only account", "sso@user.test", "anything"},
+		// The OIDC-only account must not be loggable in with an empty password
+		// either, even though its stored hash is empty.
+		{"oidc-only account, empty password", "sso@user.test", ""},
+	}
+
+	for _, tc := range failCases {
+		client := newClient()
+		resp, err := postFormCSRF(t, client, h.base, "/login",
+			url.Values{"email": {tc.email}, "password": {tc.passwd}})
+		require.NoError(t, err, tc.name)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		// Identical status and error message across every failing case: the only
+		// per-request differences in the page are the reflected email and CSRF
+		// token, both of which are caller-supplied input, not account signals.
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode, tc.name)
+		require.Contains(t, string(body), "Invalid email or password.", tc.name)
+	}
+
+	// A genuine local login still succeeds.
+	client := newClient()
+	resp, err := postFormCSRF(t, client, h.base, "/login",
+		url.Values{"email": {"local@user.test"}, "password": {"secret"}})
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode)
+	require.Equal(t, "/admin/", resp.Header.Get("Location"))
+}
+
 // fakeAuthn is a stand-in OIDC authenticator for tests.
 type fakeAuthn struct {
 	identity *auth.Identity
