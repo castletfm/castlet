@@ -4,7 +4,9 @@ import (
 	"errors"
 	"net/http"
 	"net/mail"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/castletfm/castlet/internal/idgen"
 	"github.com/castletfm/castlet/model"
@@ -32,17 +34,42 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	email := r.FormValue("email")
 	password := r.FormValue("password")
 
+	// Brute-force speed bump: refuse further attempts from an IP that has
+	// already exhausted its failed-attempt budget, before touching the store or
+	// hashing a password.
+	key := clientIP(r)
+	if retryAfter, blocked := s.loginLimiter.blocked(key, s.now()); blocked {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(retryAfter)))
+		s.render(w, r, http.StatusTooManyRequests, "login", "Log in",
+			loginPage{Email: email, Error: "Too many failed login attempts. Please wait and try again."})
+		return
+	}
+
 	user, err := s.store.UserByEmail(r.Context(), email)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)) != nil {
 		// Same response whether the email is unknown or the password is wrong,
 		// so the form does not reveal which accounts exist.
+		s.loginLimiter.fail(key, s.now())
 		s.render(w, r, http.StatusUnauthorized, "login", "Log in",
 			loginPage{Email: email, Error: "Invalid email or password."})
 		return
 	}
 
+	// A successful login clears the counter so a legitimate user is never locked
+	// out by their own earlier typos.
+	s.loginLimiter.reset(key)
 	s.sessions.Issue(w, user.ID, user.SessionEpoch, s.now())
 	s.redirect(w, r, "/admin/")
+}
+
+// retryAfterSeconds rounds a retry-after duration up to whole seconds, with a
+// floor of 1, for the Retry-After header.
+func retryAfterSeconds(d time.Duration) int {
+	secs := int((d + time.Second - 1) / time.Second)
+	if secs < 1 {
+		return 1
+	}
+	return secs
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {

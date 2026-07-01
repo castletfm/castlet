@@ -49,3 +49,26 @@ func TestJobTimeoutPolicyDefaults(t *testing.T) {
 		t.Fatalf("defaults = %+v, want factor=%v min=%v max=%v", p, defaultTimeoutFactor, defaultTimeoutMin, defaultTimeoutMax)
 	}
 }
+
+// TestJobTimeoutPolicyMinDefaulting nails down the contract the app wiring relies
+// on for TranscribeTimeoutMin (the one knob carried inside the policy struct
+// rather than gated by >0 in app): a non-positive Min normalizes to the 5m
+// default, while a positive Min is preserved verbatim.
+func TestJobTimeoutPolicyMinDefaulting(t *testing.T) {
+	cases := []struct {
+		name string
+		min  time.Duration
+		want time.Duration
+	}{
+		{"zero defaults to 5m", 0, defaultTimeoutMin},
+		{"negative defaults to 5m", -1 * time.Minute, defaultTimeoutMin},
+		{"positive preserved", 3 * time.Minute, 3 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (JobTimeoutPolicy{Min: tc.min}).withDefaults().Min; got != tc.want {
+				t.Fatalf("withDefaults().Min = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
